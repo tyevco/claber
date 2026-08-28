@@ -29,6 +29,11 @@ sudo -u "$RUN_USER" python3 -m venv "$DEST/venv"
 sudo -u "$RUN_USER" "$DEST/venv/bin/pip" install --upgrade pip
 # All four have prebuilt aarch64 wheels, so no compiling on the Pi.
 sudo -u "$RUN_USER" "$DEST/venv/bin/pip" install "$DEST[sheets]"
+# ...then force the package itself back in. The version in pyproject.toml
+# does not move between changes, so pip sees mplabel 0.1.0 already
+# installed and skips it - meaning a re-run of this script would leave the
+# OLD code running. --no-deps keeps that from re-downloading the world.
+sudo -u "$RUN_USER" "$DEST/venv/bin/pip" install --force-reinstall --no-deps "$DEST"
 
 if [ ! -f /etc/mplabel.conf ]; then
     cp mplabel.conf.example /etc/mplabel.conf
@@ -46,8 +51,8 @@ sed -e "s|^User=.*|User=$RUN_USER|" \
     systemd/mplabel.service > /etc/systemd/system/mplabel.service
 systemctl daemon-reload
 
-# The raw tspl backend needs usblp, which CUPS unbinds when it claims a
-# printer. Load it at boot and keep CUPS off the label printer.
+# The raw backends (escpos, tspl, zpl) need usblp, which CUPS unbinds when
+# it claims a printer. Load it at boot and keep CUPS off the label printer.
 if ! grep -q '^usblp' /etc/modules 2>/dev/null; then
     echo "usblp" >> /etc/modules
 fi
@@ -63,10 +68,16 @@ cat <<EOF
   1. Log out and back in, so the lp group membership takes effect.
   2. Plug in the G4 and turn it on, then:
                                      $DEST/venv/bin/python -m mplabel probe
-     Look for "speaks TSPL" and note the /dev/usb/lpN node.
+     The G4 reports "speaks ESC/POS". Note the /dev/usb/lpN node, and set
+     printer_backend to whatever probe names.
   3. Tiny text-only test print:      $DEST/venv/bin/python -m mplabel selftest
-     This is a few dozen bytes. If it prints, the language is right.
+     This is a few dozen bytes and no raster. If it prints, the language
+     is right and only the image path is left to prove.
   4. Edit /etc/mplabel.conf          (IMAP credentials; device node if not lp0)
+     NOTE: an existing /etc/mplabel.conf is never overwritten by this
+     script, so after an update check printer_backend by hand - a config
+     written before the ESC/POS change still says tspl, and the file wins
+     over the built-in default.
   5. Dry run, no printing:           $DEST/venv/bin/python -m mplabel check
   6. Real label:                     $DEST/venv/bin/python -m mplabel test-print
   7. Start it:                       sudo systemctl enable --now mplabel
