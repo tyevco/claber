@@ -1,0 +1,9 @@
+# Core. All have prebuilt aarch64 wheels, so nothing compiles on the Pi.
+pypdf>=5.0
+pdfplumber>=0.11
+pypdfium2>=4.0
+Pillow>=10.0
+
+# Google Sheets sync. Omit if you do not want the sheet.
+gspread>=6.0
+google-auth>=2.0

@@ -1,0 +1,30 @@
+# Credentials - never commit these
+*.json.key
+mplabel-sheets.json
+service-account*.json
+mplabel.conf
+mplabel.env
+.env
+
+# Real customer data. The labels carry buyers' home addresses; the
+# database carries their names and what they bought. Keep both out of
+# version control. tests/fixtures/ holds synthetic stand-ins instead.
+labels/
+*.db
+*_source.pdf
+*_4x6.pdf
+selling*.html
+facebook-*.zip
+
+# ...but the synthetic test fixtures must be tracked. They are generated
+# by tests/fixtures/make_label.py and contain no real customer data.
+!tests/fixtures/**
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+venv/
+.venv/

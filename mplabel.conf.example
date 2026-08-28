@@ -1,0 +1,80 @@
+# /etc/mplabel.conf   (chmod 600, owned by the user the service runs as)
+#
+# Tuned for a CLABEL G4 (Shenzhen Dudian), 203 dpi, USB.
+#
+# Any value can be overridden by an environment variable named
+# MPLABEL_<KEY>, e.g. MPLABEL_IMAP_PASSWORD. That is the better place for
+# the password if you would rather not have it on disk.
+
+[mplabel]
+imap_host       = imap.gmail.com
+imap_port       = 993
+imap_user       = her-address@gmail.com
+
+# Gmail App Password, NOT the account password. Generate one at
+# myaccount.google.com -> Security -> 2-Step Verification -> App passwords.
+# Regular passwords are rejected over IMAP.
+imap_password   = xxxxxxxxxxxxxxxx
+
+imap_folder     = INBOX
+
+# Gmail label applied after a label is filed, so you can see what the
+# service has touched. Leave blank to skip.
+processed_label = Shipped-Labels
+
+# Where the database and label PDFs live.
+home            = /home/pi/marketplace
+
+# ---------------------------------------------------------------- printer
+# The G4 has no Linux driver from Clabel (their portal ships Windows and
+# Mac only), so we talk to it directly in TSPL over the raw USB node.
+# Options: tspl, zpl, cups-pdf, cups-raster
+printer_backend = tspl
+
+# Raw USB node. Confirm with `mplabel.py probe`.
+printer_device  = /dev/usb/lp0
+
+# G4 is 203 dpi (8 dots/mm) -> a 4x6 label is exactly 812 x 1218 dots.
+printer_dpi     = 203
+
+# TSPL DENSITY, 0-15. 8 is a good start. Raise if barcodes scan faintly,
+# lower if solid blacks bleed and smear.
+printer_darkness = 8
+
+# TSPL SPEED in inches/sec. The G4 tops out at 152 mm/s (~6 in/s), but
+# slower gives crisper barcodes. 4 is a sensible default.
+printer_speed   = 4
+
+# How the printer finds the start of each label:
+#   gap        die-cut labels with a gap between them  <- normal 4x6 stock
+#   blackmark  stock with a black registration mark
+#   continuous gapless roll
+# Getting this wrong is the usual cause of drifting or skipped labels.
+media_tracking  = gap
+
+# Gap size in inches. 0.12 (~3mm) suits most 4x6 die-cut stock.
+gap_inches      = 0.12
+
+# Pause after each job. These firmwares drop bytes that arrive while the
+# head is still moving, so do not set this to 0 if you print in batches.
+settle_seconds  = 2.0
+
+# Only used by the cups-* backends.
+printer_queue   =
+
+poll_seconds    = 120
+auto_print      = yes
+
+# ----------------------------------------------------------- google sheets
+# Service account key file. Leave blank to disable the sync entirely.
+# chmod 600 and own it by the service user - it is a credential.
+sheets_key      = /etc/mplabel-sheets.json
+
+# Identify the sheet by id (from its URL, the long string between /d/ and
+# /edit) or by name. The id is safer - renaming the sheet will not break it.
+sheets_id       =
+sheets_name     = Marketplace
+
+# Push after every poll that found something. The sync is wrapped so a
+# Google outage can never stop a label printing.
+sheets_after_poll = yes

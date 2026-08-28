@@ -1,0 +1,79 @@
+From: Facebook Marketplace <noreply@marketplace.facebook.com>
+Reply-To: noreply <noreply@facebookmail.com>
+To: Jane Tester <jane.tester@example.com>
+Subject: Shipping label for your Marketplace order
+Date: Fri, 28 Aug 2026 08:01:12 -0700
+Message-ID: <fixture-label-0001@marketplace.facebook.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="OUTER"
+
+--OUTER
+Content-Type: text/html; charset="utf-8"
+
+<html><body>
+<img src="https://static.xx.fbcdn.net/fb_logo.png" width="40">
+<p>Hi Jane,</p>
+<p>Your prepaid shipping label for Sam Sample&#39;s order is attached. Please ship this item by <b>Fri, Sep 4</b> to avoid cancellation.</p>
+<table><tr>
+<td><div>Hand-thrown stoneware vase</div>
+<div>&#36;15.00</div>
+<div>To be shipped</div>
+<a href="https://www.facebook.com/marketplace/item/2379911152536775/?order_id=1094882736451203&amp;ref=email">See order details</a></td>
+<td><img src="https://scontent.xx.fbcdn.net/item.jpg"></td>
+</tr></table>
+<h3>How to choose the right box</h3>
+<ol><li>Try reusing any boxes you have that snugly fit the item.</li></ol>
+<h3>How to ship your item</h3>
+<ol><li><a href="https://www.facebook.com/marketplace/label/generate/">Generate your prepaid shipping label</a> in the app or on desktop.</li>
+<li>The package must be provided to the shipping carrier by <b>Fri, Sep 4</b>.</li>
+<li>Payment to your bank account will be initiated 5 days after delivery confirmation.</li></ol>
+<p>Meta Platforms, Inc. Attention: Community Support, 1 Hacker Way Menlo Park, CA 94025</p>
+</body></html>
+
+--OUTER
+Content-Type: application/pdf; name="label_2379911152536775.pdf"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="label_2379911152536775.pdf"
+
+JVBERi0xLjMKJZOMi54gUmVwb3J0TGFiIEdlbmVyYXRlZCBQREYgZG9jdW1lbnQgKG9wZW5zb3Vy
+Y2UpCjEgMCBvYmoKPDwKL0YxIDIgMCBSIC9GMiAzIDAgUgo+PgplbmRvYmoKMiAwIG9iago8PAov
+QmFzZUZvbnQgL0hlbHZldGljYSAvRW5jb2RpbmcgL1dpbkFuc2lFbmNvZGluZyAvTmFtZSAvRjEg
+L1N1YnR5cGUgL1R5cGUxIC9UeXBlIC9Gb250Cj4+CmVuZG9iagozIDAgb2JqCjw8Ci9CYXNlRm9u
+dCAvSGVsdmV0aWNhLUJvbGQgL0VuY29kaW5nIC9XaW5BbnNpRW5jb2RpbmcgL05hbWUgL0YyIC9T
+dWJ0eXBlIC9UeXBlMSAvVHlwZSAvRm9udAo+PgplbmRvYmoKNCAwIG9iago8PAovQ29udGVudHMg
+OCAwIFIgL01lZGlhQm94IFsgMCAwIDYxMiA3OTIgXSAvUGFyZW50IDcgMCBSIC9SZXNvdXJjZXMg
+PDwKL0ZvbnQgMSAwIFIgL1Byb2NTZXQgWyAvUERGIC9UZXh0IC9JbWFnZUIgL0ltYWdlQyAvSW1h
+Z2VJIF0KPj4gL1JvdGF0ZSAwIC9UcmFucyA8PAoKPj4gCiAgL1R5cGUgL1BhZ2UKPj4KZW5kb2Jq
+CjUgMCBvYmoKPDwKL1BhZ2VNb2RlIC9Vc2VOb25lIC9QYWdlcyA3IDAgUiAvVHlwZSAvQ2F0YWxv
+Zwo+PgplbmRvYmoKNiAwIG9iago8PAovQXV0aG9yIChhbm9ueW1vdXMpIC9DcmVhdGlvbkRhdGUg
+KEQ6MjAyNjA4MjgxNjE3MTMrMDAnMDAnKSAvQ3JlYXRvciAoYW5vbnltb3VzKSAvS2V5d29yZHMg
+KCkgL01vZERhdGUgKEQ6MjAyNjA4MjgxNjE3MTMrMDAnMDAnKSAvUHJvZHVjZXIgKFJlcG9ydExh
+YiBQREYgTGlicmFyeSAtIFwob3BlbnNvdXJjZVwpKSAKICAvU3ViamVjdCAodW5zcGVjaWZpZWQp
+IC9UaXRsZSAodW50aXRsZWQpIC9UcmFwcGVkIC9GYWxzZQo+PgplbmRvYmoKNyAwIG9iago8PAov
+Q291bnQgMSAvS2lkcyBbIDQgMCBSIF0gL1R5cGUgL1BhZ2VzCj4+CmVuZG9iago4IDAgb2JqCjw8
+Ci9GaWx0ZXIgWyAvQVNDSUk4NURlY29kZSAvRmxhdGVEZWNvZGUgXSAvTGVuZ3RoIDkzMgo+Pgpz
+dHJlYW0KR2F0JSJEL1wsbiUwIlBVWWQ/JmYtKkNuPDlDPiFAT0VUOypWJ1BHL0JqXEhTZU4vdTBE
+T1JxPl5OMEdqTGQ8TWAsV3I9UjVBMGtgK1ImSTprJy9gYzMyZzljJi0zKyYpYUxHVGUwP0MsaEdd
+SztxSjchKz1OQXVVPCJBcCRtTSIwXEw0RFNqNSFOQ0FlWTooJFhGXjM0RExvZVIpSFRgbEgzKlgh
+Jmd0MCxxL1Y9XT0qbGE0RG88PF5DVykiPW9SdTRPUHQ0VTRUcTkqdFpZRUIoNHQwaSY1bEQpVV10
+I1IqKHM8JV8udUQsMDVNMV9MQltbVjxBJmtndGc1O0x1T1c/PC5JcE8xJ2VDREk8KWdKaig/TzJH
+LzhRRnFEYEVWQiM+VlVkPnFpbFB1ciZWWm9CbCU5JmdqU0A1NTVeVT1kPiclOG5gQi9vb2FlUVhJ
+W0ddSzpOcTU8altKOWJabmckPEpaO1YrLSxMb1xMS3UpXDlvNUUvN0dMMi5kKiFVVDlpJydTNmNi
+JkdxM1gxV09oa3IjW1ZJLDRtOms+NyVBJ2FWSiM/anE5NEc1U0csW2hVbzwjW2lEdWZgLz4uRk9Y
+XSNPVkc0dGBLXFdrK1I4Vz1Cay8ybTZjXjIqW1trJE1dY2tsbkoxOUdyOyJVai5qTXQoXyovWUpZ
+dTFPNUxpXkVNcUcsXi4tZXJMKlQmNVpxa007cFRrWWpvaT5aIVpOQGh0VDNOMSxiMGhkP2FYQmlG
+TVgsazZgaThWQmhWOkNpQFlUPlVIQFMoNycqRmMvNmk9Szw3VmszJSdjUkI9bSVcIUZKY2VISlRi
+LD0qM3BTSyolYCYkcVQjPmAzOSlBOldsL0EwWS8rREksOktXQFhaWVlmKlgpTW1qYmleImAxYnRY
+b0k6bnRadEUmclwxND1JTGUoNWlmPWZpdTdFMTElYTouO2NcI1M1WWd1Z25nRGFaJFZdXUhIUUVt
+KmdAb3M2V21zXj4qMGdmWm1uJClKP21EVydNQTlIMFtSY2BNRENyKixnaloqVTFCPCdBWSNjalAy
+YDNyOGtUYS07LSZRZzhpXFUvN09AJkk+SnVcP2dUWiNMLk8uaC9nN20wLkcuMlIzNnROTCk/ZFA2
+Yl9mUyNCO14kcjw7KXBAY1pZY3MvKlxNNUxcQycncFU5byY8UVFwLzc/IyJOQ25Dbj5ZO182WXBT
+QUAlalJdIz8mQDplWW1wN1YuJThxJT5Ofj5lbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA5CjAwMDAw
+MDAwMDAgNjU1MzUgZiAKMDAwMDAwMDA2MSAwMDAwMCBuIAowMDAwMDAwMTAyIDAwMDAwIG4gCjAw
+MDAwMDAyMDkgMDAwMDAgbiAKMDAwMDAwMDMyMSAwMDAwMCBuIAowMDAwMDAwNTE0IDAwMDAwIG4g
+CjAwMDAwMDA1ODIgMDAwMDAgbiAKMDAwMDAwMDg0MyAwMDAwMCBuIAowMDAwMDAwOTAyIDAwMDAw
+IG4gCnRyYWlsZXIKPDwKL0lEIApbPDI2MzZlNWRjNjc2ODFjZDgxM2Y4YzdiNDk5ODhlMjU5Pjwy
+NjM2ZTVkYzY3NjgxY2Q4MTNmOGM3YjQ5OTg4ZTI1OT5dCiUgUmVwb3J0TGFiIGdlbmVyYXRlZCBQ
+REYgZG9jdW1lbnQgLS0gZGlnZXN0IChvcGVuc291cmNlKQoKL0luZm8gNiAwIFIKL1Jvb3QgNSAw
+IFIKL1NpemUgOQo+PgpzdGFydHhyZWYKMTkyNAolJUVPRgo=
+--OUTER--

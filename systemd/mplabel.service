@@ -1,0 +1,29 @@
+[Unit]
+Description=Facebook Marketplace label watcher
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=lp
+WorkingDirectory=/opt/mplabel
+ExecStart=/opt/mplabel/venv/bin/python -m mplabel run --loop
+Restart=always
+RestartSec=30
+
+# Keep the password out of the unit file and the process list.
+EnvironmentFile=-/etc/mplabel.env
+
+# A Pi that loses wifi should not spin; the poll loop backs off on its own.
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/pi/marketplace
+
+[Install]
+WantedBy=multi-user.target

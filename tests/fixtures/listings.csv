@@ -1,0 +1,3 @@
+listing_id,title,price,category,listed_at,sold_at,state
+CSV001,Cast iron skillet,25,Kitchen,2026-01-05,2026-01-19,sold
+CSV002,Floor lamp,30,Home,2026-02-01,,active

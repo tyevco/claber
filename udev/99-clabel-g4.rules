@@ -1,0 +1,14 @@
+# /etc/udev/rules.d/99-clabel-g4.rules
+#
+# Gives the raw USB printer node a stable name and lets members of the lp
+# group write to it without sudo. Reload with:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Fill in the vendor and product id from `lsusb` (the 1234:5678 pair) and
+# uncomment. Left generic here because the G4's USB id is not published
+# anywhere I could verify - read it off your own unit.
+#
+# SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", MODE="0660", GROUP="lp", SYMLINK+="usb/clabel-g4"
+#
+# Fallback: any usblp device is group-writable by lp. Fine with one printer.
+SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", MODE="0660", GROUP="lp"
