@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import time
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from . import backfill as backfill_mod
@@ -138,6 +139,10 @@ def connect_db(home):
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA)
+        # listings owns its own tables, but the poll loop writes mail_events
+        # as it goes, so they have to exist from the start. Both scripts are
+        # CREATE TABLE IF NOT EXISTS.
+        conn.executescript(listings_mod.SCHEMA)
     except sqlite3.OperationalError as exc:
         # sqlite says only "unable to open database file" whether the
         # directory is missing, unwritable, or the file itself is owned by
@@ -260,6 +265,36 @@ def process_message(cfg, conn, msg, do_print):
     return rec
 
 
+def record_event(conn, msg):
+    """Note a non-label Facebook email in mail_events.
+
+    A sale generates "New Marketplace order for <item>" first, and a local
+    pickup sale generates *only* that - no label email ever arrives. Before
+    this, those sales were invisible: the poller kept label mail and
+    discarded everything else, so the database only ever knew about items
+    that were shipped.
+
+    Returns 1 if a sale-side event was stored, else 0."""
+    subject = mailparse._decode(msg.get("Subject"))
+    kind = listings_mod.classify(subject)
+    if not kind or kind == "shipping_label":
+        return 0
+    try:
+        occurred = parsedate_to_datetime(msg.get("Date")).isoformat()
+    except Exception:
+        occurred = None
+    parsed = mailparse.parse(msg)
+    # Her own purchases carry the seller's listing id; drop it.
+    buyer_side = kind in listings_mod.BUYER_KINDS
+    listings_mod.record_event(
+        conn, mailparse._decode(msg.get("Message-ID")), occurred, kind,
+        subject,
+        listing_id=None if buyer_side else parsed.get("listing_id"),
+        amount=parsed.get("price"), counterparty=parsed.get("buyer"))
+    conn.commit()
+    return 0 if buyer_side else 1
+
+
 def poll_once(cfg, conn, do_print):
     host, port = cfg["imap_host"], int(cfg["imap_port"])
     user, pw = cfg["imap_user"], cfg["imap_password"]
@@ -274,14 +309,22 @@ def poll_once(cfg, conn, do_print):
         ids = data[0].split() if data and data[0] else []
         log.info("%d unread candidate(s)", len(ids))
 
-        handled = 0
+        handled = noted = 0
         for num in ids:
             typ, raw = imap.fetch(num, "(RFC822)")
             if not raw or not raw[0]:
                 continue
             msg = email.message_from_bytes(raw[0][1])
             if not mailparse.is_label_email(msg):
-                # Leave unrelated Facebook mail unread and untouched.
+                # Not a label, but it may still be a sale - and a local
+                # pickup sale produces nothing else. Note it, then put the
+                # mail back unread exactly as before: recording an event
+                # does not consume the message.
+                try:
+                    noted += record_event(conn, msg)
+                except Exception:
+                    log.exception("could not record event for %s",
+                                  num.decode())
                 imap.store(num, "-FLAGS", "\\Seen")
                 continue
             try:
@@ -301,7 +344,12 @@ def poll_once(cfg, conn, do_print):
                         imap.store(num, "+X-GM-LABELS", tag)
                     except Exception:
                         log.debug("could not apply Gmail label %s", tag)
-        if handled and truthy(cfg.get("sheets_after_poll")) and cfg.get("sheets_key"):
+        if noted:
+            log.info("%d sale/listing event(s) noted from non-label mail",
+                     noted)
+            listings_mod.refresh(conn)
+        if (handled or noted) and truthy(cfg.get("sheets_after_poll")) \
+                and cfg.get("sheets_key"):
             try:
                 sync_sheets(cfg, conn)
             except Exception:

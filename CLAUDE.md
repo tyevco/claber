@@ -138,6 +138,8 @@ reinterprets a 22-digit tracking number as a float and mangles it.
 only reach the DB if the listing email or a saved-page/DYI import carried
 one. If `v_aging` shows blank prices, the percentages are lying.
 
+**A sale is not the same thing as a label.** `is_label_email` keeps only subjects with "label" or "shipping", but the sale itself arrives as `New Marketplace order for <item>`, and a **local pickup sale produces no label email at all**. The poller therefore records a `mail_events` row for any classified non-label Facebook mail before putting it back, and `apply_events` reconciles it by the item name in the subject. Without that the database only ever knew about items that shipped, which is how 25 sold listings sat next to a 3-row `sales` table.
+
 **Unrecognised mail is put back.** `poll_once` searches
 `(UNSEEN FROM "facebook")`, and anything failing `is_label_email` - or
 raising during processing - is re-marked `-FLAGS \Seen`. Dropping that

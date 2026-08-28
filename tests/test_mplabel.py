@@ -366,6 +366,53 @@ def test_subject_classification(subject, kind):
     assert listings.classify(subject) == kind
 
 
+@pytest.mark.parametrize("subject,expected", [
+    ("New Marketplace order for Brass Candlestick Pair",
+     "Brass Candlestick Pair"),
+    ("You sold Oak side table", "Oak side table"),
+    ("Shipping label for your Marketplace order", None),
+    ("You placed an order: Blue Ceramic Vase", None),
+])
+def test_title_from_subject(subject, expected):
+    assert listings.title_from_subject(subject) == expected
+
+
+def test_a_local_pickup_sale_is_counted(tmp_path, db):
+    """A local pickup sale never produces a shipping label, so the order
+    subject is the only record of it. Those used to be dropped: the poller
+    kept label mail and put everything else back, so the database only ever
+    knew about items that shipped."""
+    import json as _json
+
+    title = "Vintage Swedish Full Lead Crystal Owl Sculpture"
+    src = tmp_path / "active.json"
+    src.write_text(_json.dumps([
+        {"title": title, "price": 65.0, "is_sold": False, "is_live": True},
+    ]), encoding="utf-8")
+    savedpage.import_saved(db, src)
+
+    # No sales row at all - only the order email.
+    listings.record_event(db, "<order1>", "2026-08-28T11:00:00", "sold",
+                          f"New Marketplace order for {title}")
+    listings.apply_events(db)
+
+    rows = db.execute("SELECT title, state, sold_at FROM listings").fetchall()
+    assert len(rows) == 1, "the order created a duplicate instead of linking"
+    assert rows[0]["state"] == "sold"
+    assert rows[0]["sold_at"] == "2026-08-28T11:00:00"
+
+
+def test_a_sale_of_something_never_captured_still_counts(db):
+    """If the item was never in a saved-page capture there is nothing to
+    link to, and dropping it would undercount sales."""
+    listings.record_event(db, "<order2>", "2026-08-28T12:00:00", "sold",
+                          "New Marketplace order for Copper Jelly Mould")
+    listings.apply_events(db)
+    row = db.execute("SELECT title, state FROM listings").fetchone()
+    assert row["title"] == "Copper Jelly Mould"
+    assert row["state"] == "sold"
+
+
 def test_her_purchases_do_not_become_listings(db):
     """The same mailbox carries what she buys. Those emails hold the
     *seller's* listing id, so counting them would invent listings that were

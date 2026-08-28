@@ -103,6 +103,26 @@ EVENT_PATTERNS = [
 BUYER_KINDS = {"purchase"}
 
 
+# The sale subjects carry the item name, and for a local-pickup sale that
+# subject is the only record that exists - no label email ever arrives.
+SUBJECT_TITLE_RES = [
+    re.compile(r"new marketplace order for\s+(.+)$", re.I),
+    re.compile(r"you sold\s+(.+)$", re.I),
+    re.compile(r"your item sold[:\-\s]+(.+)$", re.I),
+    re.compile(r"congratulations on your sale of\s+(.+)$", re.I),
+]
+
+
+def title_from_subject(subject):
+    """Pull the item name out of a sale subject, or None."""
+    s = (subject or "").strip()
+    for rx in SUBJECT_TITLE_RES:
+        m = rx.search(s)
+        if m:
+            return m.group(1).strip().strip('"“”')
+    return None
+
+
 def classify(subject):
     """Return the event kind for a subject line, or None if unrecognised."""
     s = (subject or "").lower()
@@ -217,9 +237,29 @@ def apply_events(conn):
     """Replay mail_events into the listings table."""
     kind_to_state = {"sold": "sold", "expired": "expired",
                      "listed": "active", "renewed": "active"}
+    by_title = {}
+    for r in conn.execute(
+            "SELECT listing_id, title FROM listings WHERE title IS NOT NULL"):
+        by_title.setdefault(_norm_title(r["title"]), r["listing_id"])
+
     for ev in conn.execute("SELECT * FROM mail_events ORDER BY occurred_at"):
+        if ev["kind"] in BUYER_KINDS:
+            continue
         lid = ev["listing_id"]
-        if not lid or ev["kind"] in BUYER_KINDS:
+        if not lid:
+            # A sale email often carries no listing id, and a local-pickup
+            # sale never produces a label - so the subject line is the only
+            # record of it. Reconcile by the item name in that subject, and
+            # for a sale with no match at all create the listing, or the
+            # sale simply would not be counted.
+            name = title_from_subject(ev["subject"])
+            if name:
+                lid = by_title.get(_norm_title(name))
+                if not lid and ev["kind"] == "sold":
+                    lid = title_key(name)
+                    by_title[_norm_title(name)] = lid
+                    upsert_listing(conn, lid, "email", title=name)
+        if not lid:
             continue
         fields = {"state": kind_to_state.get(ev["kind"])}
         if ev["kind"] == "listed":
