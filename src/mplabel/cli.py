@@ -469,6 +469,11 @@ def main():
     p.add_argument("path")
     p.add_argument("--format", choices=["dyi", "csv", "saved"], default="dyi")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--state", choices=["active", "sold", "expired", "removed"],
+                   help="force the state for a capture taken from one tab, "
+                        "e.g. --state sold for the Sold tab. Without it the "
+                        "state comes from a badge in each card, which the "
+                        "Sold tab may not repeat.")
     sub.add_parser("stats", help="analytics summary in the terminal")
 
     args = ap.parse_args()
@@ -532,7 +537,8 @@ def main():
         listings_mod.refresh(conn)
         if args.format == "saved":
             n, stats = savedpage_mod.import_saved(conn, args.path,
-                                                  verbose=not args.quiet)
+                                                  verbose=not args.quiet,
+                                                  state=args.state)
             print(f"imported {n} listing(s) "
                   f"({stats['json_blocks']} JSON blocks scanned)")
         elif args.format == "dyi":

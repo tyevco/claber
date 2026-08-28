@@ -207,6 +207,7 @@ def extract(path):
                                    or d.get("creation_timestamp")
                                    # what CONSOLE_SNIPPET writes
                                    or d.get("listed_at")),
+                "sold_at": _time(d.get("sold_at") or d.get("sold_time")),
                 "state": _state(d),
                 "category": d.get("marketplace_listing_category_id")
                             or d.get("category_name"),
@@ -227,8 +228,15 @@ def extract(path):
     return list(found.values()), stats
 
 
-def import_saved(conn, path, verbose=False):
-    """Load a saved page into the listings table."""
+def import_saved(conn, path, verbose=False, state=None):
+    """Load a saved page into the listings table.
+
+    state overrides whatever the file implies, for a capture taken from
+    one tab. The snippet reads `sold` off a badge in the card, but on the
+    Sold tab the tab itself carries that meaning and the cards may not
+    repeat it - in which case every sold listing would import as active
+    and sell-through would come out backwards. Passing state='sold' says
+    what the file is instead of inferring it."""
     from . import listings as listings_mod
 
     rows, stats = extract(path)
@@ -236,8 +244,8 @@ def import_saved(conn, path, verbose=False):
         listings_mod.upsert_listing(
             conn, r["listing_id"], "saved-page",
             title=r["title"], price=r["price"], listed_at=r["listed_at"],
-            state=r["state"], category=r["category"],
-            condition=r["condition"])
+            state=state or r["state"], sold_at=r.get("sold_at"),
+            category=r["category"], condition=r["condition"])
     conn.commit()
 
     if stats["listings"] == 0:

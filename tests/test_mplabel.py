@@ -520,6 +520,27 @@ def test_card_shaped_records_import(tmp_path, db):
     assert tuple(row) == ("Oak Bookcase", 65.0, "active")
 
 
+def test_state_override_for_a_single_tab_capture(tmp_path, db):
+    """A capture from the Sold tab may carry no per-card Sold badge, so
+    every row would import as active and sell-through would come out
+    backwards. --state says what the file is."""
+    import json as _json
+
+    src = tmp_path / "sold.json"
+    src.write_text(_json.dumps([
+        {"title": "Walnut Mantel Clock", "price": 120.0,
+         "is_sold": False, "is_live": True},
+    ]), encoding="utf-8")
+
+    savedpage.import_saved(db, src, state="sold")
+    assert db.execute("SELECT state FROM listings").fetchone()[0] == "sold"
+
+    # And the terminal-state rule still holds: a later active-tab capture
+    # of the same item must not resurrect it.
+    savedpage.import_saved(db, src)
+    assert db.execute("SELECT state FROM listings").fetchone()[0] == "sold"
+
+
 def test_snippet_and_parser_agree_on_key_names():
     """Nothing at runtime checks that CONSOLE_SNIPPET emits what extract()
     reads - a rename on either side would just quietly yield 0 listings."""
