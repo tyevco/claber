@@ -69,6 +69,19 @@ gap_inches      = 0.12
 # labels come out blank or truncated part-way down.
 escpos_band_rows = 128
 
+# A 3-digit code printed small in the top right of every label, so a stack
+# of parcels can be told apart at a glance. It is stored on the sale and
+# mirrored into the Sheet's Sales tab. Codes are picked at random from those
+# not in use by a parcel that has yet to ship, and freed once it ships.
+# The archived labels/<ref>_4x6.pdf is deliberately left unstamped - the
+# stamp goes on a throwaway copy on its way to the printer, so a reprint
+# cannot double-stamp.
+label_code      = yes
+
+# Point size of that code. Raise it if it is hard to read on thermal stock,
+# lower it if it crowds anything on the label.
+label_code_size = 8
+
 # How many days back each poll looks. Read state is NOT used as a filter:
 # Gmail marks every message in a conversation read when you open one, so
 # nine orders threaded together would hide eight labels. The window plus

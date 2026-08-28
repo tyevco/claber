@@ -22,9 +22,11 @@ import imaplib
 import io
 import logging
 import os
+import random
 import socket
 import sqlite3
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -61,6 +63,11 @@ DEFAULTS = {
     "media_tracking": "gap",
     "gap_inches": "0.12",
     "escpos_band_rows": "128",
+    # A 3-digit code printed small in the top right, so a stack of parcels
+    # can be told apart at a glance. Stored on the sale and mirrored to the
+    # sheet; the archived PDF is left unstamped.
+    "label_code": "yes",
+    "label_code_size": "8",
     "settle_seconds": "2.0",
     "poll_seconds": "120",
     # How far back each poll looks. Read state is not a filter - Gmail
@@ -94,6 +101,7 @@ CREATE TABLE IF NOT EXISTS sales (
     label_pdf    TEXT,
     printed_at   TEXT,
     print_count  INTEGER DEFAULT 0,
+    code         TEXT,
     status       TEXT DEFAULT 'to_ship',
     notes        TEXT
 );
@@ -147,6 +155,15 @@ def connect_db(home):
         # as it goes, so they have to exist from the start. Both scripts are
         # CREATE TABLE IF NOT EXISTS.
         conn.executescript(listings_mod.SCHEMA)
+        # ...which is exactly why a new column needs saying separately: the
+        # database already holds real sales and CREATE TABLE IF NOT EXISTS
+        # will not touch them.
+        have = {r[1] for r in conn.execute("PRAGMA table_info(sales)")}
+        for column, decl in (("code", "TEXT"),):
+            if column not in have:
+                conn.execute(f"ALTER TABLE sales ADD COLUMN {column} {decl}")
+                log.info("added sales.%s to the existing database", column)
+        conn.commit()
     except sqlite3.OperationalError as exc:
         # sqlite says only "unable to open database file" whether the
         # directory is missing, unwritable, or the file itself is owned by
@@ -252,7 +269,46 @@ def already_seen(conn, message_id, listing_id):
 
 # ---------------------------------------------------------------- printing
 
-def print_label(cfg, pdf_path):
+def allocate_code(conn):
+    """A 3-digit code that no unshipped parcel is already using.
+
+    Scoped to unshipped deliberately: the code exists to tell apart the
+    boxes waiting to go out, so once a parcel ships its code is free
+    again. Random rather than sequential, so a re-run cannot silently
+    hand out a code that is still on a box in the hall."""
+    taken = {r[0] for r in conn.execute(
+        "SELECT code FROM sales WHERE code IS NOT NULL "
+        "AND status != 'shipped'")}
+    free = [f"{n:03d}" for n in range(1000) if f"{n:03d}" not in taken]
+    if not free:
+        # A thousand parcels open at once. Repeat rather than refuse to
+        # print: an ambiguous code beats a parcel that cannot ship.
+        log.warning("all 1000 codes are in use by unshipped parcels")
+        return f"{random.randrange(1000):03d}"
+    return random.choice(free)
+
+
+def ensure_code(conn, message_id):
+    """The row's code, allocating one if it has none.
+
+    Idempotent, so a reprint puts the same digits on the paper as the
+    first print did - and as the sheet says."""
+    if not message_id:
+        return None
+    row = conn.execute("SELECT code FROM sales WHERE message_id=?",
+                       (message_id,)).fetchone()
+    if row is None:
+        return None
+    if row["code"]:
+        return row["code"]
+    code = allocate_code(conn)
+    conn.execute("UPDATE sales SET code=? WHERE message_id=?",
+                 (code, message_id))
+    conn.commit()
+    return code
+
+
+def print_label(cfg, pdf_path, code=None):
     backend = cfg["printer_backend"]
     dpi = int(cfg["printer_dpi"])
     darkness = int(cfg["printer_darkness"]) if cfg["printer_darkness"] else None
@@ -279,8 +335,22 @@ def print_label(cfg, pdf_path):
         kwargs = {"device": cfg["printer_device"], "dpi": dpi,
                   "darkness": darkness}
 
-    log.info("printing %s via %s", Path(pdf_path).name, backend)
-    printers.send(pdf_path, backend, **kwargs)
+    # Stamp a throwaway copy rather than the archive, so a reprint cannot
+    # double-stamp and labels/<ref>_4x6.pdf stays as Facebook sent it.
+    tmp = None
+    if code and truthy(cfg.get("label_code", "yes")):
+        tmp = Path(tempfile.gettempdir()) / f"mplabel_{code}_{os.getpid()}.pdf"
+        label.stamp_code(pdf_path, tmp,
+                         code, size=float(cfg.get("label_code_size", 8)))
+        pdf_path = tmp
+
+    log.info("printing %s via %s%s", Path(pdf_path).name, backend,
+             f" [{code}]" if code else "")
+    try:
+        printers.send(pdf_path, backend, **kwargs)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def mark_printed(conn, message_id):
@@ -327,7 +397,7 @@ def process_message(cfg, conn, msg, do_print):
 
     if do_print:
         try:
-            print_label(cfg, out_pdf)
+            print_label(cfg, out_pdf, ensure_code(conn, rec.get("message_id")))
             mark_printed(conn, rec.get("message_id"))
         except Exception as exc:
             log.error("print failed for %s: %s", ref, exc)
@@ -478,6 +548,10 @@ def cmd_file(cfg, args):
     src = Path(args.pdf)
     out = Path(args.output) if args.output else src.with_name(src.stem + "_4x6.pdf")
     info = label.to_4x6(src, out, force_rotation=args.rotate)
+    if getattr(args, "code", None):
+        # Handy for checking placement on a real label without printing.
+        label.stamp_code(out, out, args.code,
+                         size=float(cfg.get("label_code_size", 8)))
     print(f"{out}  {info['size_in'][0]} x {info['size_in'][1]} in  "
           f"(rotated {info['rotation']})")
     for k, v in label.extract_label_fields(out).items():
@@ -501,14 +575,17 @@ def sync_sheets(cfg, conn, dry_run=False):
 def cmd_list(cfg, conn, args):
     rows = conn.execute(
         "SELECT listing_id, item, buyer, price, ship_by, tracking, status, "
-        "printed_at FROM sales WHERE status != 'shipped' ORDER BY ship_by"
+        "printed_at, code FROM sales WHERE status != 'shipped' "
+        "ORDER BY ship_by"
     ).fetchall()
     if not rows:
         print("nothing outstanding")
         return
     for r in rows:
         printed = "printed" if r["printed_at"] else "NOT PRINTED"
-        print(f"{r['ship_by'] or '?':<12} ${r['price'] or 0:>7.2f}  "
+        # The code first: it is what is written on the box in the hall.
+        print(f"{r['code'] or '---':<5} {r['ship_by'] or '?':<12} "
+              f"${r['price'] or 0:>7.2f}  "
               f"{(r['item'] or '?')[:38]:<40} {r['buyer'] or '?':<18} "
               f"{printed}")
 
@@ -519,9 +596,10 @@ def cmd_reprint(cfg, conn, args):
         (args.ref, args.ref, args.ref)).fetchone()
     if not row:
         raise SystemExit(f"no record matching {args.ref}")
-    print_label(cfg, row["label_pdf"])
+    code = ensure_code(conn, row["message_id"])
+    print_label(cfg, row["label_pdf"], code)
     mark_printed(conn, row["message_id"])
-    print(f"reprinted {row['item']}")
+    print(f"reprinted {row['item']}" + (f"  [{code}]" if code else ""))
 
 
 def cmd_test_print(cfg, conn, args):
@@ -529,8 +607,10 @@ def cmd_test_print(cfg, conn, args):
                        "ORDER BY id DESC LIMIT 1").fetchone()
     if not row:
         raise SystemExit("no labels on file yet - run `check` first")
-    print_label(cfg, row["label_pdf"])
-    print(f"sent {Path(row['label_pdf']).name} to {cfg['printer_backend']}")
+    code = ensure_code(conn, row["message_id"])
+    print_label(cfg, row["label_pdf"], code)
+    print(f"sent {Path(row['label_pdf']).name} to {cfg['printer_backend']}"
+          + (f"  [{code}]" if code else ""))
 
 
 def cmd_stats(cfg, conn, args):
@@ -588,6 +668,8 @@ def main():
     p.add_argument("-o", "--output")
     p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270])
     p.add_argument("--print", dest="print_it", action="store_true")
+    p.add_argument("--code", help="stamp this parcel code on the label, to "
+                                  "check placement without printing")
     sub.add_parser("list", help="outstanding orders")
     p = sub.add_parser("reprint"); p.add_argument("ref")
     p = sub.add_parser("ship", help="mark as shipped"); p.add_argument("ref")

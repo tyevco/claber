@@ -8,6 +8,8 @@ So rather than cropping to the ink plus a margin, this snaps to the nominal
 label size and centres the ink inside it.
 """
 
+import io
+
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
@@ -16,6 +18,12 @@ PT_PER_IN = 72.0
 TARGET_W = 4.0 * PT_PER_IN     # 288
 TARGET_H = 6.0 * PT_PER_IN     # 432
 TOL = 4.0                      # pt of slop before we complain
+
+# Helvetica metrics, in ems. Digits are all one width in this face, which is
+# what makes a 3-digit box a fixed size.
+_DIGIT_W = 0.556
+_ASCENT = 0.72
+_DESCENT = 0.22
 
 
 def inspect(pdf_path, page_index=0):
@@ -106,6 +114,123 @@ def to_4x6(src, dst, page_index=0, force_rotation=None):
             "ink_bbox": tuple(round(v, 1) for v in bbox),
             "crop_bbox": tuple(round(v, 1) for v in box),
             "size_in": (round(w / PT_PER_IN, 3), round(h / PT_PER_IN, 3))}
+
+
+def _code_placement(mediabox, rot, code, size, margin):
+    """Where the code goes so that it lands top-right *as printed*.
+
+    The page is not stored upright: `to_4x6` leaves a landscape mediabox
+    with /Rotate 90, so page space and printed space disagree. Under a 90
+    degree clockwise display rotation, page +y runs to the right of the
+    print and page -x runs up it - which puts the printed top-right corner
+    at the page's top-*left*, with the text on a +90 (CCW) matrix. That is
+    the same convention the label's own text uses.
+
+    Returns (matrix, tx, ty, box) in page coordinates, where box is
+    (x, y, w, h) for the white patch behind the digits."""
+    x0, y0, x1, y1 = mediabox
+    textw = len(code) * _DIGIT_W * size
+    asc, desc = _ASCENT * size, _DESCENT * size
+    pad = 0.35 * size
+    rot = rot % 360
+
+    if rot == 90:
+        tx, ty = x0 + margin + asc, y1 - margin - textw
+        return ((0, 1, -1, 0), tx, ty,
+                (tx - asc - pad, ty - pad, asc + desc + 2 * pad,
+                 textw + 2 * pad))
+    if rot == 180:
+        tx, ty = x0 + margin + textw, y0 + margin + asc
+        return ((-1, 0, 0, -1), tx, ty,
+                (tx - textw - pad, ty - desc - pad, textw + 2 * pad,
+                 asc + desc + 2 * pad))
+    if rot == 270:
+        tx, ty = x1 - margin - asc, y0 + margin + textw
+        return ((0, -1, 1, 0), tx, ty,
+                (tx - desc - pad, ty - textw - pad, asc + desc + 2 * pad,
+                 textw + 2 * pad))
+    tx, ty = x1 - margin - textw, y1 - margin - asc
+    return ((1, 0, 0, 1), tx, ty,
+            (tx - pad, ty - desc - pad, textw + 2 * pad,
+             asc + desc + 2 * pad))
+
+
+def _overlay_pdf(mediabox, content):
+    """A one-page PDF holding nothing but `content`, sized to match.
+
+    Written out by hand rather than with reportlab, which is a test-only
+    dependency here and would otherwise have to be installed on the Pi -
+    the short dependency list is deliberate. Helvetica is one of the 14
+    faces every PDF reader carries, so nothing needs embedding."""
+    x0, y0, x1, y1 = mediabox
+    stream = content.encode("ascii")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (f"<< /Type /Page /Parent 2 0 R /MediaBox "
+         f"[{x0:.4f} {y0:.4f} {x1:.4f} {y1:.4f}] /Resources << /Font << "
+         f"/MPCode 5 0 R >> >> /Contents 4 0 R >>").encode("ascii"),
+        (b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n"
+         + stream + b"\nendstream"),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode("ascii") + body + b"\nendobj\n"
+    xref_at = len(out)
+    size = len(objs) + 1
+    out += f"xref\n0 {size}\n".encode("ascii")
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode("ascii")
+    out += (f"trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n"
+            f"{xref_at}\n%%EOF\n").encode("ascii")
+    return bytes(out)
+
+
+def stamp_code(src, dst, code, size=8.0, margin=6.0):
+    """Write src to dst with `code` printed small in the top right.
+
+    Deliberately not applied to the archived label: `cli.print_label`
+    stamps a throwaway copy on its way to the printer, so re-printing can
+    never double-stamp and the file on disk stays as Facebook sent it.
+
+    The white patch behind the digits is not decoration - the top right of
+    a USPS label is not reliably blank, and black on black would be
+    useless."""
+    code = str(code)
+    if not code.isdigit():
+        raise ValueError(f"code must be digits, got {code!r}")
+
+    # clone_from, so the page is attached to the writer before the merge.
+    # Merging into a detached page is deprecated in pypdf and documented as
+    # unreliable; it removes silently in pypdf 7.
+    writer = PdfWriter(clone_from=str(src))
+    page = writer.pages[0]
+    mediabox = [float(v) for v in page.mediabox]
+    rot = int(page.get("/Rotate") or 0)
+    (a, b, c, d), tx, ty, (bx, by, bw, bh) = _code_placement(
+        mediabox, rot, code, size, margin)
+
+    content = (
+        "q\n"
+        "1 1 1 rg\n"
+        f"{bx:.3f} {by:.3f} {bw:.3f} {bh:.3f} re f\n"
+        "0 0 0 rg\n"
+        f"BT /MPCode {size:.3f} Tf "
+        f"{a} {b} {c} {d} {tx:.3f} {ty:.3f} Tm ({code}) Tj ET\n"
+        "Q\n")
+
+    overlay = PdfReader(io.BytesIO(_overlay_pdf(mediabox, content))).pages[0]
+    page.merge_page(overlay)
+
+    with open(dst, "wb") as fh:
+        writer.write(fh)
+    return {"code": code, "rotation": rot,
+            "origin": (round(tx, 1), round(ty, 1))}
 
 
 def extract_label_fields(pdf_4x6):

@@ -34,10 +34,10 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # tab name -> (SQL, column headers)
 TABS = {
     "Sales": (
-        """SELECT received_at, item, buyer, price, ship_by, tracking,
+        """SELECT code, received_at, item, buyer, price, ship_by, tracking,
                   ship_to, weight, service, status, printed_at
              FROM sales ORDER BY received_at DESC""",
-        ["Sold", "Item", "Buyer", "Price", "Ship by", "Tracking",
+        ["Code", "Sold", "Item", "Buyer", "Price", "Ship by", "Tracking",
          "Ship to", "Weight", "Service", "Status", "Printed"]),
 
     "Listings": (

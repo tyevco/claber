@@ -96,6 +96,147 @@ def test_oversized_content_rejected(tmp_path):
         label.to_4x6(big, tmp_path / "o.pdf")
 
 
+# ----------------------------------------------------------- parcel code
+
+def _quadrant_ink(pdf, dpi=203):
+    """Ink per corner of the page *as printed*, as a fraction of each area.
+
+    Rendered, not reasoned about: the page is stored landscape with
+    /Rotate 90, so page space and printed space disagree, and the only
+    honest way to know where the code lands is to look at the output."""
+    from mplabel import printers
+    data, width_px, width_bytes, height = printers.render_bitmap(pdf, dpi)
+    half_w, half_h = width_px // 2, height // 2
+
+    def dark(x_from, x_to, y_from, y_to):
+        n = 0
+        for y in range(y_from, y_to):
+            row = y * width_bytes
+            for x in range(x_from, x_to):
+                if data[row + (x >> 3)] & (0x80 >> (x & 7)):
+                    n += 1
+        return n / max(1, (x_to - x_from) * (y_to - y_from))
+
+    # Rendered images put y=0 at the top.
+    return {"tl": dark(0, half_w, 0, half_h),
+            "tr": dark(half_w, width_px, 0, half_h),
+            "bl": dark(0, half_w, half_h, height),
+            "br": dark(half_w, width_px, half_h, height)}
+
+
+def test_code_lands_in_the_printed_top_right(tmp_path):
+    """The whole point of the feature: the code has to be findable in the
+    corner of the paper, not merely present in the file somewhere."""
+    plain = tmp_path / "plain.pdf"
+    stamped = tmp_path / "stamped.pdf"
+    label.to_4x6(LABEL_PDF, plain)
+    label.stamp_code(plain, stamped, "042")
+
+    before, after = _quadrant_ink(plain), _quadrant_ink(stamped)
+    assert after["tr"] > before["tr"], "nothing was added to the top right"
+    for corner in ("tl", "bl", "br"):
+        assert abs(after[corner] - before[corner]) < 0.001, \
+            f"the stamp bled into the {corner} corner"
+
+
+def test_stamped_label_is_still_exactly_4x6(tmp_path):
+    """An oversized page is 824 dots at 203dpi, wider than the print head,
+    and the overflow ejects a second near-blank label."""
+    plain = tmp_path / "plain.pdf"
+    stamped = tmp_path / "stamped.pdf"
+    label.to_4x6(LABEL_PDF, plain)
+    label.stamp_code(plain, stamped, "042")
+
+    from mplabel import printers
+    for pdf in (plain, stamped):
+        _d, w, _wb, h = printers.render_bitmap(pdf, 203)
+        assert (w, h) == (812, 1218)
+
+
+def test_stamp_does_not_disturb_the_label_fields(tmp_path):
+    """The code is three digits on a page full of numbers. If it ever gets
+    stamped before extraction, this is what catches it."""
+    plain = tmp_path / "plain.pdf"
+    stamped = tmp_path / "stamped.pdf"
+    label.to_4x6(LABEL_PDF, plain)
+    label.stamp_code(plain, stamped, "042")
+    assert label.extract_label_fields(stamped) == \
+        label.extract_label_fields(plain)
+
+
+def test_code_never_collides_with_an_unshipped_parcel(db):
+    """Two boxes in the hall with the same number on them is the one
+    outcome that makes the whole feature worse than useless."""
+    from mplabel import cli
+
+    for n in range(998):
+        db.execute("INSERT INTO sales (message_id, code, status) "
+                   "VALUES (?,?,'printed')", (f"<m{n}>", f"{n:03d}"))
+    db.commit()
+    for _ in range(20):
+        assert cli.allocate_code(db) in ("998", "999")
+
+
+def test_a_shipped_parcel_frees_its_code(db):
+    """Codes are scoped to what is still going out, or they would run out."""
+    from mplabel import cli
+
+    for n in range(1000):
+        db.execute("INSERT INTO sales (message_id, code, status) "
+                   "VALUES (?,?,?)",
+                   (f"<m{n}>", f"{n:03d}",
+                    "shipped" if n == 500 else "printed"))
+    db.commit()
+    assert cli.allocate_code(db) == "500"
+
+
+def test_code_is_three_digits(db):
+    from mplabel import cli
+    code = cli.allocate_code(db)
+    assert len(code) == 3 and code.isdigit()
+
+
+def test_reprint_keeps_the_same_code(db):
+    """The paper, the screen and the sheet have to agree, so allocation
+    has to be idempotent."""
+    from mplabel import cli
+
+    db.execute("INSERT INTO sales (message_id) VALUES ('<m1>')")
+    db.commit()
+    first = cli.ensure_code(db, "<m1>")
+    assert first and cli.ensure_code(db, "<m1>") == first
+    assert db.execute("SELECT code FROM sales WHERE message_id='<m1>'"
+                      ).fetchone()[0] == first
+
+
+def test_migration_adds_code_to_an_existing_database(tmp_path):
+    """Her database already holds real sales, and CREATE TABLE IF NOT
+    EXISTS will not add a column to it."""
+    from mplabel import cli
+
+    home = tmp_path / "marketplace"
+    (home / "labels").mkdir(parents=True)
+    old = sqlite3.connect(home / "sales.db")
+    old.executescript(
+        cli.SCHEMA.replace("code         TEXT,\n", ""))
+    old.execute("INSERT INTO sales (message_id, item) VALUES ('<m1>','Lamp')")
+    old.commit()
+    old.close()
+
+    conn = cli.connect_db(home)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sales)")}
+    assert "code" in cols
+    row = conn.execute("SELECT item, code FROM sales").fetchone()
+    assert row["item"] == "Lamp" and row["code"] is None
+
+
+def test_stamp_rejects_a_non_numeric_code(tmp_path):
+    plain = tmp_path / "plain.pdf"
+    label.to_4x6(LABEL_PDF, plain)
+    with pytest.raises(ValueError, match="digits"):
+        label.stamp_code(plain, tmp_path / "x.pdf", "04A")
+
+
 # ------------------------------------------------------------- rasterise
 
 @pytest.mark.parametrize("dpi,w,h", [(203, 812, 1218), (300, 1200, 1800)])
@@ -796,6 +937,17 @@ def test_sheet_payload_builds_without_credentials(db):
     counts = sheets.sync(db, None, dry_run=True)
     assert set(counts) == {"Sales", "Listings", "By price band",
                            "Monthly", "Aging"}
+
+
+def test_sales_tab_carries_the_parcel_code(db):
+    """The code is only useful if it can be read off the sheet against the
+    number written on the box."""
+    db.execute("INSERT INTO sales (message_id, item, code) "
+               "VALUES ('<m1>', 'Brass Lamp', '042')")
+    db.commit()
+    sql, headers = sheets.TABS["Sales"]
+    assert headers[0] == "Code"
+    assert db.execute(sql).fetchone()[0] == "042"
 
 
 def test_sheet_tabs_have_matching_header_widths(db):
