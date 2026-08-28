@@ -269,23 +269,39 @@ def already_seen(conn, message_id, listing_id):
 
 # ---------------------------------------------------------------- printing
 
+# Digits and capitals, minus I L O U - the characters that get misread as
+# 1, 1, 0 and V on a thermal label read across a room. 32 symbols over 3
+# places is 32768 codes, so collisions among open parcels never bite.
+CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+CODE_LENGTH = 3
+
+
 def allocate_code(conn):
-    """A 3-digit code that no unshipped parcel is already using.
+    """A code that no unshipped parcel is already using.
 
     Scoped to unshipped deliberately: the code exists to tell apart the
     boxes waiting to go out, so once a parcel ships its code is free
     again. Random rather than sequential, so a re-run cannot silently
     hand out a code that is still on a box in the hall."""
-    taken = {r[0] for r in conn.execute(
+    taken = {(r[0] or "").upper() for r in conn.execute(
         "SELECT code FROM sales WHERE code IS NOT NULL "
         "AND status != 'shipped'")}
-    free = [f"{n:03d}" for n in range(1000) if f"{n:03d}" not in taken]
-    if not free:
-        # A thousand parcels open at once. Repeat rather than refuse to
-        # print: an ambiguous code beats a parcel that cannot ship.
-        log.warning("all 1000 codes are in use by unshipped parcels")
-        return f"{random.randrange(1000):03d}"
-    return random.choice(free)
+    for _ in range(200):
+        code = "".join(random.choice(CODE_ALPHABET)
+                       for _ in range(CODE_LENGTH))
+        if code not in taken:
+            return code
+    # Only reachable if a startling share of the space is in use. Walk it
+    # rather than keep rolling.
+    for n in range(len(CODE_ALPHABET) ** CODE_LENGTH):
+        code, rest = "", n
+        for _ in range(CODE_LENGTH):
+            code = CODE_ALPHABET[rest % len(CODE_ALPHABET)] + code
+            rest //= len(CODE_ALPHABET)
+        if code not in taken:
+            return code
+    log.warning("every code is in use by an unshipped parcel")
+    return "".join(random.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
 
 
 def ensure_code(conn, message_id):
@@ -590,10 +606,21 @@ def cmd_list(cfg, conn, args):
               f"{printed}")
 
 
+def find_sale(conn, ref):
+    """Look a sale up by any of the things you might have to hand.
+
+    The parcel code is included because it is the only one of these that
+    is printed on the box: reading it off the label and typing it back is
+    the whole point of stamping it there. Case-insensitive, since it is
+    read off paper."""
+    return conn.execute(
+        "SELECT * FROM sales WHERE listing_id=? OR order_id=? OR tracking=? "
+        "OR UPPER(code)=?",
+        (ref, ref, ref, (ref or "").upper())).fetchone()
+
+
 def cmd_reprint(cfg, conn, args):
-    row = conn.execute(
-        "SELECT * FROM sales WHERE listing_id=? OR order_id=? OR tracking=?",
-        (args.ref, args.ref, args.ref)).fetchone()
+    row = find_sale(conn, args.ref)
     if not row:
         raise SystemExit(f"no record matching {args.ref}")
     code = ensure_code(conn, row["message_id"])
@@ -704,8 +731,9 @@ def cmd_stats(cfg, conn, args):
 
 def cmd_ship(cfg, conn, args):
     n = conn.execute("UPDATE sales SET status='shipped' WHERE listing_id=? "
-                     "OR order_id=? OR tracking=?",
-                     (args.ref, args.ref, args.ref)).rowcount
+                     "OR order_id=? OR tracking=? OR UPPER(code)=?",
+                     (args.ref, args.ref, args.ref,
+                      (args.ref or "").upper())).rowcount
     conn.commit()
     print(f"{n} record(s) marked shipped")
 
@@ -728,8 +756,12 @@ def main():
     p.add_argument("--code", help="stamp this parcel code on the label, to "
                                   "check placement without printing")
     sub.add_parser("list", help="outstanding orders")
-    p = sub.add_parser("reprint"); p.add_argument("ref")
-    p = sub.add_parser("ship", help="mark as shipped"); p.add_argument("ref")
+    ref_help = ("parcel code from the label, or listing id, order id or "
+                "tracking number")
+    p = sub.add_parser("reprint", help="print a label again")
+    p.add_argument("ref", help=ref_help)
+    p = sub.add_parser("ship", help="mark as shipped")
+    p.add_argument("ref", help=ref_help)
     sub.add_parser("test-print", help="reprint the newest label")
     sub.add_parser("probe", help="show printers and USB devices")
     sub.add_parser("selftest", help="print a tiny text-only TSPL test label")

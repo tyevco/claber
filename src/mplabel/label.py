@@ -19,11 +19,25 @@ TARGET_W = 4.0 * PT_PER_IN     # 288
 TARGET_H = 6.0 * PT_PER_IN     # 432
 TOL = 4.0                      # pt of slop before we complain
 
-# Helvetica metrics, in ems. Digits are all one width in this face, which is
-# what makes a 3-digit box a fixed size.
-_DIGIT_W = 0.556
+# Helvetica advance widths, in ems. Digits are all one width in this face,
+# but letters are not - W is nearly twice M's neighbours - so the white
+# patch behind the code has to be measured, not assumed, or a code like
+# WXY spills out past its background.
 _ASCENT = 0.72
 _DESCENT = 0.22
+_HELVETICA_W = {
+    "0": .556, "1": .556, "2": .556, "3": .556, "4": .556,
+    "5": .556, "6": .556, "7": .556, "8": .556, "9": .556,
+    "A": .667, "B": .667, "C": .722, "D": .722, "E": .667, "F": .611,
+    "G": .778, "H": .722, "I": .278, "J": .500, "K": .667, "L": .556,
+    "M": .833, "N": .722, "O": .778, "P": .667, "Q": .778, "R": .722,
+    "S": .667, "T": .611, "U": .722, "V": .667, "W": .944, "X": .667,
+    "Y": .667, "Z": .611,
+}
+
+
+def _text_width(text, size):
+    return sum(_HELVETICA_W.get(ch, 0.6) for ch in text) * size
 
 
 def inspect(pdf_path, page_index=0):
@@ -129,7 +143,7 @@ def _code_placement(mediabox, rot, code, size, margin):
     Returns (matrix, tx, ty, box) in page coordinates, where box is
     (x, y, w, h) for the white patch behind the digits."""
     x0, y0, x1, y1 = mediabox
-    textw = len(code) * _DIGIT_W * size
+    textw = _text_width(code, size)
     asc, desc = _ASCENT * size, _DESCENT * size
     pad = 0.35 * size
     rot = rot % 360
@@ -201,9 +215,10 @@ def stamp_code(src, dst, code, size=8.0, margin=6.0):
     The white patch behind the digits is not decoration - the top right of
     a USPS label is not reliably blank, and black on black would be
     useless."""
-    code = str(code)
-    if not code.isdigit():
-        raise ValueError(f"code must be digits, got {code!r}")
+    code = str(code).upper()
+    if not code or not set(code) <= set(_HELVETICA_W):
+        raise ValueError(
+            f"code must be digits and capital letters, got {code!r}")
 
     # clone_from, so the page is attached to the writer before the merge.
     # Merging into a detached page is deprecated in pypdf and documented as

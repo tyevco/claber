@@ -244,36 +244,101 @@ def test_pending_dry_run_prints_nothing(db, tmp_path, capsys, monkeypatch):
     assert db.execute("SELECT printed_at FROM sales").fetchone()[0]
 
 
-def test_code_never_collides_with_an_unshipped_parcel(db):
-    """Two boxes in the hall with the same number on them is the one
-    outcome that makes the whole feature worse than useless."""
+def _tiny_alphabet(monkeypatch, alphabet="AB", length=1):
+    """Shrink the code space so exhaustion is testable at all. With the
+    real 32^3 the interesting cases never come up by chance."""
+    from mplabel import cli
+    monkeypatch.setattr(cli, "CODE_ALPHABET", alphabet)
+    monkeypatch.setattr(cli, "CODE_LENGTH", length)
+
+
+def test_code_never_collides_with_an_unshipped_parcel(db, monkeypatch):
+    """Two boxes in the hall with the same code on them is the one outcome
+    that makes the whole feature worse than useless."""
     from mplabel import cli
 
-    for n in range(998):
+    _tiny_alphabet(monkeypatch, "ABCD", 1)
+    for n, code in enumerate("ABC"):
         db.execute("INSERT INTO sales (message_id, code, status) "
-                   "VALUES (?,?,'printed')", (f"<m{n}>", f"{n:03d}"))
+                   "VALUES (?,?,'printed')", (f"<m{n}>", code))
     db.commit()
     for _ in range(20):
-        assert cli.allocate_code(db) in ("998", "999")
+        assert cli.allocate_code(db) == "D"
 
 
-def test_a_shipped_parcel_frees_its_code(db):
+def test_a_shipped_parcel_frees_its_code(db, monkeypatch):
     """Codes are scoped to what is still going out, or they would run out."""
     from mplabel import cli
 
-    for n in range(1000):
-        db.execute("INSERT INTO sales (message_id, code, status) "
-                   "VALUES (?,?,?)",
-                   (f"<m{n}>", f"{n:03d}",
-                    "shipped" if n == 500 else "printed"))
+    _tiny_alphabet(monkeypatch, "AB", 1)
+    db.execute("INSERT INTO sales (message_id, code, status) "
+               "VALUES ('<m1>','A','printed')")
+    db.execute("INSERT INTO sales (message_id, code, status) "
+               "VALUES ('<m2>','B','shipped')")
     db.commit()
-    assert cli.allocate_code(db) == "500"
+    assert cli.allocate_code(db) == "B"
 
 
-def test_code_is_three_digits(db):
+def test_code_avoids_characters_that_get_misread(db):
+    """I, L, O and U read as 1, 1, 0 and V on thermal stock across a room,
+    and the code is meant to be read off a box, not squinted at."""
     from mplabel import cli
-    code = cli.allocate_code(db)
-    assert len(code) == 3 and code.isdigit()
+
+    assert not set("ILOU") & set(cli.CODE_ALPHABET)
+    for _ in range(50):
+        code = cli.allocate_code(db)
+        assert len(code) == cli.CODE_LENGTH
+        assert set(code) <= set(cli.CODE_ALPHABET)
+
+
+def test_letters_are_stamped_and_measured(tmp_path):
+    """Helvetica letters are not one width - W is nearly twice I - so the
+    white patch has to be measured or a wide code spills off it."""
+    assert label._text_width("WWW", 8) > label._text_width("111", 8) * 1.5, \
+        "letter widths are not being measured"
+
+    plain = tmp_path / "plain.pdf"
+    label.to_4x6(LABEL_PDF, plain)
+    before = _quadrant_ink(plain)
+    for code in ("W7X", "042", "WWW"):
+        out = tmp_path / f"{code}.pdf"
+        label.stamp_code(plain, out, code)
+        after = _quadrant_ink(out)
+        assert after["tr"] > before["tr"], code
+        for corner in ("tl", "bl", "br"):
+            assert abs(after[corner] - before[corner]) < 0.001, \
+                f"{code} bled into the {corner} corner"
+
+
+def test_stamp_uppercases_a_lowercase_code(tmp_path):
+    plain = tmp_path / "plain.pdf"
+    label.to_4x6(LABEL_PDF, plain)
+    assert label.stamp_code(plain, tmp_path / "o.pdf", "w7x")["code"] == "W7X"
+
+
+def test_find_sale_by_parcel_code(db):
+    """The code is the only handle that is printed on the box, so it has to
+    be typeable back in - `list` shows it and nothing else you could use."""
+    from mplabel import cli
+
+    db.execute("INSERT INTO sales (message_id, item, listing_id, tracking, "
+               "code) VALUES ('<m1>','Lamp','123','9400abc','W7X')")
+    db.commit()
+    for ref in ("W7X", "w7x", "123", "9400abc"):
+        row = cli.find_sale(db, ref)
+        assert row is not None and row["item"] == "Lamp", ref
+    assert cli.find_sale(db, "nope") is None
+
+
+def test_ship_by_parcel_code(db):
+    import argparse
+    from mplabel import cli
+
+    db.execute("INSERT INTO sales (message_id, item, code) "
+               "VALUES ('<m1>','Lamp','W7X')")
+    db.commit()
+    cli.cmd_ship({}, db, argparse.Namespace(ref="w7x"))
+    assert db.execute("SELECT status FROM sales").fetchone()[0] == "shipped"
 
 
 def test_reprint_keeps_the_same_code(db):
@@ -310,11 +375,14 @@ def test_migration_adds_code_to_an_existing_database(tmp_path):
     assert row["item"] == "Lamp" and row["code"] is None
 
 
-def test_stamp_rejects_a_non_numeric_code(tmp_path):
+@pytest.mark.parametrize("bad", ["04-", "hi there", "", "4.2", "é"])
+def test_stamp_rejects_an_unprintable_code(tmp_path, bad):
+    """Anything outside the width table would be drawn at a guessed width
+    and spill off its own background."""
     plain = tmp_path / "plain.pdf"
     label.to_4x6(LABEL_PDF, plain)
-    with pytest.raises(ValueError, match="digits"):
-        label.stamp_code(plain, tmp_path / "x.pdf", "04A")
+    with pytest.raises(ValueError, match="capital letters"):
+        label.stamp_code(plain, tmp_path / "x.pdf", bad)
 
 
 # ------------------------------------------------------------- rasterise
