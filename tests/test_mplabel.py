@@ -377,6 +377,38 @@ def test_title_from_subject(subject, expected):
     assert listings.title_from_subject(subject) == expected
 
 
+@pytest.mark.parametrize("from_header,ok", [
+    ("Facebook Marketplace <noreply@marketplace.facebook.com>", True),
+    ("Facebook <notification@facebookmail.com>", True),
+    ("Facebook <NoReply@Marketplace.Facebook.Com>", True),
+    # Substring matching used to accept all of these.
+    ("Facebook Marketplace <noreply@marketplace.facebook.com.example.net>",
+     False),
+    ("Facebook Marketplace <billing@facebookmail.com.attacker.io>", False),
+    ("\"Facebook Marketplace\" <sales@notfacebookmail.com>", False),
+    ("Facebook Marketplace <hello@example.com>", False),
+])
+def test_sender_domain_must_be_facebook(from_header, ok):
+    """The IMAP search matches the From header as text, so a display name
+    alone gets a message fetched. Everything downstream trusts this: a
+    subject reading "New Marketplace order for <item>" becomes a sold
+    listing."""
+    msg = email.message_from_string(
+        f"From: {from_header}\n"
+        "Subject: New Marketplace order for Brass Lamp\n\n")
+    assert mailparse.is_from_facebook(msg) is ok
+
+
+def test_spoofed_sender_cannot_post_a_sale(db, monkeypatch):
+    from mplabel import cli
+    msg = email.message_from_string(
+        "From: Facebook Marketplace <noreply@marketplace.facebook.com.evil.ru>\n"
+        "Subject: New Marketplace order for Brass Lamp\n"
+        "Date: Fri, 28 Aug 2026 11:00:00 +0000\n\n")
+    assert cli.record_event(db, msg) == 0
+    assert db.execute("SELECT COUNT(*) FROM mail_events").fetchone()[0] == 0
+
+
 def test_a_local_pickup_sale_is_counted(tmp_path, db):
     """A local pickup sale never produces a shipping label, so the order
     subject is the only record of it. Those used to be dropped: the poller

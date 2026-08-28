@@ -275,6 +275,11 @@ def record_event(conn, msg):
     that were shipped.
 
     Returns 1 if a sale-side event was stored, else 0."""
+    # The IMAP search only matches the From header as text, so check the
+    # sender domain before believing a subject line. Otherwise anyone who
+    # puts "Facebook" in a display name can post a sale into her figures.
+    if not mailparse.is_from_facebook(msg):
+        return 0
     subject = mailparse._decode(msg.get("Subject"))
     kind = listings_mod.classify(subject)
     if not kind or kind == "shipping_label":

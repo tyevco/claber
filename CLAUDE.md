@@ -73,6 +73,7 @@ hardware or a real Facebook account.
 | Dot counts 812x1218 @203dpi | **Verified** by rendering. |
 | Label field extraction | **Verified** against the real PDF (tracking, weight, service, recipient address). |
 | Email field extraction | **Verified** against one real email, reproduced as a fixture. |
+| Marketplace sender address | **Verified.** Real mail comes from `Facebook Marketplace <noreply@marketplace.facebook.com>`. `SENDER_DOMAINS` also allows `facebookmail.com`, which is **ASSUMED** for the non-label notifications. |
 | Ship-by year inference | **Verified** by unit test incl. New Year rollover and leap day. Parse with an explicit year; year-less `strptime` defaults to 1900 and loses Feb 29. |
 | G4 speaks TSPL | **Verified on the hardware.** `tspl_selftest` rendered correctly — `TSPL OK` in large type, the following lines smaller and each on its own line, i.e. `TEXT 40,80,"4",0,2,2` executed rather than echoed — and a real label then printed through the `tspl` backend. |
 | **The IEEE-1284 id lies on this unit** | **Verified.** `probe` reads `MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;` — every word of which points at ESC/POS, and it is wrong. The same string calls this thermal printer an "Impact Printer", so the descriptor is boilerplate the OEM never edited. An ESC/POS text selftest printed *nothing*, which is what a TSPL parser does with commands it does not recognise. Do not switch backends on the strength of the id; print something first. USB `28e9:02ad`, CUPS sees `usb://Clabel-/G4`. |
@@ -137,6 +138,8 @@ reinterprets a 22-digit tracking number as a float and mangles it.
 **Sell-through is meaningless without prices on unsold listings.** Prices
 only reach the DB if the listing email or a saved-page/DYI import carried
 one. If `v_aging` shows blank prices, the percentages are lying.
+
+**The IMAP search is not a sender check.** `poll_once` searches `(UNSEEN FROM "facebook")`, which matches the From header as *text* - a display name is enough to get a message fetched, and anyone can set one. `mailparse.is_from_facebook` is the real gate, and it matches the address domain with a boundary: `noreply@marketplace.facebook.com.example.net` contains `marketplace.facebook.com` but is not Facebook. Every path that turns mail into data - `is_label_email`, `cli.record_event`, `backfill.run` - must call it, because a subject reading "New Marketplace order for <item>" now creates a sold listing.
 
 **A sale is not the same thing as a label.** `is_label_email` keeps only subjects with "label" or "shipping", but the sale itself arrives as `New Marketplace order for <item>`, and a **local pickup sale produces no label email at all**. The poller therefore records a `mail_events` row for any classified non-label Facebook mail before putting it back, and `apply_events` reconciles it by the item name in the subject. Without that the database only ever knew about items that shipped, which is how 25 sold listings sat next to a 3-row `sales` table.
 

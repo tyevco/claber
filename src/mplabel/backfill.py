@@ -145,6 +145,11 @@ def run(cfg, conn, limit=None, resume=True):
                 if typ != "OK" or not raw or not raw[0]:
                     continue
                 msg = email.message_from_bytes(raw[0][1])
+                # The server-side search is by From domain, but X-GM-RAW
+                # and IMAP SEARCH both match loosely. Verify per message.
+                if not mailparse.is_from_facebook(msg):
+                    unmatched += 1
+                    continue
                 mid = mailparse._decode(msg.get("Message-ID"))
                 if mid and mid in seen:
                     skipped += 1

@@ -215,9 +215,27 @@ def attachment(msg, suffix=".pdf"):
     return None, None
 
 
+def is_from_facebook(msg):
+    """True only if the message really came from Facebook.
+
+    The IMAP search is `FROM "facebook"`, which matches the whole From
+    header - so a display name is enough to get a message fetched, and
+    anyone can set one. Everything downstream trusts this: a subject
+    reading "New Marketplace order for <item>" is taken as a sale and
+    creates a sold listing, so a spoof would quietly poison the numbers.
+
+    Match on the address domain with a boundary, not as a substring:
+    `noreply@marketplace.facebook.com.example.net` contains
+    "marketplace.facebook.com" but is not Facebook."""
+    header = (_decode(msg.get("From")) + " "
+              + _decode(msg.get("Reply-To"))).lower()
+    domains = re.findall(r"[^\s<>@]+@([a-z0-9.\-]+)", header)
+    return any(d == known or d.endswith("." + known)
+               for d in domains for known in SENDER_DOMAINS)
+
+
 def is_label_email(msg):
-    sender = (_decode(msg.get("From")) + _decode(msg.get("Reply-To"))).lower()
-    if not any(d in sender for d in SENDER_DOMAINS):
+    if not is_from_facebook(msg):
         return False
     subject = _decode(msg.get("Subject")).lower()
     return "label" in subject or "shipping" in subject
