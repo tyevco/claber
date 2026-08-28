@@ -242,12 +242,15 @@ def test_escpos_continuous_media_does_not_form_feed(tmp_path):
         printers.build_escpos(out, 203, media="nonsense")
 
 
-@pytest.mark.parametrize("argv,patch", [
-    (["mplabel", "selftest"], "escpos_selftest"),
-    (["mplabel", "file", str(LABEL_PDF)], None),
+@pytest.mark.parametrize("cmd,patch", [
+    (["selftest"], "escpos_selftest"),
+    # -o keeps the converted PDF in tmp_path: without it cmd_file writes
+    # label_sample_4x6.pdf next to the fixture, and .gitignore's
+    # !tests/fixtures/** exception means it lands in the next commit.
+    (["file", str(LABEL_PDF), "-o"], None),
 ])
 def test_printer_commands_do_not_open_the_database(monkeypatch, tmp_path,
-                                                   argv, patch):
+                                                   cmd, patch):
     """selftest and file never touch the database, so they must not open
     one. They used to, which meant an unwritable home directory stopped
     you testing the printer:
@@ -263,9 +266,13 @@ def test_printer_commands_do_not_open_the_database(monkeypatch, tmp_path,
     monkeypatch.setattr(cli, "load_config", lambda p: dict(cli.DEFAULTS))
     if patch:
         monkeypatch.setattr(printers, patch, lambda *a, **k: None)
+    argv = ["mplabel"] + cmd
+    if cmd[-1] == "-o":
+        argv.append(str(tmp_path / "out.pdf"))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", argv)
     cli.main()
+    assert not list(FIXTURES.glob("*_4x6.pdf")), "wrote into tests/fixtures"
 
 
 def test_probe_only_suggests_backends_that_exist():
