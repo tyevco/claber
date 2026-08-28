@@ -470,6 +470,37 @@ def test_unrelated_json_not_treated_as_listing():
     assert all(r["title"] != "nope" for r in rows)
 
 
+def test_console_snippet_json_imports(tmp_path, db):
+    """CONSOLE_SNIPPET downloads a bare .json array, not a page. That has
+    no <script> tags, so it used to parse to zero listings and blame the
+    scrolling. Its `listed_at` key is not one of Facebook's own creation
+    time spellings either."""
+    import json as _json
+
+    rows = [
+        {"listing_id": "111", "title": "Brass Candlestick Pair",
+         "price": 38.0, "listed_at": 1756382400,
+         "is_sold": False, "is_live": True},
+        {"listing_id": "222", "title": "Walnut Mantel Clock",
+         "price": 120.0, "listed_at": 1753704000,
+         "is_sold": True, "is_live": False},
+    ]
+    src = tmp_path / "marketplace-listings.json"
+    src.write_text(_json.dumps(rows), encoding="utf-8")
+
+    found, stats = savedpage.extract(src)
+    assert stats["listings"] == 2, stats
+    by_id = {r["listing_id"]: r for r in found}
+    assert by_id["111"]["title"] == "Brass Candlestick Pair"
+    assert by_id["111"]["state"] == "active"
+    assert by_id["222"]["state"] == "sold"
+    assert by_id["111"]["price"] == 38.0
+    assert by_id["111"]["listed_at"], "the listed_at key must survive"
+
+    savedpage.import_saved(db, src)
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 2
+
+
 def test_saved_page_import_populates_analytics(db):
     savedpage.import_saved(db, FIXTURES / "selling_page.html")
     listings.build_views(db)

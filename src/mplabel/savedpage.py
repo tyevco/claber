@@ -61,6 +61,17 @@ def _json_blobs(text, failures=None):
     a page saved mid-load has truncated script tags, and a run that
     reports 3 listings and 40 skipped blocks means something went wrong
     with the save, not that she only has 3 listings."""
+    # A bare .json file - what CONSOLE_SNIPPET downloads - has no script
+    # tags at all. Without this it parsed to zero listings and told her to
+    # scroll further, which was never the problem.
+    stripped = text.lstrip()
+    if stripped[:1] in "{[":
+        try:
+            yield json.loads(stripped)
+            return
+        except (json.JSONDecodeError, ValueError):
+            pass
+
     seen = 0
     for pattern in (SCRIPT_RE, ANY_SCRIPT_RE):
         for raw in pattern.findall(text):
@@ -185,7 +196,9 @@ def extract(path):
                 "price": _price(_first(d, PRICE_KEYS)),
                 "listed_at": _time(d.get("creation_time")
                                    or d.get("created_time")
-                                   or d.get("creation_timestamp")),
+                                   or d.get("creation_timestamp")
+                                   # what CONSOLE_SNIPPET writes
+                                   or d.get("listed_at")),
                 "state": _state(d),
                 "category": d.get("marketplace_listing_category_id")
                             or d.get("category_name"),
