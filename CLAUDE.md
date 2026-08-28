@@ -18,7 +18,7 @@ cleverness.
 
 ```bash
 pip install -e ".[dev,sheets]"
-pytest                                     # 40 tests, all should pass
+pytest                                     # 95 tests, all should pass
 pytest tests/test_mplabel.py::test_output_is_exactly_4x6   # one test
 pytest -k tspl                             # printer-language regressions
 python -m mplabel --help
@@ -27,7 +27,35 @@ python -m mplabel file tests/fixtures/label_sample.pdf   # no config needed
 
 Config resolution order: `MPLABEL_<KEY>` env var, then
 `/etc/mplabel.conf`, then `~/.config/mplabel.conf`, then `DEFAULTS` in
-`cli.py`.
+`cli.py`. Two traps in that chain: it stops at the **first** config file
+that exists, so `~/.config/mplabel.conf` is never read while
+`/etc/mplabel.conf` is there - values do not merge; and the file needs its
+`[mplabel]` section header, without which the parser finds nothing and
+silently falls back to `DEFAULTS`, which looks exactly like an empty
+config.
+
+## Deploying to the Pi
+
+`install_pi.sh` copies `src/` into `/opt/mplabel` and does a
+**non-editable** install, so the running code is in the venv's
+site-packages, not in the git checkout. Pulling in `~/claber` changes
+nothing on its own:
+
+```bash
+cd ~/claber && git pull
+/opt/mplabel/venv/bin/pip install --force-reinstall --no-deps ~/claber
+sudo systemctl restart mplabel
+```
+
+`--force-reinstall` is not optional. The version in `pyproject.toml` never
+moves, so pip sees `mplabel 0.1.0` already installed and skips - which
+means a re-run of `install_pi.sh` used to leave the old code in place while
+looking like it had worked. `--no-deps` stops it re-downloading Pillow and
+friends.
+
+`/etc/mplabel.conf` is never overwritten by the installer, so after an
+update check by hand that any new key is set. The file beats the built-in
+default.
 
 ## Layout
 
@@ -52,7 +80,26 @@ install_pi.sh     Pi bootstrap
 One SQLite file, two schemas declared in two modules: `cli.SCHEMA`
 owns `sales`; `listings.SCHEMA` owns `listings` and `mail_events`.
 Nothing joins them at write time - `listings.link_sales()` reconciles
-by `listing_id` afterwards.
+afterwards.
+
+**Reconciliation is by title as often as by id.** A saved-page import has
+no Facebook listing id to work with (the cards do not carry one), and
+plenty of label emails carry none either. So a listing with no id is keyed
+by `listings.title_key(title)` - `saved:<slug>-<sha1[:8]>` - and
+`link_sales` falls back to matching a sale against a listing by normalised
+title, creating the row under the same scheme when nothing matches. One
+function owns that derivation for both sides; if they ever drift, sales
+stop finding their listings and duplicates appear silently beside them.
+
+The digest is not decoration: her titles run long and share their first
+sixty characters ("Antique 1900-1915 American Edwardian / Late
+Victorian..."), and a plain truncated slug merged two real listings into
+one, quietly shrinking the denominator sell-through is measured against.
+
+**Adding a column needs a migration.** `CREATE TABLE IF NOT EXISTS` will
+not touch a database that already holds real sales, so `connect_db` carries
+a small `PRAGMA table_info` / `ALTER TABLE` loop. Add to that list, not
+just to `SCHEMA`, or the column exists only on fresh installs.
 
 `listings.refresh()` is the single rebuild entry point: schema ->
 link_sales -> apply_events -> build_views. Analytics are views, not
@@ -60,6 +107,41 @@ tables: `v_listing_perf` derives days_to_sell / days_listed /
 price_band, and `v_price_band`, `v_monthly` and `v_aging` are built on
 top of it. `sheets.TABS` selects from those views by column name, so
 renaming a view column breaks the sheet with no test failure.
+
+## Getting her listings out of Marketplace
+
+This is the part that took the most attempts, so the reasoning is worth
+keeping.
+
+`savedpage.extract()` reads the JSON Facebook embeds in `<script>` tags.
+On a real selling page **that JSON is not there any more** - the cards are
+rendered from data that never lands in a parseable script tag, so a save of
+the page yields nothing. The working route is `CONSOLE_SNIPPET`
+(`python -m mplabel.savedpage --snippet`), pasted into DevTools on
+`facebook.com/marketplace/you/selling` after scrolling to the bottom. It
+reads the rendered page and downloads clean JSON, which `extract()` also
+imports - a file that is itself JSON is parsed directly.
+
+Three things the snippet learned the hard way, each from a real run:
+
+- **Anchor on the price, not on links.** Her own listings do not link to
+  `/marketplace/item/<id>` - they open an edit panel - so an href-based
+  scan found zero.
+- **Climb until the block holds a real title.** Reduced listings show two
+  prices; stopping at the first two-line block picked up the struck-through
+  original price *as the title*, and rows imported titled `$325.00`.
+- **Field labels are chrome.** `Category: Women's clothing & shoes` became a
+  title on cards where the real one sat outside the price's block.
+
+`mplabel import --format saved <file> --state sold` forces the state for a
+capture taken from one tab. The snippet reads "sold" from a badge inside
+each card, but on the Sold tab the tab itself carries that meaning and the
+cards may not repeat it - without the override every sold listing imports
+as active, which inverts sell-through: the numerator empties while the
+denominator grows.
+
+Neither capture carried dates, so `listed_at` is empty and `v_aging` is
+empty with it. The DYI export is the only route to those.
 
 ## Verified vs assumed
 
@@ -136,6 +218,20 @@ first ships every parcel back to the seller.
 **Sheets writes use `value_input_option="RAW"`.** Otherwise Sheets
 reinterprets a 22-digit tracking number as a float and mangles it.
 
+**Set `sheets_id`, not `sheets_name`.** `SCOPES` asks only for
+`spreadsheets`, but opening a sheet *by name* makes gspread search Drive,
+which needs the Drive scope - so `sheets_name` fails with a permission
+error even when the key and the sharing are both correct. The id is the
+long string in the sheet's URL between `/d/` and `/edit`. And the sheet
+must be shared with the service account's `client_email` as Editor: it is
+a separate identity, and until it is shared every write is a 403 no matter
+how good the key is.
+
+**A printer test must not need the database.** `probe`, `selftest` and
+`file` run above `connect_db` in `main()`, because an unwritable home
+directory once stopped a printer test dead - which is the one thing you
+want working when nothing else is. `cmd_file` takes no `conn` at all.
+
 **Sell-through is meaningless without prices on unsold listings.** Prices
 only reach the DB if the listing email or a saved-page/DYI import carried
 one. If `v_aging` shows blank prices, the percentages are lying.
@@ -183,7 +279,10 @@ it to the repo.
   manually saved page with zero automated requests. If asked to add a
   scraper, raise this before building it.
 - **stdlib HTML parsing.** No BeautifulSoup, to keep the Pi dependency
-  list short. Do not add it for convenience.
+  list short. Do not add it for convenience. Same rule elsewhere: the
+  parcel-code overlay is hand-written PDF bytes using base-14 Helvetica
+  rather than promoting **reportlab** from a test-only dependency, and any
+  HTTP client should be `urllib` rather than `requests`.
 - **Shape-tolerant importers.** DYI and saved-page parsers walk nested
   JSON looking for listing-shaped objects rather than following fixed
   paths, because both formats are undocumented and change without
@@ -199,6 +298,19 @@ it to the repo.
 ## Open work
 
 Roughly in priority order.
+
+0. **USPS tracking is probably not available, and that is a finding, not a
+   gap.** The idea was to look up each tracking number and mark the parcel
+   shipped on its first scan. USPS tied tracking access to the **Mailer ID
+   that bought the postage** on 1 April 2026, and on a Marketplace label
+   that MID belongs to Facebook's label provider, not to her - parties
+   without it need a signed IP agreement and a monthly fee. The Web Tools
+   XML API that used to answer on a bare tracking number was shut down on
+   25 January 2026, so there is no legacy fallback. Settle it with one
+   OAuth token and one lookup (`apis.usps.com/oauth2/v3/token`, then
+   `/tracking/v3/tracking/<number>`) before writing a client; a 403 means
+   fall back to deriving status from her mailbox, where every other fact in
+   this system already comes from.
 
 1. **Check the printed label against the stock.** TSPL prints, so what is
    left is geometry, not language: does one job advance exactly one
@@ -232,3 +344,15 @@ something non-obvious was learned the hard way — those comments are load
 bearing, keep them. Docstrings on modules and non-trivial functions.
 Tests are regression tests: each one exists because something was
 actually wrong. If you fix a bug, add the test first.
+
+Two habits worth keeping in the tests themselves:
+
+- **The `db` fixture builds the real schemas**, `cli.SCHEMA` and
+  `listings.SCHEMA`. It used to hand-roll a trimmed `sales` table, which
+  drifted until it had no `message_id` - so tests passed against a table
+  the code would never meet.
+- **Assert on rendered output where geometry matters.** The parcel code's
+  placement is checked by rasterising the page and asking which corner
+  gained ink, not by trusting the rotation arithmetic. The page is stored
+  landscape with `/Rotate 90` and a non-zero mediabox origin, and reasoning
+  about that is exactly where a plausible-looking mistake hides.
