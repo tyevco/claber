@@ -613,6 +613,63 @@ def cmd_test_print(cfg, conn, args):
           + (f"  [{code}]" if code else ""))
 
 
+def cmd_pending(cfg, conn, args):
+    """Print labels that were recorded but never printed.
+
+    `run` cannot do this: once a message is in `sales` the poller skips it
+    on sight, which is what stops a re-poll reprinting the world. So
+    anything recorded by `check` - or by a run that failed at the printer -
+    needs its own way out, and this is it.
+
+    Defaults to today only. The window the poller looks back over is days
+    wide, and older labels may well have been printed and posted by hand
+    already; reprinting those wastes stock and puts a second label on a
+    parcel that has gone."""
+    sql = ("SELECT message_id, item, price, code, label_pdf, received_at "
+           "FROM sales WHERE printed_at IS NULL AND status != 'shipped' "
+           "AND label_pdf IS NOT NULL")
+    params = []
+    if not args.all:
+        since = args.since or datetime.now().strftime("%Y-%m-%d")
+        # Compare the date as written in the email rather than converting:
+        # received_at carries the sender's offset, and shifting it around
+        # timezones would move labels across the day boundary.
+        sql += " AND substr(received_at, 1, 10) >= ?"
+        params.append(since)
+    rows = conn.execute(sql + " ORDER BY received_at", params).fetchall()
+
+    if not rows:
+        print("nothing pending" if args.all else
+              "nothing pending from today - use --since or --all to widen")
+        return
+
+    for r in rows:
+        print(f"  {r['code'] or '---':<5} {(r['received_at'] or '?')[:10]}  "
+              f"${r['price'] or 0:>7.2f}  {(r['item'] or '?')[:44]}")
+    if args.dry_run:
+        print(f"\n{len(rows)} label(s) would print. Drop --dry-run to send "
+              f"them.")
+        return
+
+    print()
+    sent = 0
+    for r in rows:
+        if not Path(r["label_pdf"]).exists():
+            log.error("label file missing for %s: %s", r["item"],
+                      r["label_pdf"])
+            continue
+        try:
+            print_label(cfg, r["label_pdf"], ensure_code(conn, r["message_id"]))
+            mark_printed(conn, r["message_id"])
+            sent += 1
+        except Exception as exc:
+            log.error("print failed for %s: %s", r["item"], exc)
+            conn.execute("UPDATE sales SET notes=? WHERE message_id=?",
+                         (f"print failed: {exc}", r["message_id"]))
+            conn.commit()
+    print(f"printed {sent} of {len(rows)}")
+
+
 def cmd_stats(cfg, conn, args):
     listings_mod.refresh(conn)
 
@@ -693,6 +750,15 @@ def main():
                         "e.g. --state sold for the Sold tab. Without it the "
                         "state comes from a badge in each card, which the "
                         "Sold tab may not repeat.")
+    p = sub.add_parser("pending",
+                       help="print labels that were recorded but never "
+                            "printed (today only unless widened)")
+    p.add_argument("--since", metavar="YYYY-MM-DD",
+                   help="from this date instead of today")
+    p.add_argument("--all", action="store_true",
+                   help="every pending label, however old")
+    p.add_argument("--dry-run", action="store_true",
+                   help="list them without printing")
     sub.add_parser("stats", help="analytics summary in the terminal")
 
     args = ap.parse_args()
@@ -770,5 +836,7 @@ def main():
         else:
             print(f"imported {listings_mod.import_csv(conn, args.path)} row(s)")
         listings_mod.refresh(conn)
+    elif args.cmd == "pending":
+        cmd_pending(cfg, conn, args)
     elif args.cmd == "stats":
         cmd_stats(cfg, conn, args)

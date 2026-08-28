@@ -217,8 +217,13 @@ Roughly in priority order.
    extraction and block counts before trusting it.
 5. Multi-page label PDFs are not handled — page 0 only.
 6. Only USPS labels are parsed. UPS/FedEx tracking formats differ.
-7. No retry queue for print failures; they are recorded in `sales.notes`
-   with `printed_at` NULL, and `mplabel list` shows them as NOT PRINTED.
+7. `mplabel pending` is the way back for a label that was recorded but
+   never printed - a `check` run, or a print that failed at the
+   printer. `run` cannot do it: once a message is in `sales` the
+   poller skips it on sight, which is what stops a re-poll reprinting
+   everything. It defaults to **today only**, because the poll window
+   is days wide and older labels may already have been printed and
+   posted by hand.
 
 ## Style
 

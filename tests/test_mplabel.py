@@ -164,6 +164,86 @@ def test_stamp_does_not_disturb_the_label_fields(tmp_path):
         label.extract_label_fields(plain)
 
 
+def _pending_args(**kw):
+    import argparse
+    return argparse.Namespace(**{"since": None, "all": False,
+                                 "dry_run": True, **kw})
+
+
+def _pending_rows(db, tmp_path, capsys, **kw):
+    from mplabel import cli
+    cli.cmd_pending({}, db, _pending_args(**kw))
+    return capsys.readouterr().out
+
+
+def test_pending_defaults_to_today(db, tmp_path, capsys):
+    """The poller looks back days. Older labels may already have been
+    printed and posted by hand, and reprinting those wastes stock and puts
+    a second label on a parcel that has gone."""
+    from mplabel import cli
+
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    today = datetime.now().strftime("%Y-%m-%d")
+    for mid, item, when in (("<old>", "Last Week Lamp", "2026-08-21T09:00:00-07:00"),
+                            ("<new>", "Today Vase", f"{today}T09:00:00-07:00")):
+        db.execute("INSERT INTO sales (message_id, item, received_at, "
+                   "label_pdf) VALUES (?,?,?,?)", (mid, item, when, str(pdf)))
+    db.commit()
+
+    out = _pending_rows(db, tmp_path, capsys)
+    assert "Today Vase" in out
+    assert "Last Week Lamp" not in out
+
+    out = _pending_rows(db, tmp_path, capsys, all=True)
+    assert "Last Week Lamp" in out and "Today Vase" in out
+
+    out = _pending_rows(db, tmp_path, capsys, since="2026-08-20")
+    assert "Last Week Lamp" in out
+
+
+def test_pending_ignores_printed_and_shipped(db, tmp_path, capsys):
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    today = datetime.now().strftime("%Y-%m-%d")
+    db.executemany(
+        "INSERT INTO sales (message_id, item, received_at, label_pdf, "
+        "printed_at, status) VALUES (?,?,?,?,?,?)",
+        [("<a>", "Already Printed", f"{today}T09:00:00-07:00", str(pdf),
+          "2026-08-28T10:00:00", "printed"),
+         ("<b>", "Already Shipped", f"{today}T09:00:00-07:00", str(pdf),
+          None, "shipped"),
+         ("<c>", "Still Waiting", f"{today}T09:00:00-07:00", str(pdf),
+          None, "to_ship")])
+    db.commit()
+
+    out = _pending_rows(db, tmp_path, capsys)
+    assert "Still Waiting" in out
+    assert "Already Printed" not in out and "Already Shipped" not in out
+
+
+def test_pending_dry_run_prints_nothing(db, tmp_path, capsys, monkeypatch):
+    from mplabel import cli
+
+    sent = []
+    monkeypatch.setattr(cli, "print_label",
+                        lambda *a, **k: sent.append(a))
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    today = datetime.now().strftime("%Y-%m-%d")
+    db.execute("INSERT INTO sales (message_id, item, received_at, label_pdf) "
+               "VALUES ('<a>','Vase',?,?)",
+               (f"{today}T09:00:00-07:00", str(pdf)))
+    db.commit()
+
+    cli.cmd_pending({}, db, _pending_args(dry_run=True))
+    assert sent == [], "a dry run must not reach the printer"
+
+    cli.cmd_pending({}, db, _pending_args(dry_run=False))
+    assert len(sent) == 1
+    assert db.execute("SELECT printed_at FROM sales").fetchone()[0]
+
+
 def test_code_never_collides_with_an_unshipped_parcel(db):
     """Two boxes in the hall with the same number on them is the one
     outcome that makes the whole feature worse than useless."""
