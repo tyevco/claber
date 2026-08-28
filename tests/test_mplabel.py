@@ -420,7 +420,10 @@ class _FakeIMAP:
     def fetch(self, num, spec):
         self.fetched.append((num, spec))
         mid = b"<msg-" + num + b"@marketplace.facebook.com>"
-        return "OK", [(b"1 (BODY[HEADER]", b"Message-ID: " + mid + b"\r\n\r\n")]
+        head = (b"Message-ID: " + mid + b"\r\n"
+                b"From: Facebook Marketplace <noreply@marketplace.facebook.com>\r\n"
+                b"Subject: Shipping label for your Marketplace order\r\n\r\n")
+        return "OK", [(b"1 (BODY[HEADER]", head)]
 
 
 def test_poll_does_not_filter_on_read_state():
@@ -450,17 +453,42 @@ def test_poll_falls_back_when_gmail_search_is_unavailable():
 
 
 def test_peek_does_not_mark_mail_read(db):
-    from mplabel import cli
+    from mplabel import cli, mailparse
 
     imap = _FakeIMAP([b"5"])
-    mid = cli.peek_message_id(imap, b"5")
-    assert mid == "<msg-5@marketplace.facebook.com>"
-    assert imap.fetched == [(b"5", "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")]
+    hdr = cli.peek_headers(imap, b"5")
+    assert mailparse._decode(hdr.get("Message-ID")) == \
+        "<msg-5@marketplace.facebook.com>"
+    assert "BODY.PEEK" in imap.fetched[0][1]
+    assert mailparse.is_label_email(hdr), "triage needs From and Subject too"
 
-    assert cli.already_recorded(db, mid) is False
+
+def test_a_catalogued_label_is_not_treated_as_printed(db):
+    """backfill records every classified Facebook message in mail_events,
+    shipping_label included. Treating that as "handled" skipped fifteen
+    labels that had never been printed: catalogued is not printed."""
+    from mplabel import cli
+
+    mid = "<label-1@marketplace.facebook.com>"
+    listings.record_event(db, mid, "2026-08-28T10:00:00", "shipping_label",
+                          "Shipping label for your Marketplace order")
+
+    assert cli.already_recorded(db, mid, is_label=True) is False, \
+        "a label in mail_events but not sales still needs printing"
+
     db.execute("INSERT INTO sales (message_id) VALUES (?)", (mid,))
     db.commit()
-    assert cli.already_recorded(db, mid) is True
+    assert cli.already_recorded(db, mid, is_label=True) is True
+
+
+def test_non_label_mail_dedupes_on_mail_events(db):
+    from mplabel import cli
+
+    mid = "<order-1@marketplace.facebook.com>"
+    assert cli.already_recorded(db, mid, is_label=False) is False
+    listings.record_event(db, mid, "2026-08-28T10:00:00", "sold",
+                          "New Marketplace order for Brass Lamp")
+    assert cli.already_recorded(db, mid, is_label=False) is True
 
 
 def test_spoofed_sender_cannot_post_a_sale(db, monkeypatch):

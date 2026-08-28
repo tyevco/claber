@@ -205,38 +205,39 @@ def candidate_ids(imap, cfg, host):
     return []
 
 
-def peek_message_id(imap, num):
-    """Read just the Message-ID, without marking the mail read.
+def peek_headers(imap, num):
+    """Fetch just the headers needed to triage a message.
 
-    BODY.PEEK is the point: a plain FETCH sets \\Seen, and the whole
-    reason this function exists is that read state is no longer a filter -
-    so touching it would be both pointless and rude."""
+    BODY.PEEK is the point: a plain FETCH sets \\Seen, and read state is
+    no longer a filter, so touching it would be both pointless and rude.
+    From and Subject come along because deciding whether this is a label
+    email has to happen before the body is worth downloading."""
     try:
-        typ, data = imap.fetch(num, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+        typ, data = imap.fetch(
+            num, "(BODY.PEEK[HEADER.FIELDS "
+                 "(MESSAGE-ID SUBJECT FROM REPLY-TO)])")
     except imaplib.IMAP4.error:
         return None
     if typ != "OK" or not data or not data[0]:
         return None
     raw = data[0][1] if isinstance(data[0], tuple) else data[0]
-    if not raw:
-        return None
-    return mailparse._decode(
-        email.message_from_bytes(raw).get("Message-ID")) or None
+    return email.message_from_bytes(raw) if raw else None
 
 
-def already_recorded(conn, message_id):
-    """True if this message has already been turned into data.
+def already_recorded(conn, message_id, is_label):
+    """True if this message has already been turned into the data we want.
 
-    Covers both tables: a label email lands in sales, anything else in
-    mail_events. Without this the widened search would re-fetch the same
-    mail every two minutes."""
+    Which table counts depends on what the message is, and conflating the
+    two cost fifteen unprinted labels. `backfill` records *every*
+    classified Facebook message in mail_events, `shipping_label` included
+    - but that only means the subject was catalogued, not that a label
+    was ever printed. A label email is handled only once it is in
+    `sales`; everything else is handled once it is in `mail_events`."""
     if not message_id:
         return False
-    for table in ("sales", "mail_events"):
-        if conn.execute(f"SELECT 1 FROM {table} WHERE message_id=?",
-                        (message_id,)).fetchone():
-            return True
-    return False
+    table = "sales" if is_label else "mail_events"
+    return conn.execute(f"SELECT 1 FROM {table} WHERE message_id=?",
+                        (message_id,)).fetchone() is not None
 
 
 def already_seen(conn, message_id, listing_id):
@@ -387,13 +388,16 @@ def poll_once(cfg, conn, do_print):
 
         handled = noted = skipped = 0
         for num in ids:
-            # Check the id before pulling the body: most candidates are
-            # mail we have already handled, and BODY.PEEK leaves the
+            # Triage on headers before pulling the body: most candidates
+            # are mail we have already handled, and BODY.PEEK leaves the
             # message's read state alone.
-            mid = peek_message_id(imap, num)
-            if already_recorded(conn, mid):
-                skipped += 1
-                continue
+            hdr = peek_headers(imap, num)
+            if hdr is not None:
+                mid = mailparse._decode(hdr.get("Message-ID")) or None
+                if already_recorded(conn, mid,
+                                    mailparse.is_label_email(hdr)):
+                    skipped += 1
+                    continue
             typ, raw = imap.fetch(num, "(RFC822)")
             if not raw or not raw[0]:
                 continue
