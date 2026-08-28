@@ -354,9 +354,35 @@ def test_ship_by_year_inference(fragment, base, expected):
     ("New message about Wool rug", "inquiry"),
     ("Your listing has expired", "expired"),
     ("Completely unrelated newsletter", None),
+    # Subject shapes taken from the real mailbox. Titles are invented.
+    ("New Marketplace order for Brass Candlestick Pair", "sold"),
+    ("\U0001f4ec Sam sent you a message", "inquiry"),
+    # ...and the buyer side, which must not read as a sale.
+    ("You placed an order: Blue Ceramic Vase", "purchase"),
+    ("Offer submitted: Blue Ceramic Vase", "purchase"),
+    ("Confirm if you received your order: Blue Ceramic Vase", "purchase"),
 ])
 def test_subject_classification(subject, kind):
     assert listings.classify(subject) == kind
+
+
+def test_her_purchases_do_not_become_listings(db):
+    """The same mailbox carries what she buys. Those emails hold the
+    *seller's* listing id, so counting them would invent listings that were
+    never for sale and drag sell-through down."""
+    listings.record_event(db, "<buy1>", "2026-08-01T10:00:00", "purchase",
+                          "You placed an order: Blue Ceramic Vase",
+                          listing_id="7777")
+    listings.record_event(db, "<sale1>", "2026-08-02T10:00:00", "sold",
+                          "New Marketplace order for Brass Candlestick Pair",
+                          listing_id="1234")
+    listings.apply_events(db)
+
+    ids = [r[0] for r in db.execute("SELECT listing_id FROM listings")]
+    assert ids == ["1234"], "a purchase leaked into the listings table"
+    state = db.execute("SELECT state FROM listings WHERE listing_id='1234'"
+                       ).fetchone()[0]
+    assert state == "sold", "a Marketplace order is a sale"
 
 
 def test_upsert_fills_blanks_without_clobbering(db):

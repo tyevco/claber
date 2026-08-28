@@ -68,15 +68,38 @@ CREATE INDEX IF NOT EXISTS idx_event_kind ON mail_events(kind);
 # reports every unmatched Facebook subject so you know what to add.
 EVENT_PATTERNS = [
     ("shipping_label", r"shipping label for your marketplace order"),
-    ("sold",           r"\b(you sold|your item sold|sold your|congratulations on your sale)\b"),
+
+    # Buyer side: mail about things SHE bought. These sit above the seller
+    # patterns because classify() returns the first match, and because
+    # getting the direction wrong is the expensive mistake here - see
+    # BUYER_KINDS. Real subjects: "You placed an order: <item>",
+    # "Confirm if you received your order: <item>", "Offer submitted:
+    # <item>". The same item turned up under both "Offer submitted" and
+    # "Confirm if you received", which is what settled the direction.
+    ("purchase",       r"\b(you placed an order|confirm if you received your order|offer submitted)\b"),
+
+    # Seller side. "New Marketplace order for <item>" is the real wording
+    # for a sale - it arrives first, without the label; the shipping_label
+    # mail follows separately with the PDF attached.
+    ("sold",           r"\b(new marketplace order for|you sold|your item sold|sold your|congratulations on your sale)\b"),
     ("order_placed",   r"\b(new order|order confirmation|you have a new order)\b"),
     ("listed",         r"\b(your (listing|item) is (now )?live|you listed|congrats.*listed|your listing was published)\b"),
     ("renewed",        r"\b(listing (was )?renewed|we renewed your listing)\b"),
     ("expired",        r"\b(listing (has )?expired|your listing is no longer)\b"),
-    ("inquiry",        r"\b(new message about|is interested in|asked about your)\b"),
+    # "📬 Tyler sent you a message" - the emoji is part of the subject.
+    ("inquiry",        r"\b(new message about|is interested in|asked about your|sent you a message)\b"),
     ("payout",         r"\b(payout|payment (sent|on its way|initiated)|you.ve been paid)\b"),
     ("rating",         r"\b(left you a rating|rate your)\b"),
 ]
+
+
+# Kinds that describe HER buying something, not selling it. They are
+# classified so `scan` stops reporting them as unrecognised, and recorded
+# so the history is complete - but they must never reach the listings
+# table. A purchase email carries the *seller's* listing id, so treating
+# one as a listing would invent a row for an item that was never for sale,
+# inflating the listing count and dragging sell-through down with it.
+BUYER_KINDS = {"purchase"}
 
 
 def classify(subject):
@@ -155,7 +178,7 @@ def apply_events(conn):
                      "listed": "active", "renewed": "active"}
     for ev in conn.execute("SELECT * FROM mail_events ORDER BY occurred_at"):
         lid = ev["listing_id"]
-        if not lid:
+        if not lid or ev["kind"] in BUYER_KINDS:
             continue
         fields = {"state": kind_to_state.get(ev["kind"])}
         if ev["kind"] == "listed":

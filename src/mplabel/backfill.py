@@ -162,14 +162,19 @@ def run(cfg, conn, limit=None, resume=True):
                     occurred = None
 
                 parsed = mailparse.parse(msg)
+                # Her own purchases carry the *seller's* listing id. Drop it
+                # rather than record it: everything downstream treats a
+                # listing id as one of her listings, so keeping it would
+                # invent rows for items that were never for sale.
+                buyer_side = kind in listings.BUYER_KINDS
                 listings.record_event(
                     conn, mid, occurred, kind, subject,
-                    listing_id=parsed.get("listing_id"),
+                    listing_id=None if buyer_side else parsed.get("listing_id"),
                     amount=parsed.get("price"),
                     counterparty=parsed.get("buyer"))
                 # The title is worth capturing on any event type, not just
                 # sales - it is how an unsold listing gets a name.
-                if parsed.get("listing_id"):
+                if not buyer_side and parsed.get("listing_id"):
                     listings.upsert_listing(
                         conn, parsed["listing_id"], "email",
                         title=parsed.get("item"), price=parsed.get("price"))
