@@ -520,6 +520,38 @@ def test_card_shaped_records_import(tmp_path, db):
     assert tuple(row) == ("Oak Bookcase", 65.0, "active")
 
 
+@pytest.mark.parametrize("sale_listing_id", [None, "88887777"])
+def test_a_sale_marks_the_saved_page_listing_sold(tmp_path, db, sale_listing_id):
+    """What she actually hit: items sold today stayed in the active
+    columns. Saved-page listings are keyed by title because the cards
+    carry no Facebook id, and some label emails carry no listing id
+    either - so matching on listing_id alone left the item 'active' and
+    put a duplicate row next to it."""
+    import json as _json
+
+    title = "Vintage Swedish Full Lead Crystal Owl Sculpture"
+    src = tmp_path / "active.json"
+    src.write_text(_json.dumps([
+        {"title": title, "price": 65.0, "is_sold": False, "is_live": True},
+    ]), encoding="utf-8")
+    savedpage.import_saved(db, src)
+
+    db.execute("INSERT INTO sales (listing_id, item, price, received_at) "
+               "VALUES (?,?,?,?)",
+               (sale_listing_id, title, 65.0, "2026-08-28T13:54:00"))
+    db.commit()
+    listings.link_sales(db)
+
+    rows = db.execute("SELECT title, state, sold_at FROM listings").fetchall()
+    assert len(rows) == 1, "the sale created a duplicate instead of linking"
+    assert rows[0]["state"] == "sold"
+    assert rows[0]["sold_at"] == "2026-08-28T13:54:00"
+
+    # And sold_at is what the monthly view groups on.
+    listings.build_views(db)
+    assert db.execute("SELECT COUNT(*) FROM v_monthly").fetchone()[0] == 1
+
+
 def test_long_similar_titles_stay_separate(tmp_path, db):
     """Her titles are long and share prefixes. A 60-character slug merged
     two real listings into one, quietly under-counting the denominator

@@ -18,6 +18,7 @@ sell-through chart.
 """
 
 import csv
+import hashlib
 import json
 import re
 import zipfile
@@ -160,13 +161,53 @@ def upsert_listing(conn, listing_id, source, **fields):
                      list(updates.values()) + [listing_id])
 
 
+def title_key(title):
+    """Stable id for a listing we only know by name.
+
+    Used by the saved-page import and by link_sales, which have to agree
+    or a sale will not find the listing it belongs to. The digest is of
+    the full title because her titles are long and share their first
+    sixty characters."""
+    slug = re.sub(r"\W+", "-", str(title).lower()).strip("-")[:48]
+    digest = hashlib.sha1(str(title).encode("utf-8")).hexdigest()[:8]
+    return f"saved:{slug}-{digest}"
+
+
+def _norm_title(title):
+    """Loose form for matching a sale against a listing."""
+    return re.sub(r"\W+", " ", (title or "").lower()).strip()
+
+
 def link_sales(conn):
     """Fold the sales table into listings, so a sold item has both a
-    listing date and a sale date and we can measure time-to-sell."""
+    listing date and a sale date and we can measure time-to-sell.
+
+    Matching on listing_id alone is not enough. A saved-page import keys
+    its listings by title, because the cards carry no Facebook id; and
+    some label emails carry no listing id either. In both cases the sold
+    item stayed 'active' while a second, duplicate row appeared beside
+    it - so a sale today would not show up as sold, and the listing count
+    would grow instead."""
+    by_title = {}
+    for r in conn.execute(
+            "SELECT listing_id, title FROM listings WHERE title IS NOT NULL"):
+        by_title.setdefault(_norm_title(r["title"]), r["listing_id"])
+
     for row in conn.execute(
-            "SELECT listing_id, item, price, received_at FROM sales "
-            "WHERE listing_id IS NOT NULL"):
-        upsert_listing(conn, row["listing_id"], "email",
+            "SELECT listing_id, item, price, received_at FROM sales"):
+        lid = row["listing_id"]
+        known = lid and conn.execute(
+            "SELECT 1 FROM listings WHERE listing_id=?", (lid,)).fetchone()
+        if not known:
+            # Prefer an existing listing with the same title; failing that
+            # key it the way the saved-page import would, so a later
+            # capture of the same item lands on this row rather than
+            # creating a twin.
+            lid = by_title.get(_norm_title(row["item"])) or lid \
+                or (title_key(row["item"]) if row["item"] else None)
+        if not lid:
+            continue
+        upsert_listing(conn, lid, "email",
                        title=row["item"], price=row["price"],
                        sold_at=row["received_at"], state="sold")
     conn.commit()

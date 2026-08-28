@@ -37,12 +37,13 @@ necessarily link to /marketplace/item/<id>. A listing that arrives with
 no id is keyed by its title as `saved:<slug>`.
 """
 
-import hashlib
 import html as htmllib
 import json
 import re
 from datetime import datetime
 from pathlib import Path
+
+from . import listings as listings_mod
 
 # A dict is listing-shaped if it carries any of these. Several spellings
 # because Facebook uses different ones in different GraphQL responses.
@@ -196,19 +197,11 @@ def extract(path):
             lid = _first(d, ID_KEYS)
             if not title and not lid:
                 continue
-            if lid:
-                lid = str(lid)
-            else:
-                # A title-derived id has to stay unique. Truncating the
-                # slug at 60 characters merged two real listings into one:
-                # "Antique 1900-1915 American Edwardian / Late Victorian..."
-                # and its neighbour agree for far longer than that. The
-                # digest is of the full title, so the id stays stable
-                # across re-imports.
-                slug = re.sub(r"\W+", "-", str(title).lower()).strip("-")[:48]
-                digest = hashlib.sha1(
-                    str(title).encode("utf-8")).hexdigest()[:8]
-                lid = f"saved:{slug}-{digest}"
+            # A title-derived id has to stay unique - truncating a slug at
+            # 60 characters merged two real listings into one - and it has
+            # to match what link_sales derives, or a sale will not find the
+            # listing it belongs to. One function owns both.
+            lid = str(lid) if lid else listings_mod.title_key(title)
 
             rec = {
                 "listing_id": lid,
@@ -249,8 +242,6 @@ def import_saved(conn, path, verbose=False, state=None):
     repeat it - in which case every sold listing would import as active
     and sell-through would come out backwards. Passing state='sold' says
     what the file is instead of inferring it."""
-    from . import listings as listings_mod
-
     rows, stats = extract(path)
     for r in rows:
         listings_mod.upsert_listing(
