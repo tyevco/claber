@@ -74,7 +74,8 @@ hardware or a real Facebook account.
 | Label field extraction | **Verified** against the real PDF (tracking, weight, service, recipient address). |
 | Email field extraction | **Verified** against one real email, reproduced as a fixture. |
 | Ship-by year inference | **Verified** by unit test incl. New Year rollover and leap day. Parse with an explicit year; year-less `strptime` defaults to 1900 and loses Feb 29. |
-| G4 speaks ESC/POS, **not** TSPL | **Verified on the hardware.** `probe` reads `MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;` — no TSPL anywhere. USB `28e9:02ad`, CUPS sees `usb://Clabel-/G4`. The old "speaks TSPL" row was inferred from the OEM family and was **wrong**; `printer_backend` now defaults to `escpos`. |
+| G4 speaks ESC/POS, **not** TSPL | **Verified twice on the hardware.** `probe` reads `MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;` — no TSPL anywhere. USB `28e9:02ad`, CUPS sees `usb://Clabel-/G4`. Then `tspl_selftest` printed its own source as literal text (`SIZE 4.0,6.0`, `TEXT 40,80,"4",0,2,2,"TSPL OK"`, …) instead of executing it — the behaviour of an ESC/POS printer in text mode. The old "speaks TSPL" row was inferred from the OEM family and was **wrong**; `printer_backend` defaults to `escpos`. |
+| The raw data path works | **Verified on the hardware** by that same misfired selftest: bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. So if a label comes out wrong from here, suspect the raster or the language, not the transport. |
 | ESC/POS raster banding at 128 rows | **ASSUMED.** Banding exists because some budget firmwares reject an oversized `GS v 0` and print nothing; the 128 is a guess, not a measured cap. Tune with `escpos_band_rows`. |
 | ESC/POS form feed advances one label | **ASSUMED.** `build_escpos` ends a gap-media job with `FF` on the theory the printer finds the die-cut gap itself. If labels creep or double-feed, this is the line to change. |
 | TSPL gap value 0.12in | **ASSUMED**, and now moot for this printer — only reached via the `tspl` backend. Typical for 4x6 die-cut; not measured on their stock. |
@@ -184,9 +185,10 @@ it to the repo.
 Roughly in priority order.
 
 1. **Print one real label through the `escpos` backend.** The language is
-   settled (ESC/POS, see the table) and the job bytes are unit-tested, but
-   nothing has come out of the printer yet. Order: `selftest` first — it
-   is plain ASCII text, no raster — then `test-print` for a real label.
+   settled (ESC/POS, see the table), the transport is proven, and the job
+   bytes are unit-tested — but no raster has ever reached the printer.
+   Order: `selftest` first (plain ASCII, no raster; it should print three
+   readable lines, *not* a page of commands), then `test-print`.
    What to watch for, in the order they are likely to bite: a blank or
    half-printed label means `escpos_band_rows` is above the firmware's
    `GS v 0` cap, so halve it; creeping or double-fed labels mean the
