@@ -264,8 +264,11 @@ def import_saved(conn, path, verbose=False, state=None):
 
     if verbose:
         for r in sorted(rows, key=lambda x: x["listed_at"] or ""):
+            # Show the state actually stored, not the one in the file: with
+            # --state the two differ, and printing the file's made a correct
+            # import look wrong.
             print(f"  {str(r['listed_at'])[:10]:<12} "
-                  f"${r['price'] or 0:>8.2f}  {(r['state'] or '?'):<8} "
+                  f"${r['price'] or 0:>8.2f}  {(state or r['state'] or '?'):<8} "
                   f"{(r['title'] or '?')[:44]}")
     return len(rows), stats
 
@@ -282,18 +285,23 @@ CONSOLE_SNIPPET = r"""
 // link to /marketplace/item/<id>, so an href-based scan finds nothing.
 // A listing with no id still imports - extract() keys it by title.
 (() => {
+  const isPrice = (l) => /^(\$\s*[\d,]|free$)/i.test(l.trim());
+  const isChrome = (l) => /^(press enter|press tab|escape|sold|pending|out of stock|edit|share|boost|mark as|delete|renew|view insights|listed|renewed|shipping|free shipping|see all|create new listing|your listing|\d+\s*(view|watch|interested|save|message|click))/i.test(l.trim());
+  const hasWords = (l) => /[A-Za-z]{3}/.test(l);
+  const isTitle = (l) => !isPrice(l) && !isChrome(l) && hasWords(l) && l.trim().length > 3;
+
   const money = (s) => {
     if (/^free$/i.test(s.trim())) return 0;
     const m = String(s).replace(/,/g, '').match(/\$\s*(\d+(?:\.\d+)?)/);
     return m ? parseFloat(m[1]) : null;
   };
   const when = (all) => {
-    const rel = all.match(/listed\s+(?:about\s+)?(\d+)\s+(minute|hour|day|week|month)s?\s+ago/i);
+    const rel = all.match(/(listed|sold)\s+(?:about\s+)?(\d+)\s+(minute|hour|day|week|month)s?\s+ago/i);
     if (rel) {
       const mult = {minute: 60, hour: 3600, day: 86400, week: 604800, month: 2592000};
-      return Math.floor(Date.now() / 1000) - parseInt(rel[1], 10) * mult[rel[2].toLowerCase()];
+      return Math.floor(Date.now() / 1000) - parseInt(rel[2], 10) * mult[rel[3].toLowerCase()];
     }
-    const abs = all.match(/listed\s+(?:on\s+)?([A-Za-z]{3,9})\s+(\d{1,2})/i);
+    const abs = all.match(/(?:listed|sold)\s+(?:on\s+)?([A-Za-z]{3,9})\s+(\d{1,2})/i);
     if (abs) {
       const now = new Date();
       let d = new Date(abs[1] + ' ' + abs[2] + ', ' + now.getFullYear());
@@ -304,46 +312,37 @@ CONSOLE_SNIPPET = r"""
     return null;
   };
 
-  // --- structure report ------------------------------------------------
-  const hrefs = [...document.querySelectorAll('a[href]')]
-    .map(a => a.getAttribute('href') || '').filter(h => /marketplace/i.test(h));
-  const shapes = {};
-  for (const h of hrefs) {
-    const k = h.split('?')[0].replace(/\d{6,}/g, '<id>');
-    shapes[k] = (shapes[k] || 0) + 1;
-  }
-  console.log('marketplace anchors:', hrefs.length);
-  console.log('anchor shapes:', Object.entries(shapes).sort((a, b) => b[1] - a[1]).slice(0, 12));
-
-  // --- find the repeating card, anchored on the price ------------------
-  // Smallest element whose whole text starts with a price. Its card is the
-  // nearest ancestor that also carries a title line.
   const priceEls = [...document.querySelectorAll('span,div')].filter(e => {
     const t = (e.innerText || '').trim();
-    return t && /^(\$[\d,]|free$)/i.test(t) && t.length < 40 && e.children.length === 0;
+    return t && isPrice(t) && t.length < 40 && e.children.length === 0;
   });
-  console.log('price elements:', priceEls.length);
 
   const out = new Map();
+  let noTitle = 0;
   for (const pe of priceEls) {
+    // Climb until the block holds a real title line, not just prices.
+    // Stopping at the first 2-line block picked up the struck-through
+    // original price as the title.
     let node = pe, lines = [];
-    for (let i = 0; i < 6 && node; i++) {
+    for (let i = 0; i < 8 && node; i++) {
       node = node.parentElement;
       if (!node) break;
-      lines = (node.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
-      if (lines.length >= 2 && lines.length <= 12) break;
+      const l = (node.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+      if (l.length > 20) break;
+      lines = l;
+      if (l.some(isTitle) && l.some(isPrice)) break;
     }
-    if (lines.length < 2) continue;
+    if (!lines.some(isTitle)) { noTitle++; continue; }
+
     const all = lines.join(' ');
-    const priceLine = lines.find(l => /^(\$[\d,]|free$)/i.test(l));
-    const status = lines.find(l => /^(sold|pending|out of stock)$/i.test(l)) || '';
-    const title = lines
-      .filter(l => l !== priceLine && l !== status)
-      .filter(l => !/^\d+\s+(view|watch|interested|save|message)/i.test(l))
-      .filter(l => !/^(listed|renewed|shipping|free shipping|boost|edit|share|mark as)/i.test(l))
-      .filter(l => l.length > 3)
-      .sort((x, y) => y.length - x.length)[0] || null;
-    if (!title) continue;
+    const prices = lines.filter(isPrice);
+    const status = lines.find(l => /^(sold|pending|out of stock)$/i.test(l.trim())) || '';
+    // First price is the asking price; a second is the struck-through
+    // original on a reduced listing.
+    const price = prices.length ? money(prices[0]) : null;
+    const was = prices.length > 1 ? money(prices[1]) : null;
+    const title = lines.filter(isTitle).sort((a, b) => b.length - a.length)[0];
+
     let id = null;
     const link = node.querySelector && node.querySelector('a[href*="/marketplace/item/"]');
     if (link) {
@@ -352,17 +351,20 @@ CONSOLE_SNIPPET = r"""
     }
     const key = id || 'title:' + title.toLowerCase();
     if (out.has(key)) continue;
-    const rec = {title: title, price: priceLine ? money(priceLine) : null,
-                 listed_at: when(all), is_sold: /^sold$/i.test(status),
-                 is_live: !/^sold$/i.test(status)};
+    const rec = {title: title, price: price, listed_at: when(all),
+                 is_sold: /^sold$/i.test(status.trim()),
+                 is_live: !/^sold$/i.test(status.trim())};
+    if (was !== null && was !== price) rec.original_price = was;
     if (id) rec.listing_id = id;
     out.set(key, rec);
   }
 
   const rows = [...out.values()];
-  console.log('LISTINGS FOUND:', rows.length);
+  console.log('price elements :', priceEls.length);
+  console.log('no title found :', noTitle);
+  console.log('LISTINGS FOUND :', rows.length);
   if (!rows.length) {
-    console.log('--- first 800 chars of page text, to see the shape ---');
+    console.log('--- first 800 chars of page text ---');
     console.log((document.body.innerText || '').slice(0, 800));
     return;
   }
