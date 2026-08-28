@@ -9,6 +9,7 @@ invented names and an unused tracking number.
 
 import email
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -239,6 +240,32 @@ def test_escpos_continuous_media_does_not_form_feed(tmp_path):
     assert not job.endswith(b"\x0c")
     with pytest.raises(ValueError, match="unknown media"):
         printers.build_escpos(out, 203, media="nonsense")
+
+
+@pytest.mark.parametrize("argv,patch", [
+    (["mplabel", "selftest"], "escpos_selftest"),
+    (["mplabel", "file", str(LABEL_PDF)], None),
+])
+def test_printer_commands_do_not_open_the_database(monkeypatch, tmp_path,
+                                                   argv, patch):
+    """selftest and file never touch the database, so they must not open
+    one. They used to, which meant an unwritable home directory stopped
+    you testing the printer:
+
+        sqlite3.OperationalError: unable to open database file
+    """
+    from mplabel import cli, printers
+
+    def boom(home):
+        pytest.fail("opened the database for a command that does not need it")
+
+    monkeypatch.setattr(cli, "connect_db", boom)
+    monkeypatch.setattr(cli, "load_config", lambda p: dict(cli.DEFAULTS))
+    if patch:
+        monkeypatch.setattr(printers, patch, lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", argv)
+    cli.main()
 
 
 def test_probe_only_suggests_backends_that_exist():

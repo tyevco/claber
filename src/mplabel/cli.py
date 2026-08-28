@@ -131,9 +131,21 @@ def truthy(v):
 def connect_db(home):
     home = Path(home)
     (home / "labels").mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(home / "sales.db")
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    db = home / "sales.db"
+    try:
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+    except sqlite3.OperationalError as exc:
+        # sqlite says only "unable to open database file" whether the
+        # directory is missing, unwritable, or the file itself is owned by
+        # someone else. Say which path, so it is fixable in one step.
+        raise SystemExit(
+            f"cannot open {db}: {exc}\n"
+            f"Check that {home} exists and is writable by the user running "
+            f"this ({os.getenv('USER') or 'you'}). Running mplabel under "
+            f"sudo even once leaves root-owned files there that the service "
+            f"user can no longer write.")
     return conn
 
 
@@ -323,7 +335,7 @@ def loop(cfg, conn, do_print):
 
 # ---------------------------------------------------------------- commands
 
-def cmd_file(cfg, conn, args):
+def cmd_file(cfg, args):
     src = Path(args.pdf)
     out = Path(args.output) if args.output else src.with_name(src.stem + "_4x6.pdf")
     info = label.to_4x6(src, out, force_rotation=args.rotate)
@@ -468,6 +480,28 @@ def main():
         return
 
     cfg = load_config(args.config)
+
+    # These touch the printer and the filesystem but never the database.
+    # Keep them above connect_db: a missing or unwritable home directory
+    # must not stop you testing the printer or converting a PDF by hand.
+    if args.cmd == "selftest":
+        # Send the test label in whatever language the printer is set to
+        # speak; a TSPL selftest on an ESC/POS printer just prints the
+        # commands as literal text.
+        backend = cfg["printer_backend"]
+        if backend == "escpos":
+            printers.escpos_selftest(cfg["printer_device"])
+        else:
+            printers.tspl_selftest(cfg["printer_device"],
+                                   cfg.get("media_tracking", "gap"),
+                                   float(cfg.get("gap_inches", 0.12)))
+        print(f"sent text-only {backend} test label to "
+              + cfg["printer_device"])
+        return
+    if args.cmd == "file":
+        cmd_file(cfg, args)
+        return
+
     conn = connect_db(cfg["home"])
 
     if args.cmd == "check":
@@ -478,8 +512,6 @@ def main():
             loop(cfg, conn, do_print)
         else:
             poll_once(cfg, conn, do_print)
-    elif args.cmd == "file":
-        cmd_file(cfg, conn, args)
     elif args.cmd == "list":
         cmd_list(cfg, conn, args)
     elif args.cmd == "reprint":
@@ -513,16 +545,3 @@ def main():
         listings_mod.refresh(conn)
     elif args.cmd == "stats":
         cmd_stats(cfg, conn, args)
-    elif args.cmd == "selftest":
-        # Send the test label in whatever language the printer is set to
-        # speak; a TSPL selftest on an ESC/POS printer just prints the
-        # commands as literal text.
-        backend = cfg["printer_backend"]
-        if backend == "escpos":
-            printers.escpos_selftest(cfg["printer_device"])
-        else:
-            printers.tspl_selftest(cfg["printer_device"],
-                                   cfg.get("media_tracking", "gap"),
-                                   float(cfg.get("gap_inches", 0.12)))
-        print(f"sent text-only {backend} test label to "
-              + cfg["printer_device"])
