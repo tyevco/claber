@@ -73,7 +73,7 @@ hardware or a real Facebook account.
 | Dot counts 812x1218 @203dpi | **Verified** by rendering. |
 | Label field extraction | **Verified** against the real PDF (tracking, weight, service, recipient address). |
 | Email field extraction | **Verified** against one real email, reproduced as a fixture. |
-| Ship-by year inference | **Verified** by unit test incl. New Year rollover. |
+| Ship-by year inference | **Verified** by unit test incl. New Year rollover and leap day. Parse with an explicit year; year-less `strptime` defaults to 1900 and loses Feb 29. |
 | G4 speaks TSPL | **ASSUMED.** Inferred from the OEM family and from Clabel's docs quoting density 1-15 (the TSPL range). Never sent to hardware. |
 | TSPL gap value 0.12in | **ASSUMED.** Typical for 4x6 die-cut; not measured on their stock. |
 | Facebook subject patterns | **ASSUMED** except `shipping_label`. Only one real email exists. |

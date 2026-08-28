@@ -126,15 +126,22 @@ def _resolve_ship_by(fragment, received):
                   frag.strip(), flags=re.I)
     frag = re.sub(r"\s+", " ", frag).strip()
     base = received or datetime.now()
+    # Parse with the year already in the string, rather than parsing
+    # year-less and patching the year in afterwards. A bare "%b %d"
+    # defaults to 1900, which is not a leap year, so "Feb 29" raised
+    # ValueError and the ship-by date was silently lost. Supplying the
+    # year also sidesteps Python 3.15, which changes what year-less
+    # parsing does. Try the received year first, then the next one, so a
+    # label that crosses New Year still rolls forward.
     for fmt in ("%b %d", "%B %d"):
-        try:
-            dt = datetime.strptime(frag, fmt)
-        except ValueError:
-            continue
-        guess = dt.replace(year=base.year)
-        if guess.date() < base.date() - timedelta(days=1):
-            guess = guess.replace(year=base.year + 1)
-        return guess.date().isoformat()
+        for year in (base.year, base.year + 1):
+            try:
+                guess = datetime.strptime(f"{frag} {year}", f"{fmt} %Y")
+            except ValueError:
+                continue
+            if guess.date() < base.date() - timedelta(days=1):
+                continue        # already past; that means it is next year
+            return guess.date().isoformat()
     return None
 
 

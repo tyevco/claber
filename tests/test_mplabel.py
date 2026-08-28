@@ -181,6 +181,7 @@ def test_attachment_round_trips(msg):
     ("Jan 2", datetime(2026, 12, 26), "2027-01-02"),        # no weekday
     ("Wed, March 4", datetime(2027, 2, 25), "2027-03-04"),  # full month
     ("Sunday, Jun 7", datetime(2026, 6, 1), "2026-06-07"),
+    ("Sat, Feb 29", datetime(2028, 2, 20), "2028-02-29"),   # leap day
 ])
 def test_ship_by_year_inference(fragment, base, expected):
     """Facebook writes 'Fri, Sep 4' with no year."""
