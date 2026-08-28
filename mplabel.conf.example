@@ -27,9 +27,11 @@ home            = /home/pi/marketplace
 
 # ---------------------------------------------------------------- printer
 # The G4 has no Linux driver from Clabel (their portal ships Windows and
-# Mac only), so we talk to it directly in TSPL over the raw USB node.
-# Options: tspl, zpl, cups-pdf, cups-raster
-printer_backend = tspl
+# Mac only), so we talk to it directly over the raw USB node. It reports
+# COMMAND SET:ESC/POS and no TSPL, so escpos is the default - confirm on
+# any other unit with `mplabel probe`.
+# Options: escpos, tspl, zpl, cups-pdf, cups-raster
+printer_backend = escpos
 
 # Raw USB node. Confirm with `mplabel.py probe`.
 printer_device  = /dev/usb/lp0
@@ -38,22 +40,32 @@ printer_device  = /dev/usb/lp0
 printer_dpi     = 203
 
 # TSPL DENSITY, 0-15. 8 is a good start. Raise if barcodes scan faintly,
-# lower if solid blacks bleed and smear.
+# lower if solid blacks bleed and smear. Ignored by the escpos backend:
+# ESC/POS density is vendor-specific and the G4 documents no command for
+# it, so set darkness on the unit itself.
 printer_darkness = 8
 
 # TSPL SPEED in inches/sec. The G4 tops out at 152 mm/s (~6 in/s), but
-# slower gives crisper barcodes. 4 is a sensible default.
+# slower gives crisper barcodes. 4 is a sensible default. TSPL only.
 printer_speed   = 4
 
 # How the printer finds the start of each label:
 #   gap        die-cut labels with a gap between them  <- normal 4x6 stock
-#   blackmark  stock with a black registration mark
+#   blackmark  stock with a black registration mark    (tspl only)
 #   continuous gapless roll
 # Getting this wrong is the usual cause of drifting or skipped labels.
 media_tracking  = gap
 
-# Gap size in inches. 0.12 (~3mm) suits most 4x6 die-cut stock.
+# Gap size in inches. 0.12 (~3mm) suits most 4x6 die-cut stock. TSPL only:
+# ESC/POS has no gap-distance command, the printer finds the gap itself
+# when it is sent a form feed.
 gap_inches      = 0.12
+
+# escpos only. The label is sent as GS v 0 raster blocks of this many rows
+# rather than one 1218-row block, because some firmwares reject an
+# oversized raster command and then print nothing at all. Lower it if
+# labels come out blank or truncated part-way down.
+escpos_band_rows = 128
 
 # Pause after each job. These firmwares drop bytes that arrive while the
 # head is still moving, so do not set this to 0 if you print in batches.

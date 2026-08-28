@@ -113,41 +113,60 @@ dots**, which is what the converter now emits.
 
 Clabel's driver portal (ga.ctaiot.com) ships **Windows and Mac only** —
 there is no vendor Linux driver, and no CUPS PPD. So the default backend
-talks to the printer directly in **TSPL** over the raw USB node. That is
-the same language the cheap 4x6 clones share (Munbyn, iDPRT, Beeprt,
-Xprinter, JADENS), and Clabel's own docs give print density as 1-15, which
-is the TSPL `DENSITY` range.
+talks to the printer directly over the raw USB node.
 
-I could not verify the G4's TSPL support from a datasheet — it is inferred
-from the OEM family and the density range. **Confirm it in two steps before
-trusting the pipeline:**
+**It speaks ESC/POS, not TSPL.** I originally guessed TSPL from the OEM
+family and from Clabel's docs quoting density 1-15 (the TSPL `DENSITY`
+range). That guess was wrong. `mplabel probe` on the actual unit reports:
+
+```
+Bus 001 Device 003: ID 28e9:02ad GDMicroelectronics G4
+/dev/usb/lp0: MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;
+              COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;
+  -> speaks ESC/POS; set printer_backend = escpos
+```
+
+No TSPL anywhere in the id, and `ACTIVE COMMAND` agrees. (`COMMENT:Impact
+Printer` is boilerplate in the descriptor — it is a thermal printer.) So
+`printer_backend` defaults to `escpos`, which sends the label as `GS v 0`
+raster blocks and advances with a form feed.
+
+**Confirm on any other unit before trusting the pipeline:**
 
 ```bash
 mplabel probe      # reads the printer's IEEE-1284 id, prints nothing
-mplabel selftest   # a few dozen bytes of text-only TSPL
+mplabel selftest   # a few dozen bytes of text, no raster
 ```
 
-`probe` asks the kernel what the printer said about itself at enumeration —
-most TSPL units self-describe with `TSPL` in the `CMD:` / `COMMAND SET:`
-field. `selftest` prints a small text label using the printer's built-in
-fonts. If `selftest` works but a real label does not, the problem is data
-transfer, not the language.
-
-If it turns out **not** to speak TSPL, switch `printer_backend`:
+`probe` asks the kernel what the printer said about itself at enumeration
+and names the backend to set. `selftest` prints a small text label using
+the printer's built-in font. If `selftest` works but a real label does not,
+the problem is the raster path or data transfer, not the language.
 
 | Backend | When |
 |---|---|
-| `tspl` | Default. Raw TSPL to `/dev/usb/lp0`. |
+| `escpos` | Default, and what the G4 reports. Raw ESC/POS to `/dev/usb/lp0`. |
+| `tspl` | If probe reports TSPL. Most cheap 4x6 clones (Munbyn, iDPRT, Beeprt, Xprinter, JADENS). |
 | `zpl` | If probe reports ZPL. |
 | `cups-pdf` | If you install a CUPS driver and want CUPS to own the printer. |
 | `cups-raster` | As above, but the PDF path prints scaled or blank. |
 
-There is also a community CUPS driver for this whole printer family with
-prebuilt arm64/armhf packages, if you would rather have a normal CUPS queue
-(and AirPrint from her phone as a bonus):
-`github.com/RunTheWall/tspl-cups-driver`. The G4 is not on its tested list
-either, but it is the same command set. Use `cups-pdf` as the backend if
-you go that route.
+If a label comes out blank or cut off part-way down, the firmware is
+rejecting an oversized raster command — lower `escpos_band_rows` (default
+128) and try again.
+
+If you would rather have a normal CUPS queue (and AirPrint from her phone
+as a bonus), CUPS does already see the printer as
+`usb://Clabel-/G4?serial=...` — it just has no driver for it. The
+community `github.com/RunTheWall/tspl-cups-driver` was the plan while I
+still thought this was a TSPL unit; **it is the wrong command set for the
+G4**, so it would need an ESC/POS raster driver instead. Use `cups-pdf` as
+the backend if you find one that works.
+
+One thing to watch if you go the CUPS route: `cups-pdf` with an empty
+`printer_queue` sends to the system default destination. There is none
+today (`lpstat` reports no destinations), so it would fail loudly — but if
+a default is ever set, a 4x6 label would go to whatever that is.
 
 ### Two things I got wrong first time
 

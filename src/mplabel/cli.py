@@ -47,7 +47,9 @@ DEFAULTS = {
     "imap_folder": "INBOX",
     "processed_label": "Shipped-Labels",
     "home": str(Path.home() / "marketplace"),
-    "printer_backend": "tspl",
+    # The G4 reports COMMAND SET:ESC/POS and no TSPL, so escpos is the
+    # default. Run `mplabel probe` on any other unit before trusting it.
+    "printer_backend": "escpos",
     "printer_queue": "",
     "printer_device": "/dev/usb/lp0",
     "printer_dpi": "203",
@@ -55,6 +57,7 @@ DEFAULTS = {
     "printer_speed": "4",
     "media_tracking": "gap",
     "gap_inches": "0.12",
+    "escpos_band_rows": "128",
     "settle_seconds": "2.0",
     "poll_seconds": "120",
     "auto_print": "yes",
@@ -173,6 +176,13 @@ def print_label(cfg, pdf_path):
                   "speed": int(cfg["printer_speed"]) if cfg.get("printer_speed") else None,
                   "media": cfg.get("media_tracking", "gap"),
                   "gap_in": float(cfg.get("gap_inches", 0.12)),
+                  "settle": float(cfg.get("settle_seconds", 2.0))}
+    elif backend == "escpos":
+        # ESC/POS has no gap-distance command - the printer finds the gap
+        # itself on a form feed - so gap_inches does not apply here.
+        kwargs = {"device": cfg["printer_device"], "dpi": dpi,
+                  "media": cfg.get("media_tracking", "gap"),
+                  "band_rows": int(cfg.get("escpos_band_rows", 128)),
                   "settle": float(cfg.get("settle_seconds", 2.0))}
     else:
         kwargs = {"device": cfg["printer_device"], "dpi": dpi,
@@ -504,7 +514,15 @@ def main():
     elif args.cmd == "stats":
         cmd_stats(cfg, conn, args)
     elif args.cmd == "selftest":
-        printers.tspl_selftest(cfg["printer_device"],
-                               cfg.get("media_tracking", "gap"),
-                               float(cfg.get("gap_inches", 0.12)))
-        print("sent text-only TSPL test label to " + cfg["printer_device"])
+        # Send the test label in whatever language the printer is set to
+        # speak; a TSPL selftest on an ESC/POS printer just prints the
+        # commands as literal text.
+        backend = cfg["printer_backend"]
+        if backend == "escpos":
+            printers.escpos_selftest(cfg["printer_device"])
+        else:
+            printers.tspl_selftest(cfg["printer_device"],
+                                   cfg.get("media_tracking", "gap"),
+                                   float(cfg.get("gap_inches", 0.12)))
+        print(f"sent text-only {backend} test label to "
+              + cfg["printer_device"])

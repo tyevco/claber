@@ -74,8 +74,10 @@ hardware or a real Facebook account.
 | Label field extraction | **Verified** against the real PDF (tracking, weight, service, recipient address). |
 | Email field extraction | **Verified** against one real email, reproduced as a fixture. |
 | Ship-by year inference | **Verified** by unit test incl. New Year rollover and leap day. Parse with an explicit year; year-less `strptime` defaults to 1900 and loses Feb 29. |
-| G4 speaks TSPL | **ASSUMED.** Inferred from the OEM family and from Clabel's docs quoting density 1-15 (the TSPL range). Never sent to hardware. |
-| TSPL gap value 0.12in | **ASSUMED.** Typical for 4x6 die-cut; not measured on their stock. |
+| G4 speaks ESC/POS, **not** TSPL | **Verified on the hardware.** `probe` reads `MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;` — no TSPL anywhere. USB `28e9:02ad`, CUPS sees `usb://Clabel-/G4`. The old "speaks TSPL" row was inferred from the OEM family and was **wrong**; `printer_backend` now defaults to `escpos`. |
+| ESC/POS raster banding at 128 rows | **ASSUMED.** Banding exists because some budget firmwares reject an oversized `GS v 0` and print nothing; the 128 is a guess, not a measured cap. Tune with `escpos_band_rows`. |
+| ESC/POS form feed advances one label | **ASSUMED.** `build_escpos` ends a gap-media job with `FF` on the theory the printer finds the die-cut gap itself. If labels creep or double-feed, this is the line to change. |
+| TSPL gap value 0.12in | **ASSUMED**, and now moot for this printer — only reached via the `tspl` backend. Typical for 4x6 die-cut; not measured on their stock. |
 | Facebook subject patterns | **ASSUMED** except `shipping_label`. Only one real email exists. |
 | DYI export schema | **ASSUMED.** Undocumented and reshuffled by Meta; importer walks for shape rather than assuming paths. |
 | Saved-page JSON shape | **ASSUMED.** Field names from public GraphQL modules; fixture is synthetic. |
@@ -99,10 +101,14 @@ source PDF returns every line mirrored (`sIPA` for `USPS APIs`) because
 the text is drawn rotated. `cli.process_message` deliberately calls
 `extract_label_fields(out_pdf)`.
 
-**TSPL and ZPL have opposite bit polarity.** TSPL prints on a *clear*
-bit, ZPL on a *set* bit. `render_bitmap(invert=True)` for TSPL, and the
-padding bits past the right edge must be set to white or you get a black
-stripe. See `test_tspl_and_zpl_bit_polarity_are_opposite`.
+**TSPL has the opposite bit polarity to ZPL and ESC/POS.** TSPL prints on
+a *clear* bit; ZPL and ESC/POS print on a *set* bit. So
+`render_bitmap(invert=True)` for TSPL only, and for TSPL the padding bits
+past the right edge must be set to white or you get a black stripe — 812
+dots is not a byte boundary, so there are always 4 spare bits per row. See
+`test_tspl_and_zpl_bit_polarity_are_opposite`,
+`test_escpos_prints_on_a_set_bit_like_zpl` and
+`test_escpos_right_edge_padding_is_white`.
 
 **`GAP 0,0` means continuous stock.** On die-cut labels the printer never
 finds the label edge and prints creep down the roll. Default is
@@ -177,10 +183,16 @@ it to the repo.
 
 Roughly in priority order.
 
-1. **Confirm the printer language.** `python -m mplabel probe` reads the
-   IEEE-1284 id; `selftest` sends a few dozen bytes of text-only TSPL.
-   If it is not TSPL, `printers.BACKENDS` already has ZPL and two CUPS
-   paths.
+1. **Print one real label through the `escpos` backend.** The language is
+   settled (ESC/POS, see the table) and the job bytes are unit-tested, but
+   nothing has come out of the printer yet. Order: `selftest` first — it
+   is plain ASCII text, no raster — then `test-print` for a real label.
+   What to watch for, in the order they are likely to bite: a blank or
+   half-printed label means `escpos_band_rows` is above the firmware's
+   `GS v 0` cap, so halve it; creeping or double-fed labels mean the
+   trailing `FF` is not how this unit advances die-cut stock; a black
+   right-hand stripe would mean the padding-bit polarity is inverted from
+   what `test_escpos_right_edge_padding_is_white` assumes.
 2. **Learn the real email subjects.** `python -m mplabel scan` prints
    unrecognised Facebook subject lines with counts. Add them to
    `listings.EVENT_PATTERNS` — a name and a regex each. Until this is

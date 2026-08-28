@@ -27,6 +27,13 @@ DEFAULT_DPI = 203          # 203 dpi is standard; some printers are 300
 LABEL_W_IN = 4.0
 LABEL_H_IN = 6.0
 
+# ESC/POS control sequences, spelled numerically so they survive being
+# copied around and stay greppable against the command tables.
+ESC_INIT = bytes((0x1B, 0x40))                  # ESC @   reset
+GS_RASTER = bytes((0x1D, 0x76, 0x30, 0x00))     # GS v 0  raster, mode 0
+ESC_FEED_DOTS = bytes((0x1B, 0x4A))             # ESC J n feed n dots
+FORM_FEED = bytes((0x0C,))                      # FF      next label
+
 
 # ------------------------------------------------------------ rasterising
 
@@ -204,6 +211,75 @@ def tspl_selftest(device="/dev/usb/lp0", media="gap", gap_in=0.12):
     _write_raw(device, ("\r\n".join(cmds) + "\r\n").encode("ascii"))
 
 
+def build_escpos(pdf_path, dpi=DEFAULT_DPI, media="gap", band_rows=128,
+                 feed_dots=0, copies=1):
+    """Assemble a complete ESC/POS raster job as bytes.
+
+    The G4 self-describes as `COMMAND SET:ESC/POS` with no TSPL anywhere
+    in its IEEE-1284 id, so this - not tspl - is the backend it needs.
+
+    ESC/POS prints on a *set* bit, like ZPL and opposite TSPL, so the
+    bitmap goes in un-inverted. That also leaves the four spare bits past
+    the right edge of each row clear, which reads as white; setting them
+    would draw a black stripe down every label.
+
+    The image goes as a series of `GS v 0` blocks of band_rows each
+    rather than one 1218-row block, because several of these budget
+    firmwares cap a single raster command well below a full 6in label and
+    silently print nothing when the cap is exceeded. Bands stack in the
+    order sent, so the seam is invisible."""
+    if media not in ("gap", "continuous"):
+        raise ValueError(f"unknown media tracking {media!r}")
+    if band_rows < 1:
+        raise ValueError("band_rows must be at least 1")
+
+    data, _width_px, width_bytes, height = render_bitmap(pdf_path, dpi,
+                                                        invert=False)
+    job = bytearray()
+    for _ in range(int(copies)):
+        job += ESC_INIT
+        y = 0
+        while y < height:
+            rows = min(band_rows, height - y)
+            job += GS_RASTER
+            job += bytes((width_bytes & 0xFF, width_bytes >> 8,
+                          rows & 0xFF, rows >> 8))
+            job += data[y * width_bytes:(y + rows) * width_bytes]
+            y += rows
+        if feed_dots:
+            job += ESC_FEED_DOTS + bytes((min(int(feed_dots), 255),))
+        if media == "gap":
+            # Form feed advances to the next die-cut label using the gap
+            # sensor. On continuous stock there is no gap to find, and
+            # asking for one makes the printer hunt and throw a media error.
+            job += FORM_FEED
+    return bytes(job)
+
+
+def print_escpos(pdf_path, device="/dev/usb/lp0", dpi=DEFAULT_DPI,
+                 darkness=None, media="gap", band_rows=128, feed_dots=0,
+                 settle=2.0):
+    # darkness is accepted so every raw backend takes the same config keys,
+    # but it is not sent: ESC/POS density is vendor-specific and the G4
+    # documents no command for it. Set darkness on the unit itself.
+    payload = build_escpos(pdf_path, dpi, media, band_rows, feed_dots)
+    _write_raw(device, payload, settle=settle)
+
+
+def escpos_selftest(device="/dev/usb/lp0"):
+    """Print a tiny text-only label using the printer's built-in font.
+
+    ESC/POS prints plain ASCII as text, so this needs no raster at all.
+    If it prints and a real label does not, the problem is the raster path
+    or data transfer, not the command language."""
+    body = (ESC_INIT
+            + b"ESC/POS OK\n"
+            + b"If you can read this, the\n"
+            + b"printer speaks ESC/POS.\n"
+            + FORM_FEED)
+    _write_raw(device, body)
+
+
 def _write_raw(device, payload, settle=2.0):
     """Write the whole job in one burst, then pause.
 
@@ -251,11 +327,21 @@ def detect_language(device="/dev/usb/lp0"):
     return None, None
 
 
+# Which raw backend serves each language detect_language() can report.
+# EPL and PCL deliberately have no entry: probe must say so plainly rather
+# than suggest a printer_backend value that send() would reject.
+LANGUAGE_BACKENDS = {
+    "TSPL": "tspl",
+    "ZPL": "zpl",
+    "ESC/POS": "escpos",
+}
+
 BACKENDS = {
     "cups-pdf": print_cups_pdf,
     "cups-raster": print_cups_raster,
     "zpl": print_zpl,
     "tspl": print_tspl,
+    "escpos": print_escpos,
 }
 
 
@@ -296,9 +382,18 @@ def probe():
         found = True
         print(f"{node}: {ident or 'no ieee1284_id exposed'}")
         if lang:
-            print(f"  -> speaks {lang}; set printer_backend = {lang.lower()}")
+            backend = LANGUAGE_BACKENDS.get(lang)
+            if backend:
+                print(f"  -> speaks {lang}; set printer_backend = {backend}")
+            else:
+                # Do not name a backend that does not exist: following that
+                # advice used to exit with "Unknown backend 'esc/pos'".
+                print(f"  -> speaks {lang}, which has no raw backend here; "
+                      f"install a CUPS driver and use printer_backend "
+                      f"= cups-pdf")
         elif ident:
-            print("  -> no known language in the id string; try tspl anyway")
+            print("  -> no known language in the id string; try escpos, "
+                  "then tspl")
     if not found:
         print("no raw nodes to query")
 

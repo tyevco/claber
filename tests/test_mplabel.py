@@ -146,6 +146,110 @@ def test_tspl_and_zpl_bit_polarity_are_opposite(tmp_path):
     assert 0.02 < ink / (len(normal) * 8) < 0.5, "should be mostly white"
 
 
+# --------------------------------------------------------------- esc/pos
+
+def _escpos_rasters(job):
+    """Pull every GS v 0 raster block out of a job.
+
+    Returns [(mode, width_bytes, rows, data), ...]. Walking the blocks by
+    their own declared sizes is the point: if a header disagrees with its
+    payload the walk desynchronises and the assertions below fail."""
+    blocks, i = [], 0
+    while True:
+        i = job.find(b"\x1dv0", i)
+        if i < 0:
+            return blocks
+        mode = job[i + 3]
+        xl, xh, yl, yh = job[i + 4:i + 8]
+        width_bytes = xl + (xh << 8)
+        rows = yl + (yh << 8)
+        start = i + 8
+        end = start + width_bytes * rows
+        blocks.append((mode, width_bytes, rows, job[start:end]))
+        i = end
+
+
+def test_escpos_job_structure(tmp_path):
+    from mplabel import printers
+    out = tmp_path / "o.pdf"
+    label.to_4x6(LABEL_PDF, out)
+    job = printers.build_escpos(out, 203)
+
+    assert job.startswith(b"\x1b@"), "job must reset the printer first"
+    blocks = _escpos_rasters(job)
+    assert blocks, "no GS v 0 raster blocks in the job"
+    for mode, width_bytes, rows, data in blocks:
+        assert mode == 0
+        assert len(data) == width_bytes * rows, "header disagrees with payload"
+    assert job.endswith(b"\x0c"), "die-cut stock advances with a form feed"
+
+
+def test_escpos_bands_cover_every_row_exactly_once(tmp_path):
+    """Banding is the risky part - a slip drops or repeats whole rows."""
+    from mplabel import printers
+    out = tmp_path / "o.pdf"
+    label.to_4x6(LABEL_PDF, out)
+    expected, _px, width_bytes, height = printers.render_bitmap(out, 203)
+
+    for band_rows in (128, 256, 1, height, height * 2):
+        blocks = _escpos_rasters(printers.build_escpos(out, 203,
+                                                       band_rows=band_rows))
+        assert sum(b[2] for b in blocks) == height, band_rows
+        assert all(b[1] == width_bytes for b in blocks), band_rows
+        assert b"".join(b[3] for b in blocks) == expected, band_rows
+
+
+def test_escpos_prints_on_a_set_bit_like_zpl(tmp_path):
+    """ESC/POS and ZPL print on a set bit; TSPL prints on a clear one.
+    Getting this backwards produces a solid black label."""
+    from mplabel import printers
+    out = tmp_path / "o.pdf"
+    label.to_4x6(LABEL_PDF, out)
+    normal, _, _, _ = printers.render_bitmap(out, 203, invert=False)
+    inverted, _, _, _ = printers.render_bitmap(out, 203, invert=True)
+
+    raster = b"".join(b[3] for b in
+                      _escpos_rasters(printers.build_escpos(out, 203)))
+    assert raster == normal
+    assert raster != inverted
+
+
+def test_escpos_right_edge_padding_is_white(tmp_path):
+    """812 dots is not a byte boundary. The 4 spare bits per row must stay
+    clear, or every label carries a black stripe down its right edge."""
+    from mplabel import printers
+    out = tmp_path / "o.pdf"
+    label.to_4x6(LABEL_PDF, out)
+    _data, width_px, width_bytes, height = printers.render_bitmap(out, 203)
+    spare = width_bytes * 8 - width_px
+    assert spare == 4
+    mask = (1 << spare) - 1
+
+    raster = b"".join(b[3] for b in
+                      _escpos_rasters(printers.build_escpos(out, 203)))
+    for y in range(height):
+        assert not raster[y * width_bytes + width_bytes - 1] & mask, y
+
+
+def test_escpos_continuous_media_does_not_form_feed(tmp_path):
+    from mplabel import printers
+    out = tmp_path / "o.pdf"
+    label.to_4x6(LABEL_PDF, out)
+    job = printers.build_escpos(out, 203, media="continuous")
+    assert not job.endswith(b"\x0c")
+    with pytest.raises(ValueError, match="unknown media"):
+        printers.build_escpos(out, 203, media="nonsense")
+
+
+def test_probe_only_suggests_backends_that_exist():
+    """probe used to print `set printer_backend = esc/pos`, which is not a
+    backend - following its own advice exited with 'Unknown backend'."""
+    from mplabel import printers
+    for lang, backend in printers.LANGUAGE_BACKENDS.items():
+        assert backend in printers.BACKENDS, f"{lang} -> {backend!r} missing"
+    assert printers.LANGUAGE_BACKENDS["ESC/POS"] == "escpos"
+
+
 # ------------------------------------------------------------ mailparse
 
 def test_email_is_recognised(msg):
