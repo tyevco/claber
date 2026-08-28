@@ -69,10 +69,19 @@ gap_inches      = 0.12
 # labels come out blank or truncated part-way down.
 escpos_band_rows = 128
 
-# A 3-digit code printed small in the top right of every label, so a stack
-# of parcels can be told apart at a glance. It is stored on the sale and
-# mirrored into the Sheet's Sales tab. Codes are picked at random from those
-# not in use by a parcel that has yet to ship, and freed once it ships.
+# A short code printed small in the top right of every label, so a stack of
+# parcels can be told apart at a glance. It is stored on the sale and
+# mirrored into the Sheet's Sales tab.
+#
+# Three characters, picked at random from those not in use by a parcel that
+# has yet to ship, and freed once it ships. The alphabet is digits and
+# capitals minus I, L, O and U - the ones that get misread as 1, 1, 0 and V
+# on thermal stock at arm's length.
+#
+# It is a handle, not just a marking: `mplabel reprint W7X` and
+# `mplabel ship W7X` both take it, which is what makes reading it off a box
+# worth doing.
+#
 # The archived labels/<ref>_4x6.pdf is deliberately left unstamped - the
 # stamp goes on a throwaway copy on its way to the printer, so a reprint
 # cannot double-stamp.

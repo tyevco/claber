@@ -236,6 +236,17 @@ want working when nothing else is. `cmd_file` takes no `conn` at all.
 only reach the DB if the listing email or a saved-page/DYI import carried
 one. If `v_aging` shows blank prices, the percentages are lying.
 
+**The parcel code is a handle, not just a marking.** `reprint` and `ship`
+both accept it (`cli.find_sale`), case-insensitively, alongside listing id
+/ order id / tracking - it is the only one of those printed on the box, and
+`mplabel list` shows it and none of the others. Three characters from
+digits and capitals minus **I L O U**, which get misread as 1, 1, 0 and V
+on thermal stock; 32^3 is 32768 codes, so collisions among open parcels
+never bite. Helvetica letters are not one width - W is nearly twice I - so
+`label._text_width` measures the white patch from real advance widths
+rather than assuming the digit width, or a code like WWW spills off its own
+background.
+
 **The parcel code is stamped on a copy, never the archive.** `labels/<ref>_4x6.pdf` stays as Facebook sent it; `print_label` stamps a throwaway file on its way to the printer. That is what makes a reprint safe - there is no way to double-stamp, and no stamped/not-stamped flag to keep straight. It also means the ~15 orders already recorded pick up a code the moment they print.
 
 **The page is not stored upright.** `to_4x6` leaves a landscape mediabox with `/Rotate 90`, and the mediabox origin is not (0,0) - it is the crop window on the letter page, e.g. `[90 450 522 738]`. So the printed top-right corner is the page's top-*left*, and text there needs a +90 (CCW) matrix, the same convention the label's own text uses. `label._code_placement` owns that; `test_code_lands_in_the_printed_top_right` settles it by rendering the page and looking, rather than by trusting the arithmetic.
