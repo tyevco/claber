@@ -19,6 +19,8 @@ cleverness.
 ```bash
 pip install -e ".[dev,sheets]"
 pytest                                     # 40 tests, all should pass
+pytest tests/test_mplabel.py::test_output_is_exactly_4x6   # one test
+pytest -k tspl                             # printer-language regressions
 python -m mplabel --help
 python -m mplabel file tests/fixtures/label_sample.pdf   # no config needed
 ```
@@ -39,7 +41,25 @@ src/mplabel/
   backfill.py    one-off mailbox survey and historical import
   savedpage.py   parse a saved Marketplace selling page
   sheets.py      Google Sheets sync via service account
+
+tests/fixtures/   synthetic stand-ins; make_label.py regenerates the PDF
+mplabel.conf.example, systemd/mplabel.service, udev/99-clabel-g4.rules
+install_pi.sh     Pi bootstrap
 ```
+
+## Data model
+
+One SQLite file, two schemas declared in two modules: `cli.SCHEMA`
+owns `sales`; `listings.SCHEMA` owns `listings` and `mail_events`.
+Nothing joins them at write time - `listings.link_sales()` reconciles
+by `listing_id` afterwards.
+
+`listings.refresh()` is the single rebuild entry point: schema ->
+link_sales -> apply_events -> build_views. Analytics are views, not
+tables: `v_listing_perf` derives days_to_sell / days_listed /
+price_band, and `v_price_band`, `v_monthly` and `v_aging` are built on
+top of it. `sheets.TABS` selects from those views by column name, so
+renaming a view column breaks the sheet with no test failure.
 
 ## Verified vs assumed
 
@@ -108,6 +128,16 @@ reinterprets a 22-digit tracking number as a float and mangles it.
 **Sell-through is meaningless without prices on unsold listings.** Prices
 only reach the DB if the listing email or a saved-page/DYI import carried
 one. If `v_aging` shows blank prices, the percentages are lying.
+
+**Unrecognised mail is put back.** `poll_once` searches
+`(UNSEEN FROM "facebook")`, and anything failing `is_label_email` - or
+raising during processing - is re-marked `-FLAGS \Seen`. Dropping that
+silently eats a customer's label email on the next parser bug.
+
+**Email fields outrank label fields.** `process_message` merges
+`extract_label_fields()` with `rec.setdefault()`, so the label only
+fills blanks. Switching to `update()` lets label text overwrite
+known-good values from the email.
 
 ## Data handling
 
