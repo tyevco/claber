@@ -22,11 +22,19 @@ a one-time job, which is exactly what you wanted.
     4. mplabel.py import --format saved ~/Downloads/selling.html
 
 Facebook's markup is machine-generated: class names are rotating hashes
-and the DOM shape changes constantly. So this ignores the DOM entirely
-and reads the JSON that Facebook embeds in <script> tags to hydrate the
-page. Field names there are far more stable than CSS classes, and where
-they do change, the walker matches on any of several known key spellings
-rather than one fixed path.
+and the DOM shape changes constantly. So the parser reads the JSON that
+Facebook embeds in <script> tags to hydrate the page rather than the DOM.
+Field names there are far more stable than CSS classes, and where they do
+change, the walker matches on any of several known key spellings rather
+than one fixed path.
+
+On a real selling page that JSON turned out not to be there any more -
+the cards are rendered from data that never lands in a parseable script
+tag. So CONSOLE_SNIPPET (`--snippet`) reads the rendered page instead and
+downloads clean JSON, which this module also imports. It anchors on the
+price text rather than on links, because her own listings do not
+necessarily link to /marketplace/item/<id>. A listing that arrives with
+no id is keyed by its title as `saved:<slug>`.
 """
 
 import html as htmllib
@@ -260,20 +268,18 @@ def import_saved(conn, path, verbose=False):
 CONSOLE_SNIPPET = r"""
 // Paste into DevTools console on facebook.com/marketplace/you/selling
 // AFTER scrolling to the bottom so every listing has loaded.
-// Reads only what the page has already fetched; sends nothing anywhere.
+// Reads only what the page has already rendered; sends nothing anywhere.
+//
+// Anchored on prices, not on links: her own listings do not necessarily
+// link to /marketplace/item/<id>, so an href-based scan finds nothing.
+// A listing with no id still imports - extract() keys it by title.
 (() => {
-  const out = new Map();
   const money = (s) => {
-    if (/free/i.test(s)) return 0;
-    const m = String(s).replace(/,/g, '').match(/(\d+(?:\.\d+)?)/);
+    if (/^free$/i.test(s.trim())) return 0;
+    const m = String(s).replace(/,/g, '').match(/\$\s*(\d+(?:\.\d+)?)/);
     return m ? parseFloat(m[1]) : null;
   };
-  // Cards show "Listed on Aug 12" or "Listed 3 weeks ago" - no year in
-  // either. Without this, listed_at is null and days_listed (the whole
-  // aging report) stays blank. Returns epoch seconds, which is what
-  // Facebook's own creation_time is, so the parser needs no new case.
-  const when = (lines) => {
-    const all = lines.join(' ');
+  const when = (all) => {
     const rel = all.match(/listed\s+(?:about\s+)?(\d+)\s+(minute|hour|day|week|month)s?\s+ago/i);
     if (rel) {
       const mult = {minute: 60, hour: 3600, day: 86400, week: 604800, month: 2592000};
@@ -289,84 +295,70 @@ CONSOLE_SNIPPET = r"""
     }
     return null;
   };
-  const put = (id, rec) => {
-    const prev = out.get(id) || {listing_id: id};
-    for (const [k, v] of Object.entries(rec)) {
-      if (v !== null && v !== undefined && (prev[k] === null || prev[k] === undefined)) prev[k] = v;
-    }
-    out.set(id, prev);
-  };
 
-  // --- 1. the rendered cards -----------------------------------------
-  // Read what is on screen. Facebook's class names are rotating hashes,
-  // but every card links to /marketplace/item/<id>/, and that is stable.
-  const links = [...document.querySelectorAll('a[href*="/marketplace/item/"]')];
-  for (const a of links) {
-    const m = (a.getAttribute('href') || '').match(/\/marketplace\/item\/(\d+)/);
-    if (!m) continue;
-    // Climb until there is text: the anchor sometimes wraps only an image.
-    let node = a, text = '';
-    for (let i = 0; i < 4 && node; i++) {
-      text = (node.innerText || '').trim();
-      if (text.length > 3) break;
+  // --- structure report ------------------------------------------------
+  const hrefs = [...document.querySelectorAll('a[href]')]
+    .map(a => a.getAttribute('href') || '').filter(h => /marketplace/i.test(h));
+  const shapes = {};
+  for (const h of hrefs) {
+    const k = h.split('?')[0].replace(/\d{6,}/g, '<id>');
+    shapes[k] = (shapes[k] || 0) + 1;
+  }
+  console.log('marketplace anchors:', hrefs.length);
+  console.log('anchor shapes:', Object.entries(shapes).sort((a, b) => b[1] - a[1]).slice(0, 12));
+
+  // --- find the repeating card, anchored on the price ------------------
+  // Smallest element whose whole text starts with a price. Its card is the
+  // nearest ancestor that also carries a title line.
+  const priceEls = [...document.querySelectorAll('span,div')].filter(e => {
+    const t = (e.innerText || '').trim();
+    return t && /^(\$[\d,]|free$)/i.test(t) && t.length < 40 && e.children.length === 0;
+  });
+  console.log('price elements:', priceEls.length);
+
+  const out = new Map();
+  for (const pe of priceEls) {
+    let node = pe, lines = [];
+    for (let i = 0; i < 6 && node; i++) {
       node = node.parentElement;
+      if (!node) break;
+      lines = (node.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+      if (lines.length >= 2 && lines.length <= 12) break;
     }
-    if (!text) continue;
-    const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
-    const priceLine = lines.find(l => /^\$|^free$/i.test(l));
+    if (lines.length < 2) continue;
+    const all = lines.join(' ');
+    const priceLine = lines.find(l => /^(\$[\d,]|free$)/i.test(l));
     const status = lines.find(l => /^(sold|pending|out of stock)$/i.test(l)) || '';
     const title = lines
       .filter(l => l !== priceLine && l !== status)
-      .filter(l => !/^\d+\s+(view|watch|interested|save)/i.test(l))
-      .filter(l => !/^(listed|renewed|shipping|free shipping)\b/i.test(l))
+      .filter(l => !/^\d+\s+(view|watch|interested|save|message)/i.test(l))
+      .filter(l => !/^(listed|renewed|shipping|free shipping|boost|edit|share|mark as)/i.test(l))
+      .filter(l => l.length > 3)
       .sort((x, y) => y.length - x.length)[0] || null;
-    put(m[1], {
-      title: title,
-      price: priceLine ? money(priceLine) : null,
-      listed_at: when(lines),
-      is_sold: /sold/i.test(status),
-      is_live: !/sold/i.test(status)
-    });
-  }
-  const fromDom = out.size;
-
-  // --- 2. hydration JSON, if any is still parseable -------------------
-  let blocks = 0, titlesInText = 0;
-  const walk = (n) => {
-    if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) return n.forEach(walk);
-    const t = n.marketplace_listing_title || n.listing_title;
-    if (t && (n.id || n.listing_price)) {
-      const p = n.listing_price || {};
-      put(String(n.id || t), {
-        title: t,
-        price: p.amount ?? (p.amount_with_offset ? p.amount_with_offset / 100 : null),
-        listed_at: n.creation_time ?? null,
-        is_sold: n.is_sold ?? null,
-        is_live: n.is_live ?? null
-      });
+    if (!title) continue;
+    let id = null;
+    const link = node.querySelector && node.querySelector('a[href*="/marketplace/item/"]');
+    if (link) {
+      const m = (link.getAttribute('href') || '').match(/\/marketplace\/item\/(\d+)/);
+      if (m) id = m[1];
     }
-    Object.values(n).forEach(walk);
-  };
-  document.querySelectorAll('script').forEach(s => {
-    const txt = (s.textContent || '').trim();
-    titlesInText += (txt.match(/marketplace_listing_title/g) || []).length;
-    if (!txt.startsWith('{') && !txt.startsWith('[')) return;
-    try { walk(JSON.parse(txt)); blocks++; } catch (e) {}
-  });
+    const key = id || 'title:' + title.toLowerCase();
+    if (out.has(key)) continue;
+    const rec = {title: title, price: priceLine ? money(priceLine) : null,
+                 listed_at: when(all), is_sold: /^sold$/i.test(status),
+                 is_live: !/^sold$/i.test(status)};
+    if (id) rec.listing_id = id;
+    out.set(key, rec);
+  }
 
-  const rows = [...out.values()].filter(r => r.title || r.price !== null);
-  console.log('item links on page :', links.length);
-  console.log('listings from cards:', fromDom);
-  console.log('json blocks parsed :', blocks);
-  console.log('titles seen in script text:', titlesInText);
-  console.log('TOTAL listings     :', rows.length);
+  const rows = [...out.values()];
+  console.log('LISTINGS FOUND:', rows.length);
   if (!rows.length) {
-    console.log('Nothing found. Check that this is the Your Listings tab of');
-    console.log('facebook.com/marketplace/you/selling, and that you scrolled');
-    console.log('to the bottom first. Send the five numbers above.');
+    console.log('--- first 800 chars of page text, to see the shape ---');
+    console.log((document.body.innerText || '').slice(0, 800));
     return;
   }
+  console.table(rows.slice(0, 10));
   const blob = new Blob([JSON.stringify(rows, null, 2)], {type: 'application/json'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
