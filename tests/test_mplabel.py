@@ -520,6 +520,28 @@ def test_card_shaped_records_import(tmp_path, db):
     assert tuple(row) == ("Oak Bookcase", 65.0, "active")
 
 
+def test_long_similar_titles_stay_separate(tmp_path, db):
+    """Her titles are long and share prefixes. A 60-character slug merged
+    two real listings into one, quietly under-counting the denominator
+    that sell-through is measured against."""
+    import json as _json
+
+    a = "Antique 1900-1915 American Edwardian Late Victorian Carved Oak Hall Stand"
+    b = "Antique 1900-1915 American Edwardian Late Victorian Carved Oak Side Chair"
+    assert a[:60] == b[:60], "the fixture must actually collide on 60 chars"
+
+    src = tmp_path / "similar.json"
+    src.write_text(_json.dumps([
+        {"title": a, "price": 650.0, "is_sold": False, "is_live": True},
+        {"title": b, "price": 180.0, "is_sold": False, "is_live": True},
+    ]), encoding="utf-8")
+
+    rows, _stats = savedpage.extract(src)
+    assert len({r["listing_id"] for r in rows}) == 2, "ids collided"
+    savedpage.import_saved(db, src)
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 2
+
+
 def test_state_override_for_a_single_tab_capture(tmp_path, db):
     """A capture from the Sold tab may carry no per-card Sold badge, so
     every row would import as active and sell-through would come out

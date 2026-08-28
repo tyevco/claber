@@ -37,6 +37,7 @@ necessarily link to /marketplace/item/<id>. A listing that arrives with
 no id is keyed by its title as `saved:<slug>`.
 """
 
+import hashlib
 import html as htmllib
 import json
 import re
@@ -195,8 +196,19 @@ def extract(path):
             lid = _first(d, ID_KEYS)
             if not title and not lid:
                 continue
-            lid = str(lid) if lid else "saved:" + re.sub(
-                r"\W+", "-", str(title).lower())[:60]
+            if lid:
+                lid = str(lid)
+            else:
+                # A title-derived id has to stay unique. Truncating the
+                # slug at 60 characters merged two real listings into one:
+                # "Antique 1900-1915 American Edwardian / Late Victorian..."
+                # and its neighbour agree for far longer than that. The
+                # digest is of the full title, so the id stays stable
+                # across re-imports.
+                slug = re.sub(r"\W+", "-", str(title).lower()).strip("-")[:48]
+                digest = hashlib.sha1(
+                    str(title).encode("utf-8")).hexdigest()[:8]
+                lid = f"saved:{slug}-{digest}"
 
             rec = {
                 "listing_id": lid,
@@ -286,7 +298,10 @@ CONSOLE_SNIPPET = r"""
 // A listing with no id still imports - extract() keys it by title.
 (() => {
   const isPrice = (l) => /^(\$\s*[\d,]|free$)/i.test(l.trim());
-  const isChrome = (l) => /^(press enter|press tab|escape|sold|pending|out of stock|edit|share|boost|mark as|delete|renew|view insights|listed|renewed|shipping|free shipping|see all|create new listing|your listing|\d+\s*(view|watch|interested|save|message|click))/i.test(l.trim());
+  // "Category: Women's clothing & shoes" was picked as a title on cards
+  // where the real one was outside the block, so field labels count as
+  // chrome too.
+  const isChrome = (l) => /^(press enter|press tab|escape|sold|pending|out of stock|edit|share|boost|mark as|delete|renew|view insights|listed|renewed|shipping|free shipping|see all|create new listing|your listing|category|condition|location|description|details|listed in|available|in stock|\d+\s*(view|watch|interested|save|message|click))\b/i.test(l.trim());
   const hasWords = (l) => /[A-Za-z]{3}/.test(l);
   const isTitle = (l) => !isPrice(l) && !isChrome(l) && hasWords(l) && l.trim().length > 3;
 
