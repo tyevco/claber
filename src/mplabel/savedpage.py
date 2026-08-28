@@ -263,17 +263,85 @@ CONSOLE_SNIPPET = r"""
 // Reads only what the page has already fetched; sends nothing anywhere.
 (() => {
   const out = new Map();
+  const money = (s) => {
+    if (/free/i.test(s)) return 0;
+    const m = String(s).replace(/,/g, '').match(/(\d+(?:\.\d+)?)/);
+    return m ? parseFloat(m[1]) : null;
+  };
+  // Cards show "Listed on Aug 12" or "Listed 3 weeks ago" - no year in
+  // either. Without this, listed_at is null and days_listed (the whole
+  // aging report) stays blank. Returns epoch seconds, which is what
+  // Facebook's own creation_time is, so the parser needs no new case.
+  const when = (lines) => {
+    const all = lines.join(' ');
+    const rel = all.match(/listed\s+(?:about\s+)?(\d+)\s+(minute|hour|day|week|month)s?\s+ago/i);
+    if (rel) {
+      const mult = {minute: 60, hour: 3600, day: 86400, week: 604800, month: 2592000};
+      return Math.floor(Date.now() / 1000) - parseInt(rel[1], 10) * mult[rel[2].toLowerCase()];
+    }
+    const abs = all.match(/listed\s+(?:on\s+)?([A-Za-z]{3,9})\s+(\d{1,2})/i);
+    if (abs) {
+      const now = new Date();
+      let d = new Date(abs[1] + ' ' + abs[2] + ', ' + now.getFullYear());
+      if (isNaN(d.getTime())) return null;
+      if (d > now) d = new Date(abs[1] + ' ' + abs[2] + ', ' + (now.getFullYear() - 1));
+      return Math.floor(d.getTime() / 1000);
+    }
+    return null;
+  };
+  const put = (id, rec) => {
+    const prev = out.get(id) || {listing_id: id};
+    for (const [k, v] of Object.entries(rec)) {
+      if (v !== null && v !== undefined && (prev[k] === null || prev[k] === undefined)) prev[k] = v;
+    }
+    out.set(id, prev);
+  };
+
+  // --- 1. the rendered cards -----------------------------------------
+  // Read what is on screen. Facebook's class names are rotating hashes,
+  // but every card links to /marketplace/item/<id>/, and that is stable.
+  const links = [...document.querySelectorAll('a[href*="/marketplace/item/"]')];
+  for (const a of links) {
+    const m = (a.getAttribute('href') || '').match(/\/marketplace\/item\/(\d+)/);
+    if (!m) continue;
+    // Climb until there is text: the anchor sometimes wraps only an image.
+    let node = a, text = '';
+    for (let i = 0; i < 4 && node; i++) {
+      text = (node.innerText || '').trim();
+      if (text.length > 3) break;
+      node = node.parentElement;
+    }
+    if (!text) continue;
+    const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
+    const priceLine = lines.find(l => /^\$|^free$/i.test(l));
+    const status = lines.find(l => /^(sold|pending|out of stock)$/i.test(l)) || '';
+    const title = lines
+      .filter(l => l !== priceLine && l !== status)
+      .filter(l => !/^\d+\s+(view|watch|interested|save)/i.test(l))
+      .filter(l => !/^(listed|renewed|shipping|free shipping)\b/i.test(l))
+      .sort((x, y) => y.length - x.length)[0] || null;
+    put(m[1], {
+      title: title,
+      price: priceLine ? money(priceLine) : null,
+      listed_at: when(lines),
+      is_sold: /sold/i.test(status),
+      is_live: !/sold/i.test(status)
+    });
+  }
+  const fromDom = out.size;
+
+  // --- 2. hydration JSON, if any is still parseable -------------------
+  let blocks = 0, titlesInText = 0;
   const walk = (n) => {
     if (!n || typeof n !== 'object') return;
     if (Array.isArray(n)) return n.forEach(walk);
     const t = n.marketplace_listing_title || n.listing_title;
     if (t && (n.id || n.listing_price)) {
       const p = n.listing_price || {};
-      out.set(String(n.id || t), {
-        listing_id: String(n.id || ''),
+      put(String(n.id || t), {
         title: t,
         price: p.amount ?? (p.amount_with_offset ? p.amount_with_offset / 100 : null),
-        listed_at: n.creation_time || null,
+        listed_at: n.creation_time ?? null,
         is_sold: n.is_sold ?? null,
         is_live: n.is_live ?? null
       });
@@ -282,16 +350,29 @@ CONSOLE_SNIPPET = r"""
   };
   document.querySelectorAll('script').forEach(s => {
     const txt = (s.textContent || '').trim();
+    titlesInText += (txt.match(/marketplace_listing_title/g) || []).length;
     if (!txt.startsWith('{') && !txt.startsWith('[')) return;
-    try { walk(JSON.parse(txt)); } catch (e) {}
+    try { walk(JSON.parse(txt)); blocks++; } catch (e) {}
   });
-  const rows = [...out.values()];
-  console.log(`found ${rows.length} listings`);
+
+  const rows = [...out.values()].filter(r => r.title || r.price !== null);
+  console.log('item links on page :', links.length);
+  console.log('listings from cards:', fromDom);
+  console.log('json blocks parsed :', blocks);
+  console.log('titles seen in script text:', titlesInText);
+  console.log('TOTAL listings     :', rows.length);
+  if (!rows.length) {
+    console.log('Nothing found. Check that this is the Your Listings tab of');
+    console.log('facebook.com/marketplace/you/selling, and that you scrolled');
+    console.log('to the bottom first. Send the five numbers above.');
+    return;
+  }
   const blob = new Blob([JSON.stringify(rows, null, 2)], {type: 'application/json'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'marketplace-listings.json';
   a.click();
+  console.log('downloaded marketplace-listings.json');
 })();
 """
 

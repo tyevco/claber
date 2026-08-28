@@ -501,6 +501,37 @@ def test_console_snippet_json_imports(tmp_path, db):
     assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 2
 
 
+def test_card_shaped_records_import(tmp_path, db):
+    """What the snippet gets off a rendered card: no creation time, and
+    state only from a Sold badge. It still has to import."""
+    import json as _json
+
+    src = tmp_path / "cards.json"
+    src.write_text(_json.dumps([
+        {"listing_id": "333", "title": "Oak Bookcase", "price": 65.0,
+         "is_sold": False, "is_live": True},
+    ]), encoding="utf-8")
+
+    found, stats = savedpage.extract(src)
+    assert stats["listings"] == 1, stats
+    assert found[0]["state"] == "active"
+    savedpage.import_saved(db, src)
+    row = db.execute("SELECT title, price, state FROM listings").fetchone()
+    assert tuple(row) == ("Oak Bookcase", 65.0, "active")
+
+
+def test_snippet_and_parser_agree_on_key_names():
+    """Nothing at runtime checks that CONSOLE_SNIPPET emits what extract()
+    reads - a rename on either side would just quietly yield 0 listings."""
+    snippet = savedpage.CONSOLE_SNIPPET
+    for key in ("listing_id", "title", "price", "listed_at",
+                "is_sold", "is_live"):
+        assert key in snippet, key
+    # is_sold / is_live are what _looks_like_listing keys off, so a card
+    # with no marketplace_* fields still registers as a listing.
+    assert {"is_sold", "is_live"} <= set(savedpage.STRONG_KEYS)
+
+
 def test_saved_page_import_populates_analytics(db):
     savedpage.import_saved(db, FIXTURES / "selling_page.html")
     listings.build_views(db)
