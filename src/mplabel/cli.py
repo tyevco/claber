@@ -26,7 +26,7 @@ import socket
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -63,6 +63,10 @@ DEFAULTS = {
     "escpos_band_rows": "128",
     "settle_seconds": "2.0",
     "poll_seconds": "120",
+    # How far back each poll looks. Read state is not a filter - Gmail
+    # marks a whole conversation read when you open it - so the window
+    # plus the message_id check is what stops repeats.
+    "lookback_days": "7",
     "auto_print": "yes",
     # Google Sheets. Leave sheets_key blank to disable the sync entirely.
     "sheets_key": "",
@@ -166,6 +170,73 @@ def upsert(conn, rec):
     conn.execute(f"INSERT OR IGNORE INTO sales ({cols}) VALUES ({marks})",
                  [rec[f] for f in fields])
     conn.commit()
+
+
+def candidate_ids(imap, cfg, host):
+    """Which messages to consider this poll.
+
+    Not UNSEEN. Gmail groups messages into a conversation, and opening a
+    conversation marks *every* message in it read - she sold nine things
+    at once, Gmail threaded them, and one glance at the thread hid the
+    other eight labels forever. Read state cannot gate printing.
+
+    So: everything from Facebook within a recent window, deduplicated
+    against what is already in the database. Deliberately not filtered on
+    the processed Gmail label either - Gmail's search is thread-aware in
+    places, and labelling one message must not be able to hide its eight
+    siblings."""
+    days = int(cfg.get("lookback_days") or 7)
+    doms = " OR ".join(mailparse.SENDER_DOMAINS)
+    queries = []
+    if "gmail" in host:
+        queries.append(f'(X-GM-RAW "from:({doms}) newer_than:{days}d")')
+    since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+    queries.append(f'(OR (FROM "facebookmail.com") '
+                   f'(FROM "marketplace.facebook.com") SINCE {since})')
+    queries.append('(UNSEEN FROM "facebook")')
+
+    for q in queries:
+        try:
+            typ, data = imap.search(None, q)
+        except imaplib.IMAP4.error:
+            continue
+        if typ == "OK":
+            return data[0].split() if data and data[0] else []
+    return []
+
+
+def peek_message_id(imap, num):
+    """Read just the Message-ID, without marking the mail read.
+
+    BODY.PEEK is the point: a plain FETCH sets \\Seen, and the whole
+    reason this function exists is that read state is no longer a filter -
+    so touching it would be both pointless and rude."""
+    try:
+        typ, data = imap.fetch(num, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+    except imaplib.IMAP4.error:
+        return None
+    if typ != "OK" or not data or not data[0]:
+        return None
+    raw = data[0][1] if isinstance(data[0], tuple) else data[0]
+    if not raw:
+        return None
+    return mailparse._decode(
+        email.message_from_bytes(raw).get("Message-ID")) or None
+
+
+def already_recorded(conn, message_id):
+    """True if this message has already been turned into data.
+
+    Covers both tables: a label email lands in sales, anything else in
+    mail_events. Without this the widened search would re-fetch the same
+    mail every two minutes."""
+    if not message_id:
+        return False
+    for table in ("sales", "mail_events"):
+        if conn.execute(f"SELECT 1 FROM {table} WHERE message_id=?",
+                        (message_id,)).fetchone():
+            return True
+    return False
 
 
 def already_seen(conn, message_id, listing_id):
@@ -310,12 +381,19 @@ def poll_once(cfg, conn, do_print):
     try:
         imap.login(user, pw)
         imap.select(cfg["imap_folder"])
-        typ, data = imap.search(None, '(UNSEEN FROM "facebook")')
-        ids = data[0].split() if data and data[0] else []
-        log.info("%d unread candidate(s)", len(ids))
+        ids = candidate_ids(imap, cfg, host)
+        log.info("%d candidate(s) in the last %s day(s)",
+                 len(ids), cfg.get("lookback_days") or 7)
 
-        handled = noted = 0
+        handled = noted = skipped = 0
         for num in ids:
+            # Check the id before pulling the body: most candidates are
+            # mail we have already handled, and BODY.PEEK leaves the
+            # message's read state alone.
+            mid = peek_message_id(imap, num)
+            if already_recorded(conn, mid):
+                skipped += 1
+                continue
             typ, raw = imap.fetch(num, "(RFC822)")
             if not raw or not raw[0]:
                 continue
@@ -349,6 +427,8 @@ def poll_once(cfg, conn, do_print):
                         imap.store(num, "+X-GM-LABELS", tag)
                     except Exception:
                         log.debug("could not apply Gmail label %s", tag)
+        if skipped:
+            log.debug("%d candidate(s) already recorded", skipped)
         if noted:
             log.info("%d sale/listing event(s) noted from non-label mail",
                      noted)

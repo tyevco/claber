@@ -29,14 +29,13 @@ def msg():
 
 @pytest.fixture
 def db():
+    # The real schemas, not a hand-written subset: a trimmed copy drifted
+    # from cli.SCHEMA and lost message_id, so tests passed against a table
+    # the code would never meet.
+    from mplabel import cli
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.executescript("""
-        CREATE TABLE sales (id INTEGER PRIMARY KEY, listing_id TEXT,
-            item TEXT, price REAL, received_at TEXT, buyer TEXT,
-            tracking TEXT, ship_to TEXT, weight TEXT, service TEXT,
-            status TEXT, printed_at TEXT, ship_by TEXT);
-    """)
+    conn.executescript(cli.SCHEMA)
     conn.executescript(listings.SCHEMA)
     return conn
 
@@ -397,6 +396,71 @@ def test_sender_domain_must_be_facebook(from_header, ok):
         f"From: {from_header}\n"
         "Subject: New Marketplace order for Brass Lamp\n\n")
     assert mailparse.is_from_facebook(msg) is ok
+
+
+class _FakeIMAP:
+    """Enough IMAP to test which messages a poll considers.
+
+    `seen` records every message the caller marked read, so a test can
+    assert that peeking does not."""
+
+    def __init__(self, ids, gmail_ok=True):
+        self.ids = ids
+        self.gmail_ok = gmail_ok
+        self.queries = []
+        self.fetched = []
+
+    def search(self, charset, query):
+        self.queries.append(query)
+        if query.startswith("(X-GM-RAW") and not self.gmail_ok:
+            import imaplib
+            raise imaplib.IMAP4.error("unsupported")
+        return "OK", [b" ".join(self.ids)]
+
+    def fetch(self, num, spec):
+        self.fetched.append((num, spec))
+        mid = b"<msg-" + num + b"@marketplace.facebook.com>"
+        return "OK", [(b"1 (BODY[HEADER]", b"Message-ID: " + mid + b"\r\n\r\n")]
+
+
+def test_poll_does_not_filter_on_read_state():
+    """She sold nine things at once, Gmail threaded them, and opening the
+    conversation marked all nine read - so UNSEEN returned none of them
+    and eight labels never printed. Read state cannot gate printing."""
+    from mplabel import cli
+
+    imap = _FakeIMAP([b"1", b"2", b"3"])
+    ids = cli.candidate_ids(imap, {"lookback_days": "7"}, "imap.gmail.com")
+    assert ids == [b"1", b"2", b"3"]
+    assert "UNSEEN" not in imap.queries[0]
+    assert "newer_than:7d" in imap.queries[0]
+    # Deliberately not filtered on the processed label: Gmail's search is
+    # thread-aware in places, and labelling one message must not hide its
+    # eight siblings.
+    assert "label:" not in imap.queries[0]
+
+
+def test_poll_falls_back_when_gmail_search_is_unavailable():
+    from mplabel import cli
+
+    imap = _FakeIMAP([b"7"], gmail_ok=False)
+    assert cli.candidate_ids(imap, {}, "imap.example.com") == [b"7"]
+    assert not imap.queries[0].startswith("(X-GM-RAW")
+    assert "SINCE" in imap.queries[0]
+
+
+def test_peek_does_not_mark_mail_read(db):
+    from mplabel import cli
+
+    imap = _FakeIMAP([b"5"])
+    mid = cli.peek_message_id(imap, b"5")
+    assert mid == "<msg-5@marketplace.facebook.com>"
+    assert imap.fetched == [(b"5", "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")]
+
+    assert cli.already_recorded(db, mid) is False
+    db.execute("INSERT INTO sales (message_id) VALUES (?)", (mid,))
+    db.commit()
+    assert cli.already_recorded(db, mid) is True
 
 
 def test_spoofed_sender_cannot_post_a_sale(db, monkeypatch):

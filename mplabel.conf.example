@@ -69,6 +69,12 @@ gap_inches      = 0.12
 # labels come out blank or truncated part-way down.
 escpos_band_rows = 128
 
+# How many days back each poll looks. Read state is NOT used as a filter:
+# Gmail marks every message in a conversation read when you open one, so
+# nine orders threaded together would hide eight labels. The window plus
+# the message-id check in the database is what stops repeats instead.
+lookback_days   = 7
+
 # Pause after each job. These firmwares drop bytes that arrive while the
 # head is still moving, so do not set this to 0 if you print in batches.
 settle_seconds  = 2.0
