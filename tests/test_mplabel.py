@@ -275,6 +275,23 @@ def test_printer_commands_do_not_open_the_database(monkeypatch, tmp_path,
     assert not list(FIXTURES.glob("*_4x6.pdf")), "wrote into tests/fixtures"
 
 
+def test_write_raw_survives_fsync_failing(tmp_path, monkeypatch):
+    """Observed on the G4: the label prints, then fsync on /dev/usb/lp0
+    raises OSError 22, and the caller records a successful print as a
+    failure. Character devices do not implement fsync."""
+    from mplabel import printers
+
+    dev = tmp_path / "lp0"
+    dev.write_bytes(b"")
+
+    def einval(fd):
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(printers.os, "fsync", einval)
+    printers._write_raw(str(dev), b"SIZE 4,6", settle=0)
+    assert dev.read_bytes() == b"SIZE 4,6", "the job must still be written"
+
+
 def test_probe_only_suggests_backends_that_exist():
     """probe used to print `set printer_backend = esc/pos`, which is not a
     backend - following its own advice exited with 'Unknown backend'."""

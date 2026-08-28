@@ -301,7 +301,17 @@ def _write_raw(device, payload, settle=2.0):
         written = 0
         while written < len(payload):
             written += os.write(fd, payload[written:])
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except OSError:
+            # /dev/usb/lp0 is a character device and does not implement
+            # fsync - it returns EINVAL. Observed on the G4: the label
+            # printed, then fsync raised, and process_message caught that
+            # and wrote "print failed" into sales.notes with printed_at
+            # left NULL. So a perfectly good label showed up as NOT
+            # PRINTED in `mplabel list`. The os.write above has already
+            # handed the bytes to the kernel; there is nothing to flush.
+            pass
     finally:
         os.close(fd)
 
