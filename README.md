@@ -49,16 +49,17 @@ the label still gets parsed — but only for those four fields, and it never
 overwrites anything the email already gave us. Everything else comes from
 the body, which is far more stable than PDF text extraction.
 
-Verified against your Andy Lines order, the parser returns:
+Verified against a real order (reproduced here with the synthetic
+test fixture, since a real label carries a buyer's home address):
 
 ```
-buyer       Andy Lines
-item        The Gleaners by Jean-François Millet print
+buyer       Sam Sample
+item        Hand-thrown stoneware vase
 price       15.0
 ship_by     2026-09-04          <- resolved from "Fri, Sep 4"
 listing_id  2379911152536775
-tracking    9334610579700002137836
-ship_to     ANDY LINES, 707 BROOKS DR, NORTH AUGUSTA SC 29841-3221
+tracking    9400100000000000000000
+ship_to     SAM SAMPLE, 2 FICTION RD, SHELBYVILLE IN 46176-0002
 weight      1 lb 15 oz
 service     USPS Ground Advantage
 ```
