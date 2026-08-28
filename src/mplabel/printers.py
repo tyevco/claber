@@ -400,6 +400,11 @@ def probe():
             backend = LANGUAGE_BACKENDS.get(lang)
             if backend:
                 print(f"  -> speaks {lang}; set printer_backend = {backend}")
+                # The G4 advertises ESC/POS and actually speaks TSPL. These
+                # descriptors are often boilerplate the OEM never edited,
+                # so say out loud that this is a hint, not a finding.
+                print("     (the id can be boilerplate - if that backend "
+                      "prints nothing, try tspl)")
             else:
                 # Do not name a backend that does not exist: following that
                 # advice used to exit with "Unknown backend 'esc/pos'".

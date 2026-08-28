@@ -47,9 +47,11 @@ DEFAULTS = {
     "imap_folder": "INBOX",
     "processed_label": "Shipped-Labels",
     "home": str(Path.home() / "marketplace"),
-    # The G4 reports COMMAND SET:ESC/POS and no TSPL, so escpos is the
-    # default. Run `mplabel probe` on any other unit before trusting it.
-    "printer_backend": "escpos",
+    # TSPL, confirmed by printing a real label. The G4's IEEE-1284 id
+    # claims COMMAND SET:ESC/POS, which is boilerplate - the same string
+    # calls this thermal printer an "Impact Printer". Do not switch this
+    # back on the strength of the id alone; print something first.
+    "printer_backend": "tspl",
     "printer_queue": "",
     "printer_device": "/dev/usb/lp0",
     "printer_dpi": "203",

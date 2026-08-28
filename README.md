@@ -115,9 +115,8 @@ Clabel's driver portal (ga.ctaiot.com) ships **Windows and Mac only** —
 there is no vendor Linux driver, and no CUPS PPD. So the default backend
 talks to the printer directly over the raw USB node.
 
-**It speaks ESC/POS, not TSPL.** I originally guessed TSPL from the OEM
-family and from Clabel's docs quoting density 1-15 (the TSPL `DENSITY`
-range). That guess was wrong. `mplabel probe` on the actual unit reports:
+**It speaks TSPL — but do not believe its id.** `mplabel probe` on the
+actual unit reports:
 
 ```
 Bus 001 Device 003: ID 28e9:02ad GDMicroelectronics G4
@@ -126,10 +125,18 @@ Bus 001 Device 003: ID 28e9:02ad GDMicroelectronics G4
   -> speaks ESC/POS; set printer_backend = escpos
 ```
 
-No TSPL anywhere in the id, and `ACTIVE COMMAND` agrees. (`COMMENT:Impact
-Printer` is boilerplate in the descriptor — it is a thermal printer.) So
-`printer_backend` defaults to `escpos`, which sends the label as `GS v 0`
-raster blocks and advances with a form feed.
+Not a word of that is true. The printer executes TSPL: `mplabel selftest`
+renders `TSPL OK` in large type with the following lines smaller and on
+their own lines, which only happens if `TEXT 40,80,"4",0,2,2,"TSPL OK"`
+was parsed rather than printed, and real labels come out of the `tspl`
+backend. An ESC/POS text selftest printed *nothing*, which is exactly
+what a TSPL parser does with commands it does not recognise.
+
+The tell is in the id itself: it also calls this thermal printer an
+`Impact Printer`. The whole descriptor is boilerplate the OEM never
+edited. **Treat probe's suggestion as a hint and print something before
+trusting it** — that mistake cost a full day here, chasing an ESC/POS
+backend the printer never needed.
 
 **Confirm on any other unit before trusting the pipeline:**
 
@@ -145,23 +152,23 @@ the problem is the raster path or data transfer, not the language.
 
 | Backend | When |
 |---|---|
-| `escpos` | Default, and what the G4 reports. Raw ESC/POS to `/dev/usb/lp0`. |
-| `tspl` | If probe reports TSPL. Most cheap 4x6 clones (Munbyn, iDPRT, Beeprt, Xprinter, JADENS). |
+| `tspl` | Default, and what the G4 actually speaks. Raw TSPL to `/dev/usb/lp0`. Most cheap 4x6 clones too (Munbyn, iDPRT, Beeprt, Xprinter, JADENS). |
+| `escpos` | If a unit really does speak ESC/POS. Sends `GS v 0` raster blocks and advances with a form feed. Unit-tested, but nothing it produced has ever printed. |
 | `zpl` | If probe reports ZPL. |
 | `cups-pdf` | If you install a CUPS driver and want CUPS to own the printer. |
 | `cups-raster` | As above, but the PDF path prints scaled or blank. |
 
-If a label comes out blank or cut off part-way down, the firmware is
-rejecting an oversized raster command — lower `escpos_band_rows` (default
-128) and try again.
+On the `escpos` path, a label that comes out blank or cut off part-way
+down means the firmware is rejecting an oversized raster command — lower
+`escpos_band_rows` (default 128) and try again.
 
 If you would rather have a normal CUPS queue (and AirPrint from her phone
 as a bonus), CUPS does already see the printer as
 `usb://Clabel-/G4?serial=...` — it just has no driver for it. The
-community `github.com/RunTheWall/tspl-cups-driver` was the plan while I
-still thought this was a TSPL unit; **it is the wrong command set for the
-G4**, so it would need an ESC/POS raster driver instead. Use `cups-pdf` as
-the backend if you find one that works.
+community `github.com/RunTheWall/tspl-cups-driver` covers this printer
+family and is the right command set for the G4. The G4 is not on its
+tested list, but TSPL is confirmed here. Use `cups-pdf` as the backend if
+you go that route.
 
 One thing to watch if you go the CUPS route: `cups-pdf` with an empty
 `printer_queue` sends to the system default destination. There is none

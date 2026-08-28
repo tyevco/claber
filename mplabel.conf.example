@@ -27,11 +27,13 @@ home            = /home/pi/marketplace
 
 # ---------------------------------------------------------------- printer
 # The G4 has no Linux driver from Clabel (their portal ships Windows and
-# Mac only), so we talk to it directly over the raw USB node. It reports
-# COMMAND SET:ESC/POS and no TSPL, so escpos is the default - confirm on
-# any other unit with `mplabel probe`.
-# Options: escpos, tspl, zpl, cups-pdf, cups-raster
-printer_backend = escpos
+# Mac only), so we talk to it directly over the raw USB node. It speaks
+# TSPL - confirmed by printing a real label - even though its IEEE-1284
+# id claims COMMAND SET:ESC/POS. That id is boilerplate; the same string
+# calls this thermal printer an "Impact Printer". If `mplabel probe`
+# suggests escpos on this model, trust the label, not the id.
+# Options: tspl, escpos, zpl, cups-pdf, cups-raster
+printer_backend = tspl
 
 # Raw USB node. Confirm with `mplabel.py probe`.
 printer_device  = /dev/usb/lp0

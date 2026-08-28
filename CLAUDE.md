@@ -74,11 +74,12 @@ hardware or a real Facebook account.
 | Label field extraction | **Verified** against the real PDF (tracking, weight, service, recipient address). |
 | Email field extraction | **Verified** against one real email, reproduced as a fixture. |
 | Ship-by year inference | **Verified** by unit test incl. New Year rollover and leap day. Parse with an explicit year; year-less `strptime` defaults to 1900 and loses Feb 29. |
-| G4 speaks ESC/POS, **not** TSPL | **Verified twice on the hardware.** `probe` reads `MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;` — no TSPL anywhere. USB `28e9:02ad`, CUPS sees `usb://Clabel-/G4`. Then `tspl_selftest` printed its own source as literal text (`SIZE 4.0,6.0`, `TEXT 40,80,"4",0,2,2,"TSPL OK"`, …) instead of executing it — the behaviour of an ESC/POS printer in text mode. The old "speaks TSPL" row was inferred from the OEM family and was **wrong**; `printer_backend` defaults to `escpos`. |
-| The raw data path works | **Verified on the hardware** by that same misfired selftest: bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. So if a label comes out wrong from here, suspect the raster or the language, not the transport. |
-| ESC/POS raster banding at 128 rows | **ASSUMED.** Banding exists because some budget firmwares reject an oversized `GS v 0` and print nothing; the 128 is a guess, not a measured cap. Tune with `escpos_band_rows`. |
-| ESC/POS form feed advances one label | **ASSUMED.** `build_escpos` ends a gap-media job with `FF` on the theory the printer finds the die-cut gap itself. If labels creep or double-feed, this is the line to change. |
-| TSPL gap value 0.12in | **ASSUMED**, and now moot for this printer — only reached via the `tspl` backend. Typical for 4x6 die-cut; not measured on their stock. |
+| G4 speaks TSPL | **Verified on the hardware.** `tspl_selftest` rendered correctly — `TSPL OK` in large type, the following lines smaller and each on its own line, i.e. `TEXT 40,80,"4",0,2,2` executed rather than echoed — and a real label then printed through the `tspl` backend. |
+| **The IEEE-1284 id lies on this unit** | **Verified.** `probe` reads `MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;` — every word of which points at ESC/POS, and it is wrong. The same string calls this thermal printer an "Impact Printer", so the descriptor is boilerplate the OEM never edited. An ESC/POS text selftest printed *nothing*, which is what a TSPL parser does with commands it does not recognise. Do not switch backends on the strength of the id; print something first. USB `28e9:02ad`, CUPS sees `usb://Clabel-/G4`. |
+| The raw data path works | **Verified on the hardware:** bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. If a label comes out wrong from here, suspect the raster or the geometry, not the transport. |
+| `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
+| `escpos` backend | **UNUSED and unproven.** Written while the id was believed, kept because the job structure is unit-tested and some sibling models really do speak ESC/POS. Nothing it produces has ever printed. Its banding size and trailing form feed are guesses. |
+| TSPL gap value 0.12in | **ASSUMED.** Typical for 4x6 die-cut; not measured on their stock. |
 | Facebook subject patterns | **ASSUMED** except `shipping_label`. Only one real email exists. |
 | DYI export schema | **ASSUMED.** Undocumented and reshuffled by Meta; importer walks for shape rather than assuming paths. |
 | Saved-page JSON shape | **ASSUMED.** Field names from public GraphQL modules; fixture is synthetic. |
@@ -184,17 +185,12 @@ it to the repo.
 
 Roughly in priority order.
 
-1. **Print one real label through the `escpos` backend.** The language is
-   settled (ESC/POS, see the table), the transport is proven, and the job
-   bytes are unit-tested — but no raster has ever reached the printer.
-   Order: `selftest` first (plain ASCII, no raster; it should print three
-   readable lines, *not* a page of commands), then `test-print`.
-   What to watch for, in the order they are likely to bite: a blank or
-   half-printed label means `escpos_band_rows` is above the firmware's
-   `GS v 0` cap, so halve it; creeping or double-fed labels mean the
-   trailing `FF` is not how this unit advances die-cut stock; a black
-   right-hand stripe would mean the padding-bit polarity is inverted from
-   what `test_escpos_right_edge_padding_is_white` assumes.
+1. **Check the printed label against the stock.** TSPL prints, so what is
+   left is geometry, not language: does one job advance exactly one
+   die-cut label, is the ink centred rather than creeping down the roll
+   (that would mean `gap_inches` is wrong for their stock), and do the
+   barcodes scan? `printer_darkness` 0-15 and `printer_speed` are the
+   knobs. This is the last thing between the pipeline and real parcels.
 2. **Learn the real email subjects.** `python -m mplabel scan` prints
    unrecognised Facebook subject lines with counts. Add them to
    `listings.EVENT_PATTERNS` — a name and a regex each. Until this is

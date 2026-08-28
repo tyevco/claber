@@ -68,16 +68,15 @@ cat <<EOF
   1. Log out and back in, so the lp group membership takes effect.
   2. Plug in the G4 and turn it on, then:
                                      $DEST/venv/bin/python -m mplabel probe
-     The G4 reports "speaks ESC/POS". Note the /dev/usb/lpN node, and set
-     printer_backend to whatever probe names.
+     The G4 reports "speaks ESC/POS", but it actually speaks TSPL - the
+     id string is boilerplate. Note the /dev/usb/lpN node.
   3. Tiny text-only test print:      $DEST/venv/bin/python -m mplabel selftest
      This is a few dozen bytes and no raster. If it prints, the language
      is right and only the image path is left to prove.
   4. Edit /etc/mplabel.conf          (IMAP credentials; device node if not lp0)
      NOTE: an existing /etc/mplabel.conf is never overwritten by this
-     script, so after an update check printer_backend by hand - a config
-     written before the ESC/POS change still says tspl, and the file wins
-     over the built-in default.
+     script, so after an update check printer_backend by hand - the file
+     wins over the built-in default. The G4 wants tspl.
   5. Dry run, no printing:           $DEST/venv/bin/python -m mplabel check
   6. Real label:                     $DEST/venv/bin/python -m mplabel test-print
   7. Start it:                       sudo systemctl enable --now mplabel

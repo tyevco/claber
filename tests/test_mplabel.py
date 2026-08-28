@@ -242,15 +242,15 @@ def test_escpos_continuous_media_does_not_form_feed(tmp_path):
         printers.build_escpos(out, 203, media="nonsense")
 
 
-@pytest.mark.parametrize("cmd,patch", [
-    (["selftest"], "escpos_selftest"),
+@pytest.mark.parametrize("cmd", [
+    ["selftest"],
     # -o keeps the converted PDF in tmp_path: without it cmd_file writes
     # label_sample_4x6.pdf next to the fixture, and .gitignore's
     # !tests/fixtures/** exception means it lands in the next commit.
-    (["file", str(LABEL_PDF), "-o"], None),
+    ["file", str(LABEL_PDF), "-o"],
 ])
 def test_printer_commands_do_not_open_the_database(monkeypatch, tmp_path,
-                                                   cmd, patch):
+                                                   cmd):
     """selftest and file never touch the database, so they must not open
     one. They used to, which meant an unwritable home directory stopped
     you testing the printer:
@@ -264,8 +264,10 @@ def test_printer_commands_do_not_open_the_database(monkeypatch, tmp_path,
 
     monkeypatch.setattr(cli, "connect_db", boom)
     monkeypatch.setattr(cli, "load_config", lambda p: dict(cli.DEFAULTS))
-    if patch:
-        monkeypatch.setattr(printers, patch, lambda *a, **k: None)
+    # Stub both, so this keeps testing dispatch order rather than whichever
+    # language happens to be the default today.
+    for fn in ("escpos_selftest", "tspl_selftest"):
+        monkeypatch.setattr(printers, fn, lambda *a, **k: None)
     argv = ["mplabel"] + cmd
     if cmd[-1] == "-o":
         argv.append(str(tmp_path / "out.pdf"))
