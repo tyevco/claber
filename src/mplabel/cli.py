@@ -18,6 +18,7 @@ environment. See mplabel.conf.example.
 import argparse
 import configparser
 import email
+import hashlib
 import imaplib
 import io
 import logging
@@ -28,6 +29,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -107,8 +109,13 @@ CREATE TABLE IF NOT EXISTS sales (
 );
 CREATE INDEX IF NOT EXISTS idx_status   ON sales(status);
 CREATE INDEX IF NOT EXISTS idx_tracking ON sales(tracking);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_listing
-    ON sales(listing_id) WHERE listing_id IS NOT NULL;
+-- NOT unique on listing_id. One listing can sell more than once: a buyer
+-- cancels, someone else buys the same item, and Facebook sends a second
+-- label email with the same listing_id and a new order_id. The unit of a
+-- sale is the order.
+CREATE INDEX IF NOT EXISTS idx_listing ON sales(listing_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_order
+    ON sales(order_id) WHERE order_id IS NOT NULL;
 """
 
 
@@ -163,6 +170,19 @@ def connect_db(home):
             if column not in have:
                 conn.execute(f"ALTER TABLE sales ADD COLUMN {column} {decl}")
                 log.info("added sales.%s to the existing database", column)
+
+        # idx_listing used to be UNIQUE, which made a second sale of the
+        # same listing impossible - and a cancel-and-rebuy is exactly that.
+        # CREATE INDEX IF NOT EXISTS will not replace it, so it has to go
+        # explicitly.
+        legacy = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_listing' AND sql LIKE '%UNIQUE%'").fetchone()
+        if legacy:
+            conn.execute("DROP INDEX idx_listing")
+            conn.execute("CREATE INDEX idx_listing ON sales(listing_id)")
+            log.info("replaced the unique index on sales.listing_id - one "
+                     "listing can sell more than once")
         conn.commit()
     except sqlite3.OperationalError as exc:
         # sqlite says only "unable to open database file" whether the
@@ -257,17 +277,34 @@ def already_recorded(conn, message_id, is_label):
                         (message_id,)).fetchone() is not None
 
 
-def already_seen(conn, message_id, listing_id):
+def already_seen(conn, message_id, order_id):
+    """Has this *order* already been recorded?
+
+    Keyed on the order, never the listing. It used to check listing_id
+    too, which quietly broke the cancel-and-rebuy case: a buyer cancels,
+    someone else buys the same item, Facebook sends a second label email
+    with the same listing_id and a new order_id - and it was discarded, so
+    the second buyer's label never printed while the record still named
+    the first buyer. A wasted label is cheap; a parcel posted to the wrong
+    person is not.
+
+    order_id still catches the case this was really guarding against, a
+    resend of the same order's label email."""
     if message_id and conn.execute(
             "SELECT 1 FROM sales WHERE message_id=?", (message_id,)).fetchone():
         return True
-    if listing_id and conn.execute(
-            "SELECT 1 FROM sales WHERE listing_id=?", (listing_id,)).fetchone():
+    if order_id and conn.execute(
+            "SELECT 1 FROM sales WHERE order_id=?", (order_id,)).fetchone():
         return True
     return False
 
 
 # ---------------------------------------------------------------- printing
+
+# Statuses that mean the sale is done with, one way or the other. Such a
+# row is not outstanding, is never printed again, and its parcel code goes
+# back in the pool.
+CLOSED_STATUSES = ("shipped", "cancelled")
 
 # Digits and capitals, minus I L O U - the characters that get misread as
 # 1, 1, 0 and V on a thermal label read across a room. 32 symbols over 3
@@ -285,7 +322,8 @@ def allocate_code(conn):
     hand out a code that is still on a box in the hall."""
     taken = {(r[0] or "").upper() for r in conn.execute(
         "SELECT code FROM sales WHERE code IS NOT NULL "
-        "AND status != 'shipped'")}
+        f"AND status NOT IN ({','.join('?' * len(CLOSED_STATUSES))})",
+        CLOSED_STATUSES)}
     for _ in range(200):
         code = "".join(random.choice(CODE_ALPHABET)
                        for _ in range(CODE_LENGTH))
@@ -322,6 +360,43 @@ def ensure_code(conn, message_id):
                  (code, message_id))
     conn.commit()
     return code
+
+
+def _norm_addr(text):
+    return " ".join((text or "").split()).upper()
+
+
+def label_belongs_to(row):
+    """Does the archived PDF actually belong to this sale?
+
+    Returns (ok, detail). Labels were once named after the listing, so two
+    orders for one listing wrote to the same file; and where no ids parsed,
+    the fallback name was a timestamp to the second, which collides inside
+    a batch. Both leave a row pointing at somebody else's label, and
+    printing that posts a parcel to the wrong person.
+
+    `ship_to` was read off the label when the sale was recorded, so the
+    page and the record must still agree. Where there is nothing to compare
+    - no stored address, or the page will not parse - say so rather than
+    guessing, and let the caller decide."""
+    if not row["label_pdf"]:
+        return False, "no label file recorded"
+    path = Path(row["label_pdf"])
+    if not path.exists():
+        return False, f"label file is missing: {path}"
+    stored = row["ship_to"]
+    if not stored:
+        return True, "no recorded address to check against"
+    try:
+        found = label.extract_label_fields(path).get("ship_to")
+    except Exception as exc:
+        return True, f"could not read the label ({exc})"
+    if not found:
+        return True, "no address found on the label"
+    if _norm_addr(found) != _norm_addr(stored):
+        return False, (f"label is addressed to {found!r} but this sale "
+                       f"recorded {stored!r}")
+    return True, ""
 
 
 def print_label(cfg, pdf_path, code=None):
@@ -381,7 +456,7 @@ def mark_printed(conn, message_id):
 
 def process_message(cfg, conn, msg, do_print):
     parsed = mailparse.parse(msg)
-    if already_seen(conn, parsed.get("message_id"), parsed.get("listing_id")):
+    if already_seen(conn, parsed.get("message_id"), parsed.get("order_id")):
         log.debug("skipping, already recorded")
         return None
 
@@ -390,12 +465,27 @@ def process_message(cfg, conn, msg, do_print):
         log.warning("no PDF attached to %s", parsed.get("subject"))
         return None
 
-    ref = (parsed.get("listing_id")
-           or parsed.get("order_id")
+    # The name has to be unique per *email*, not per listing. It used to be
+    # the listing id, so a cancel-and-rebuy wrote the second buyer's label
+    # over the first one's file and both rows then pointed at it; and where
+    # no ids were parsed the fallback was a timestamp to the second, which
+    # collides trivially when a batch of labels is processed in a loop.
+    # Either way a reprint posts a parcel to the wrong person.
+    # Facebook names the attachment label_<id>.pdf, and on real mail that
+    # is the only id we get - the body's order_id/listing_id links parsed
+    # as NULL on all 18 real labels. Prefer it over a timestamp, which is
+    # both unsearchable and, at second resolution, collides inside a batch.
+    from_name = Path(fname or "").stem.replace("label_", "").strip()
+    ref = (parsed.get("order_id")
+           or parsed.get("listing_id")
+           or (from_name if from_name.isalnum() else None)
            or datetime.now().strftime("%Y%m%d%H%M%S"))
+    unique = hashlib.sha1(
+        (parsed.get("message_id") or uuid.uuid4().hex).encode("utf-8")
+    ).hexdigest()[:8]
     labels = Path(cfg["home"]) / "labels"
-    raw_pdf = labels / f"{ref}_source.pdf"
-    out_pdf = labels / f"{ref}_4x6.pdf"
+    raw_pdf = labels / f"{ref}_{unique}_source.pdf"
+    out_pdf = labels / f"{ref}_{unique}_4x6.pdf"
     raw_pdf.write_bytes(blob)
 
     info = label.to_4x6(raw_pdf, out_pdf)
@@ -591,8 +681,9 @@ def sync_sheets(cfg, conn, dry_run=False):
 def cmd_list(cfg, conn, args):
     rows = conn.execute(
         "SELECT listing_id, item, buyer, price, ship_by, tracking, status, "
-        "printed_at, code FROM sales WHERE status != 'shipped' "
-        "ORDER BY ship_by"
+        "printed_at, code FROM sales WHERE status NOT IN "
+        f"({','.join('?' * len(CLOSED_STATUSES))}) ORDER BY ship_by",
+        CLOSED_STATUSES
     ).fetchall()
     if not rows:
         print("nothing outstanding")
@@ -612,17 +703,31 @@ def find_sale(conn, ref):
     The parcel code is included because it is the only one of these that
     is printed on the box: reading it off the label and typing it back is
     the whole point of stamping it there. Case-insensitive, since it is
-    read off paper."""
+    read off paper.
+
+    A listing id can now match more than one sale - a cancel and rebuy
+    leaves both - so live sales sort first and the newest wins. Handing
+    back the cancelled one would print the wrong buyer's label."""
     return conn.execute(
         "SELECT * FROM sales WHERE listing_id=? OR order_id=? OR tracking=? "
-        "OR UPPER(code)=?",
-        (ref, ref, ref, (ref or "").upper())).fetchone()
+        "OR UPPER(code)=? "
+        f"ORDER BY status IN ({','.join('?' * len(CLOSED_STATUSES))}), "
+        "id DESC LIMIT 1",
+        (ref, ref, ref, (ref or "").upper()) + CLOSED_STATUSES).fetchone()
 
 
 def cmd_reprint(cfg, conn, args):
     row = find_sale(conn, args.ref)
     if not row:
         raise SystemExit(f"no record matching {args.ref}")
+    ok, detail = label_belongs_to(row)
+    if not ok and not getattr(args, "force", False):
+        raise SystemExit(
+            f"refusing to print: {detail}\n"
+            f"This sale is {row['item']!r} for {row['buyer']!r}. Printing a "
+            f"label addressed to someone else posts the parcel to the wrong "
+            f"person. Run `mplabel verify` to see how many rows are "
+            f"affected, or --force if you are certain.")
     code = ensure_code(conn, row["message_id"])
     print_label(cfg, row["label_pdf"], code)
     mark_printed(conn, row["message_id"])
@@ -653,9 +758,9 @@ def cmd_pending(cfg, conn, args):
     already; reprinting those wastes stock and puts a second label on a
     parcel that has gone."""
     sql = ("SELECT message_id, item, price, code, label_pdf, received_at "
-           "FROM sales WHERE printed_at IS NULL AND status != 'shipped' "
-           "AND label_pdf IS NOT NULL")
-    params = []
+           "FROM sales WHERE printed_at IS NULL AND label_pdf IS NOT NULL "
+           f"AND status NOT IN ({','.join('?' * len(CLOSED_STATUSES))})")
+    params = list(CLOSED_STATUSES)
     if not args.all:
         since = args.since or datetime.now().strftime("%Y-%m-%d")
         # Compare the date as written in the email rather than converting:
@@ -697,6 +802,47 @@ def cmd_pending(cfg, conn, args):
     print(f"printed {sent} of {len(rows)}")
 
 
+def cmd_verify(cfg, conn, args):
+    """Check every archived label still matches the sale it belongs to.
+
+    Worth running once after upgrading: labels used to be named after the
+    listing, and where no ids parsed, after a timestamp to the second - so
+    a second label could overwrite the first and leave the row pointing at
+    the wrong person's address."""
+    rows = conn.execute(
+        "SELECT * FROM sales WHERE label_pdf IS NOT NULL ORDER BY id"
+    ).fetchall()
+    seen, shared, bad = {}, [], []
+    for r in rows:
+        seen.setdefault(r["label_pdf"], []).append(r)
+    for path, group in seen.items():
+        if len(group) > 1:
+            shared.append((path, group))
+    for r in rows:
+        ok, detail = label_belongs_to(r)
+        if not ok:
+            bad.append((r, detail))
+
+    if shared:
+        print(f"{len(shared)} label file(s) claimed by more than one sale:\n")
+        for path, group in shared:
+            print(f"  {Path(path).name}")
+            for r in group:
+                print(f"    [{r['code'] or '---'}] {(r['item'] or '?')[:40]:<42}"
+                      f" {r['buyer'] or '?'}")
+        print()
+    if bad:
+        print(f"{len(bad)} sale(s) whose label does not match the record:\n")
+        for r, detail in bad:
+            print(f"  [{r['code'] or '---'}] {(r['item'] or '?')[:40]}")
+            print(f"      {detail}")
+        print("\nRe-fetch these from the mailbox: mark them cancelled or "
+              "delete the rows, then `mplabel check` with a wide enough "
+              "--lookback to pick the emails up again.")
+    if not shared and not bad:
+        print(f"all {len(rows)} archived label(s) match their sale")
+
+
 def cmd_stats(cfg, conn, args):
     listings_mod.refresh(conn)
 
@@ -730,12 +876,27 @@ def cmd_stats(cfg, conn, args):
 
 
 def cmd_ship(cfg, conn, args):
-    n = conn.execute("UPDATE sales SET status='shipped' WHERE listing_id=? "
-                     "OR order_id=? OR tracking=? OR UPPER(code)=?",
-                     (args.ref, args.ref, args.ref,
-                      (args.ref or "").upper())).rowcount
+    _close_sale(conn, args.ref, "shipped")
+
+
+def cmd_cancel(cfg, conn, args):
+    """Mark a sale cancelled - the buyer pulled out.
+
+    Not 'shipped': that would count it as revenue and leave it in the
+    sold figures. A cancelled sale stops being outstanding and gives its
+    parcel code back, and if the item sells again that is a new order
+    alongside this one, not a replacement for it."""
+    _close_sale(conn, args.ref, "cancelled")
+
+
+def _close_sale(conn, ref, status):
+    row = find_sale(conn, ref)
+    if not row:
+        raise SystemExit(f"no record matching {ref}")
+    conn.execute("UPDATE sales SET status=? WHERE id=?", (status, row["id"]))
     conn.commit()
-    print(f"{n} record(s) marked shipped")
+    print(f"{status}: {row['item'] or '?'}"
+          + (f"  [{row['code']}]" if row["code"] else ""))
 
 
 def main():
@@ -760,7 +921,12 @@ def main():
                 "tracking number")
     p = sub.add_parser("reprint", help="print a label again")
     p.add_argument("ref", help=ref_help)
+    p.add_argument("--force", action="store_true",
+                   help="print even if the label does not match the record")
+    sub.add_parser("verify", help="check archived labels against their sales")
     p = sub.add_parser("ship", help="mark as shipped")
+    p.add_argument("ref", help=ref_help)
+    p = sub.add_parser("cancel", help="the buyer pulled out; not a sale")
     p.add_argument("ref", help=ref_help)
     sub.add_parser("test-print", help="reprint the newest label")
     sub.add_parser("probe", help="show printers and USB devices")
@@ -842,6 +1008,10 @@ def main():
         cmd_reprint(cfg, conn, args)
     elif args.cmd == "ship":
         cmd_ship(cfg, conn, args)
+    elif args.cmd == "cancel":
+        cmd_cancel(cfg, conn, args)
+    elif args.cmd == "verify":
+        cmd_verify(cfg, conn, args)
     elif args.cmd == "test-print":
         cmd_test_print(cfg, conn, args)
     elif args.cmd == "scan":

@@ -316,6 +316,133 @@ def test_stamp_uppercases_a_lowercase_code(tmp_path):
     assert label.stamp_code(plain, tmp_path / "o.pdf", "w7x")["code"] == "W7X"
 
 
+def test_a_relisted_item_can_sell_twice(db):
+    """A buyer cancelled and someone else bought the same item. The second
+    label email carries the same listing_id and a new order_id - and was
+    being discarded, so the second buyer's label never printed and the
+    record still named the first buyer."""
+    from mplabel import cli
+
+    first = {"message_id": "<m1>", "order_id": "111", "listing_id": "L1",
+             "buyer": "Alice", "item": "Brass Lamp"}
+    assert not cli.already_seen(db, first["message_id"], first["order_id"])
+    cli.upsert(db, first)
+
+    second = {"message_id": "<m2>", "order_id": "222", "listing_id": "L1",
+              "buyer": "Bob", "item": "Brass Lamp"}
+    assert not cli.already_seen(db, second["message_id"], second["order_id"]), \
+        "a new order on the same listing is a new sale"
+    cli.upsert(db, second)
+
+    buyers = [r[0] for r in db.execute(
+        "SELECT buyer FROM sales ORDER BY id")]
+    assert buyers == ["Alice", "Bob"], "the second sale was dropped"
+
+
+def test_the_same_order_is_still_only_printed_once(db):
+    """Dropping the listing_id check must not let a resent label email
+    print a second time."""
+    from mplabel import cli
+
+    rec = {"message_id": "<m1>", "order_id": "111", "listing_id": "L1",
+           "buyer": "Alice"}
+    cli.upsert(db, rec)
+    assert cli.already_seen(db, "<m1>", "111"), "same message"
+    assert cli.already_seen(db, "<resent>", "111"), "same order, new email"
+    assert not cli.already_seen(db, "<m9>", None), "no order id to match on"
+
+
+def test_find_sale_prefers_the_live_sale(db):
+    """`reprint L1` must not print the cancelled buyer's label - that is a
+    parcel posted to the wrong person."""
+    from mplabel import cli
+
+    db.execute("INSERT INTO sales (message_id, listing_id, order_id, buyer, "
+               "status) VALUES ('<m1>','L1','111','Alice','cancelled')")
+    db.execute("INSERT INTO sales (message_id, listing_id, order_id, buyer) "
+               "VALUES ('<m2>','L1','222','Bob')")
+    db.commit()
+    assert cli.find_sale(db, "L1")["buyer"] == "Bob"
+
+
+def test_a_cancelled_sale_drops_off_and_frees_its_code(db, monkeypatch):
+    import argparse
+    from mplabel import cli
+
+    _tiny_alphabet(monkeypatch, "AB", 1)
+    db.execute("INSERT INTO sales (message_id, listing_id, buyer, code) "
+               "VALUES ('<m1>','L1','Alice','A')")
+    db.commit()
+    cli.cmd_cancel({}, db, argparse.Namespace(ref="L1"))
+
+    assert db.execute("SELECT status FROM sales").fetchone()[0] == "cancelled"
+    assert cli.allocate_code(db) in ("A", "B"), "its code is free again"
+    rows = db.execute("SELECT 1 FROM sales WHERE status NOT IN "
+                      f"({','.join('?' * len(cli.CLOSED_STATUSES))})",
+                      cli.CLOSED_STATUSES).fetchall()
+    assert not rows, "a cancelled sale is not outstanding"
+
+
+def test_a_mismatched_label_is_not_printed(db, tmp_path, monkeypatch):
+    """The reprint that started this: the row said Opera Glasses, the PDF
+    was addressed to someone who had ordered something else. Printing that
+    posts a parcel to the wrong person."""
+    import argparse
+    from mplabel import cli
+
+    pdf = tmp_path / "l.pdf"
+    label.to_4x6(LABEL_PDF, pdf)
+    real = label.extract_label_fields(pdf)["ship_to"]
+
+    db.execute("INSERT INTO sales (message_id, item, buyer, ship_to, "
+               "label_pdf, code) VALUES ('<m1>','Opera Glasses','Alice',"
+               "'SOMEONE ELSE, 9 OTHER ST',?,'W7X')", (str(pdf),))
+    db.commit()
+    row = cli.find_sale(db, "W7X")
+    ok, detail = cli.label_belongs_to(row)
+    assert not ok and "addressed to" in detail
+
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+    with pytest.raises(SystemExit, match="refusing to print"):
+        cli.cmd_reprint({}, db, argparse.Namespace(ref="W7X", force=False))
+    assert sent == []
+
+    # ...and the matching case still prints.
+    db.execute("UPDATE sales SET ship_to=? WHERE code='W7X'", (real,))
+    db.commit()
+    cli.cmd_reprint({}, db, argparse.Namespace(ref="W7X", force=False))
+    assert len(sent) == 1
+
+
+def test_two_orders_for_one_listing_keep_separate_labels(db, tmp_path):
+    """End to end on the case that started this. Both emails carry the same
+    listing_id; the second is a different order. Before, the second was
+    discarded *and* its PDF overwrote the first one's file, so the surviving
+    row pointed at the other buyer's label."""
+    from mplabel import cli
+
+    raw = EMAIL_EML.read_bytes()
+    second = raw.replace(b"1094882736451203", b"2222222222222222") \
+                .replace(b"fixture-label-0001", b"fixture-label-0002")
+    assert second != raw
+
+    (tmp_path / "labels").mkdir()
+    cfg = {"home": str(tmp_path)}
+    a = cli.process_message(cfg, db, email.message_from_bytes(raw), False)
+    b = cli.process_message(cfg, db, email.message_from_bytes(second), False)
+    assert a and b, "the second order was dropped"
+    assert a["listing_id"] == b["listing_id"], "same listing, by construction"
+    assert a["label_pdf"] != b["label_pdf"], "one label overwrote the other"
+
+    rows = db.execute("SELECT order_id, label_pdf FROM sales "
+                      "ORDER BY id").fetchall()
+    assert len(rows) == 2
+    assert len({r["label_pdf"] for r in rows}) == 2
+    for r in rows:
+        assert Path(r["label_pdf"]).exists()
+
+
 def test_find_sale_by_parcel_code(db):
     """The code is the only handle that is printed on the box, so it has to
     be typeable back in - `list` shows it and nothing else you could use."""

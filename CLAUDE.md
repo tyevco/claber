@@ -236,6 +236,12 @@ want working when nothing else is. `cmd_file` takes no `conn` at all.
 only reach the DB if the listing email or a saved-page/DYI import carried
 one. If `v_aging` shows blank prices, the percentages are lying.
 
+**One label file per email, and never named after the listing.** On real mail `listing_id` and `order_id` parse as **NULL** - 0 of 18 - so the archive name fell back to a timestamp at second resolution, and a batch of labels put three pairs in the same second. Each pair shared one file, so three sales pointed at another buyer's label and one of those printed. The name now prefers the id in Facebook's own attachment name (`label_<id>.pdf`) and always carries a digest of the Message-ID, so it is unique per email and searchable by the id on the PDF.
+
+**The unit of a sale is the order, not the listing.** `already_seen` keys on message_id and order_id; `sales.listing_id` is a plain index, not UNIQUE. A buyer cancels, someone else buys the same item, and Facebook sends a second label email with the same listing_id - which the old unique index and the old listing_id check both silently rejected. `mplabel cancel` closes the dead order without counting it as revenue.
+
+**Check a label still matches its sale before printing it.** `label_belongs_to` re-reads the recipient off the PDF and compares it with the `ship_to` recorded from that same page when the sale was filed; `reprint` refuses on a mismatch, and `mplabel verify` sweeps the archive. This is the backstop for anything that leaves a row pointing at the wrong file - the failure is silent and the consequence is a parcel posted to a stranger.
+
 **The parcel code is a handle, not just a marking.** `reprint` and `ship`
 both accept it (`cli.find_sale`), case-insensitively, alongside listing id
 / order id / tracking - it is the only one of those printed on the box, and
