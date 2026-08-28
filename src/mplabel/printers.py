@@ -272,10 +272,15 @@ def escpos_selftest(device="/dev/usb/lp0"):
     ESC/POS prints plain ASCII as text, so this needs no raster at all.
     If it prints and a real label does not, the problem is the raster path
     or data transfer, not the command language."""
+    # CR+LF, not bare LF: the only line ending this printer is known to
+    # render is the \r\n the TSPL selftest happened to use when it printed
+    # its own source as text. Trailing blank lines push the last line past
+    # the head in case FF turns out to be ignored in standard mode.
     body = (ESC_INIT
-            + b"ESC/POS OK\n"
-            + b"If you can read this, the\n"
-            + b"printer speaks ESC/POS.\n"
+            + b"ESC/POS OK\r\n"
+            + b"If you can read this, the\r\n"
+            + b"printer speaks ESC/POS.\r\n"
+            + b"\r\n\r\n\r\n"
             + FORM_FEED)
     _write_raw(device, body)
 
