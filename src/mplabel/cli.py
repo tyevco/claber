@@ -82,6 +82,10 @@ DEFAULTS = {
     # first takes it and this one becomes hidraw1. Nothing here prints to
     # it; `mplabel supvan-probe` polls its status and moves no paper.
     "supvan_device": "/dev/hidraw0",
+    # Dots across the print head. render_bitmap refuses to render wider
+    # than this; the overflow is clipped by the hardware and ejects a
+    # second, near-blank label. 812 is the G4 at 203dpi.
+    "printer_head_dots": "812",
     # A 3-character code printed small in the top right, so a stack of parcels
     # can be told apart at a glance. Stored on the sale and mirrored to the
     # sheet; the archived PDF is left unstamped.
@@ -458,82 +462,30 @@ def label_belongs_to(row):
     return True, ""
 
 
-@contextmanager
-def print_lock(cfg):
-    """Hold the printer for the length of one job.
-
-    Two things reach the printer now - the poll loop and the web app - and
-    `printers._write_raw` deliberately hands the whole job over in a single
-    write, because this firmware discards bytes that arrive while the head
-    is moving. Two writers interleaved produce one garbage label, or a job
-    that silently vanishes. The lock has to span the settle pause too,
-    which is why it wraps `printers.send` rather than living inside it.
-
-    Blocking, not LOCK_NB: a reprint from her phone should queue behind the
-    poller, never fail.
-
-    Best effort, though. `probe`, `selftest` and `file` deliberately run
-    above `connect_db` so a printer test still works when the data
-    directory is missing or unwritable - which is precisely when you need
-    one. A lock we cannot create must therefore be a warning and not an
-    error, or this would reintroduce the failure it was written to avoid.
-    """
-    path = Path(cfg.get("home") or tempfile.gettempdir()) / ".print.lock"
-    fh = None
-    if fcntl is None:
-        # Off-target, so there is no poller to contend with either.
-        log.debug("no fcntl on this platform; printing without a lock")
-        yield
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(path, "w")
-        fcntl.flock(fh, fcntl.LOCK_EX)
-    except OSError as exc:
-        log.warning("printing without a lock (%s): %s", path, exc)
-        if fh is not None:
-            fh.close()
-            fh = None
-    try:
-        yield
-    finally:
-        if fh is not None:
-            fcntl.flock(fh, fcntl.LOCK_UN)
-            fh.close()
+# print_lock moved to printers.py so a print daemon can take it without
+# importing label (and with it pdfplumber and pypdf). Re-exported here
+# because that is where every caller in this module expects it.
+print_lock = printers.print_lock
 
 
 def print_label(cfg, pdf_path, code=None):
     backend = cfg["printer_backend"]
-    dpi = int(cfg["printer_dpi"])
-    darkness = int(cfg["printer_darkness"]) if cfg["printer_darkness"] else None
-
-    if backend.startswith("cups"):
-        kwargs = {"printer": cfg["printer_queue"] or None}
-        if backend == "cups-raster":
-            kwargs["dpi"] = dpi
-    elif backend == "tspl":
-        kwargs = {"device": cfg["printer_device"], "dpi": dpi,
-                  "darkness": darkness,
-                  "speed": int(cfg["printer_speed"]) if cfg.get("printer_speed") else None,
-                  "media": cfg.get("media_tracking", "gap"),
-                  "gap_in": float(cfg.get("gap_inches", 0.12)),
-                  "settle": float(cfg.get("settle_seconds", 2.0))}
-    elif backend == "escpos":
-        # ESC/POS has no gap-distance command - the printer finds the gap
-        # itself on a form feed - so gap_inches does not apply here.
-        kwargs = {"device": cfg["printer_device"], "dpi": dpi,
-                  "media": cfg.get("media_tracking", "gap"),
-                  "band_rows": int(cfg.get("escpos_band_rows", 128)),
-                  "settle": float(cfg.get("settle_seconds", 2.0))}
-    else:
-        kwargs = {"device": cfg["printer_device"], "dpi": dpi,
-                  "darkness": darkness}
+    kwargs = printers.backend_kwargs(cfg, backend)
 
     # Stamp a throwaway copy rather than the archive, so a reprint cannot
     # double-stamp and labels/<ref>_4x6.pdf stays as Facebook sent it.
+    #
+    # The name has to be unique per *job*, not per code and PID. web.Server
+    # is a ThreadingHTTPServer, so two handler threads share a PID - and a
+    # double-tap on a laggy phone is two prints of the same sale, hence the
+    # same code. The old name collided, and one thread's `finally` unlinked
+    # the file the other was still reading.
     tmp = None
     if code and truthy(cfg.get("label_code", "yes")):
-        tmp = Path(tempfile.gettempdir()) / f"mplabel_{code}_{os.getpid()}.pdf"
+        fh = tempfile.NamedTemporaryFile(
+            prefix=f"mplabel_{code}_", suffix=".pdf", delete=False)
+        fh.close()
+        tmp = Path(fh.name)
         label.stamp_code(pdf_path, tmp,
                          code, size=float(cfg.get("label_code_size", 8)))
         pdf_path = tmp
@@ -541,7 +493,7 @@ def print_label(cfg, pdf_path, code=None):
     log.info("printing %s via %s%s", Path(pdf_path).name, backend,
              f" [{code}]" if code else "")
     try:
-        with print_lock(cfg):
+        with printers.print_lock(cfg):
             printers.send(pdf_path, backend, **kwargs)
     finally:
         if tmp is not None:
@@ -1096,6 +1048,12 @@ def cmd_test_print(cfg, conn, args):
                        "ORDER BY id DESC LIMIT 1").fetchone()
     if not row:
         raise SystemExit("no labels on file yet - run `check` first")
+    ok, detail = label_belongs_to(row)
+    if not ok and not getattr(args, "force", False):
+        raise SystemExit(
+            f"refusing to print: {detail}\n"
+            f"The newest label on file is {row['item']!r} for "
+            f"{row['buyer']!r}. Use --force if you are certain.")
     code = ensure_code(conn, row["message_id"])
     print_label(cfg, row["label_pdf"], code)
     print(f"sent {Path(row['label_pdf']).name} to {cfg['printer_backend']}"
@@ -1114,7 +1072,9 @@ def cmd_pending(cfg, conn, args):
     wide, and older labels may well have been printed and posted by hand
     already; reprinting those wastes stock and puts a second label on a
     parcel that has gone."""
-    sql = ("SELECT message_id, item, price, code, label_pdf, received_at "
+    # SELECT *, not a column list: label_belongs_to reads ship_to off the
+    # row to check the archived label still matches this sale.
+    sql = ("SELECT * "
            "FROM sales WHERE printed_at IS NULL AND label_pdf IS NOT NULL "
            f"AND status NOT IN ({','.join('?' * len(CLOSED_STATUSES))})")
     params = list(CLOSED_STATUSES)
@@ -1143,9 +1103,14 @@ def cmd_pending(cfg, conn, args):
     print()
     sent = 0
     for r in rows:
-        if not Path(r["label_pdf"]).exists():
-            log.error("label file missing for %s: %s", r["item"],
-                      r["label_pdf"])
+        # The same guard cmd_reprint uses. This is the *batch* path, so
+        # without it one bad archive name posts several parcels to
+        # strangers in one go - and it was the only print path that
+        # checked nothing but whether the file existed.
+        ok, detail = label_belongs_to(r)
+        if not ok:
+            print(f"  refusing {r['code'] or '---'}: {detail}")
+            log.error("refusing to print %s: %s", r["item"], detail)
             continue
         try:
             print_label(cfg, r["label_pdf"], ensure_code(conn, r["message_id"]))
@@ -1334,6 +1299,16 @@ def _close_sale(conn, ref, status):
 
 
 def main():
+    try:
+        _main()
+    except printers.PrinterUnavailable as exc:
+        # An Exception everywhere else, so the poll loop and the web app
+        # can catch it - but at a terminal it should still just print the
+        # message and exit non-zero rather than dump a traceback.
+        raise SystemExit(str(exc))
+
+
+def _main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-c", "--config")
@@ -1369,8 +1344,14 @@ def main():
     p.add_argument("ref", help=ref_help)
     p = sub.add_parser("cancel", help="the buyer pulled out; not a sale")
     p.add_argument("ref", help=ref_help)
-    sub.add_parser("test-print", help="reprint the newest label")
-    sub.add_parser("probe", help="show printers and USB devices")
+    p = sub.add_parser("test-print", help="reprint the newest label")
+    p.add_argument("--force", action="store_true",
+                   help="print even if the label does not match the sale")
+    p = sub.add_parser("probe", help="show printers and USB devices")
+    p.add_argument("--cups", action="store_true",
+                   help="also run `lpinfo -v`. Off by default: CUPS's "
+                        "discovery can claim the printer and unbind usblp, "
+                        "which is the fault this command exists to find.")
     sub.add_parser("selftest", help="print a tiny text-only TSPL test label")
     p = sub.add_parser("supvan-probe",
                        help="status of the 48mm inventory label maker; "
@@ -1507,7 +1488,7 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S")
 
     if args.cmd == "probe":
-        printers.probe()
+        printers.probe(cups=args.cups)
         return
 
     cfg = load_config(args.config)

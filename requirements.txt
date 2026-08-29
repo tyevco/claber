@@ -1,9 +1,19 @@
 # Core. All have prebuilt aarch64 wheels, so nothing compiles on the Pi.
-pypdf>=5.0
-pdfplumber>=0.11
-pypdfium2>=4.0
-Pillow>=10.0
+#
+# Upper bounds, not exact pins: exact pins would eventually name a version
+# with no aarch64 wheel and make the Pi build from source, which is the
+# thing these four were chosen to avoid. The bounds stop a major upgrade
+# arriving silently during a `--force-reinstall`.
+#
+# pypdf < 7 is the load-bearing one. label.stamp_code merges an overlay
+# onto a page attached to a writer, and the deprecated detached-page path
+# it replaced is documented as *removed* in pypdf 7 - so an unbounded
+# floor here is a scheduled breakage of the parcel-code stamp.
+pypdf>=5.0,<7
+pdfplumber>=0.11,<1.0
+pypdfium2>=4.0,<6
+Pillow>=10.0,<14
 
 # Google Sheets sync. Omit if you do not want the sheet.
-gspread>=6.0
-google-auth>=2.0
+gspread>=6.0,<7
+google-auth>=2.0,<3
