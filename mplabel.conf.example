@@ -120,3 +120,34 @@ sheets_name     = Marketplace
 # Push after every poll that found something. The sync is wrapped so a
 # Google outage can never stop a label printing.
 sheets_after_poll = yes
+
+# ------------------------------------------------------------ print service
+# `printd` is the print half of the split: it owns the printer and nothing
+# else. Leave printer_backend as tspl to keep everything in one process -
+# this is entirely optional, and rolling it back is one line.
+#
+# Do not switch to pi-http until the label geometry is signed off. Changing
+# the transport while gap_inches is still unmeasured means a bad print you
+# cannot attribute to either change.
+
+# On the Pi that has the printer, run: mplabel printd
+printd_bind     = 127.0.0.1
+printd_port     = 9101
+
+# Both sides need the SAME secret. printd refuses to start without one
+# rather than accept unsigned jobs - a print request is a physical action.
+#   python3 -c "import secrets; print(secrets.token_hex(32))"
+printd_secret   =
+
+# Spool and the done journal. Defaults to <home>/printd.
+printd_state_dir =
+
+# On the side that has the orders. Setting printer_backend = pi-http sends
+# jobs here instead of to a device; every printer_* key below then belongs
+# to the printd host, not to this one.
+printd_url      =
+printd_timeout  = 45
+
+# Dots across the print head. render_bitmap refuses to render wider - the
+# overflow is clipped by the hardware and ejects a second, blank label.
+printer_head_dots = 812

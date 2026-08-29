@@ -17,6 +17,9 @@ run `python3 printers.py --probe` to see what is attached.
 """
 
 import fcntl
+import hashlib
+import hmac
+import json
 import logging
 import os
 import re
@@ -264,6 +267,102 @@ def tspl_selftest(device="/dev/usb/lp0", media="gap", gap_in=0.12):
     _write_raw(device, ("\r\n".join(cmds) + "\r\n").encode("ascii"))
 
 
+# TSPL status queries. Neither prints anything: they ask the printer how
+# it is and expect a byte back.
+TSPL_STATUS = bytes((0x1B, 0x21, 0x3F))     # <ESC>!?  -> one status byte
+TSPL_HOST_STATUS = b"~HS\r\n"               # TSC's multi-line variant
+
+# Bit meanings for the one-byte reply, per the TSPL manual. Only useful if
+# the printer answers at all - see ask_status.
+TSPL_STATUS_BITS = [
+    (0x01, "head open"),
+    (0x02, "paper jam"),
+    (0x04, "out of paper"),
+    (0x08, "out of ribbon"),
+    (0x10, "pause"),
+    (0x20, "printing"),
+    (0x40, "cover open"),
+]
+
+
+def ask_status(device="/dev/usb/lp0", timeout=0.5):
+    """Ask the printer how it is, and see whether it answers at all.
+
+    This is the experiment behind the one failure that actually loses a
+    parcel. A successful `os.write` does not mean a label came out: out of
+    paper, head open, jam and a wrong gap distance all accept the bytes
+    happily and print nothing, after which `mark_printed` sets printed_at
+    and the row leaves the Pending query. The parcel becomes invisible to
+    the recovery path at the exact moment it needed to be visible - and
+    the phone app removes the last defence, which was a person standing
+    near the printer.
+
+    If this unit answers, printd can refuse a job when the paper is out
+    and the row stays where she can see it. **Whether it answers is
+    unknown** - bidirectional reads have never been tested on this
+    hardware, and the IEEE-1284 id has already been caught lying once.
+
+    Returns a dict; never raises for a printer that simply says nothing.
+    Non-destructive: neither query prints. Every read is bounded by
+    `select`, because a blocking read on a device that will never answer
+    is its own way to wedge the printer."""
+    import select
+
+    out = {"device": device, "answered": False, "raw": None,
+           "flags": [], "note": ""}
+    dev = Path(device)
+    if not dev.exists():
+        out["note"] = f"{device} does not exist"
+        return out
+    try:
+        fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as exc:
+        # Read access is not a given: the udev rule grants the lp group
+        # write, and a printer may be write-only regardless.
+        out["note"] = f"cannot open read-write ({exc}); write-only is normal"
+        return out
+    try:
+        # Drain anything stale first, so a leftover byte is not read as an
+        # answer to a question we have not asked yet.
+        try:
+            while select.select([fd], [], [], 0)[0]:
+                if not os.read(fd, 64):
+                    break
+        except OSError:
+            pass
+
+        for query, name in ((TSPL_STATUS, "<ESC>!?"),
+                            (TSPL_HOST_STATUS, "~HS")):
+            try:
+                os.write(fd, query)
+            except OSError as exc:
+                out["note"] = f"write of {name} failed: {exc}"
+                continue
+            if select.select([fd], [], [], timeout)[0]:
+                try:
+                    data = os.read(fd, 64)
+                except OSError as exc:
+                    out["note"] = f"{name} read failed: {exc}"
+                    continue
+                if data:
+                    out["answered"] = True
+                    out["raw"] = data.hex()
+                    out["query"] = name
+                    first = data[0]
+                    out["flags"] = [label for bit, label in TSPL_STATUS_BITS
+                                    if first & bit]
+                    if not out["flags"]:
+                        out["flags"] = ["ready"]
+                    return out
+        out["note"] = out["note"] or (
+            f"no reply within {timeout}s to either query - this printer is "
+            f"probably write-only, so a failed print cannot be detected "
+            f"from software")
+    finally:
+        os.close(fd)
+    return out
+
+
 def build_escpos(pdf_path, dpi=DEFAULT_DPI, media="gap", band_rows=128,
                  feed_dots=0, copies=1, head_dots=DEFAULT_HEAD_DOTS):
     """Assemble a complete ESC/POS raster job as bytes.
@@ -410,7 +509,7 @@ def print_lock(cfg=None, device=None, required=False):
             fh.close()
 
 
-def backend_kwargs(cfg, backend=None):
+def backend_kwargs(cfg, backend=None, code=None):
     """The keyword arguments `send()` needs for one backend, from config.
 
     Extracted from cli.print_label so that anything else driving a printer
@@ -422,6 +521,11 @@ def backend_kwargs(cfg, backend=None):
     head = int(cfg.get("printer_head_dots") or DEFAULT_HEAD_DOTS)
     settle = float(cfg.get("settle_seconds", 2.0))
 
+    if backend == "pi-http":
+        return {"url": cfg.get("printd_url"),
+                "secret": cfg.get("printd_secret"),
+                "timeout": float(cfg.get("printd_timeout", 45)),
+                "code": code}
     if backend.startswith("cups"):
         kwargs = {"printer": cfg.get("printer_queue") or None}
         if backend == "cups-raster":
@@ -507,6 +611,76 @@ def detect_language(device="/dev/usb/lp0"):
 # Which raw backend serves each language detect_language() can report.
 # EPL and PCL deliberately have no entry: probe must say so plainly rather
 # than suggest a printer_backend value that send() would reject.
+
+def print_pi_http(pdf_path, url=None, secret=None, timeout=45.0, job=None,
+                  code=None):
+    """Hand the job to a printd over HTTP.
+
+    A backend like any other, so `cli.print_label` and every caller above
+    it - reprint, pending, test-print, the phone app - are unchanged, and
+    switching back is one line of config.
+
+    urllib, not requests: the short dependency list is deliberate.
+
+    Retries are *not* done here. A print is not safely retryable from the
+    client's side, because a timeout cannot distinguish "never arrived"
+    from "printed, and the acknowledgement was lost" - and the second one
+    retried is a duplicate label on a parcel. printd keeps a durable
+    journal so the question can be *asked* instead; that is what
+    GET /printed is for."""
+    import urllib.error
+    import urllib.request
+
+    if not url:
+        raise PrinterUnavailable("printd_url is not set")
+    body = Path(pdf_path).read_bytes()
+    job = job or f"{code or 'job'}-{os.urandom(8).hex()}"
+    req = urllib.request.Request(
+        url.rstrip("/") + "/print", data=body, method="POST",
+        headers={
+            "Content-Type": "application/pdf",
+            "X-MPLabel-Protocol": "1",
+            "X-MPLabel-Job": job,
+            "X-MPLabel-Sig": _sign_job(secret, job, body),
+            # How long this caller is willing to wait. printd refuses
+            # rather than printing to an empty room after we have given up.
+            "X-MPLabel-Deadline": str(timeout),
+        })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return json.loads(res.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        try:
+            detail = json.loads(detail).get("error", detail)
+        except ValueError:
+            pass
+        if exc.code == 409:
+            # Already printed. Not an error worth failing a batch over.
+            log.warning("printd says job %s already printed", job)
+            return {"printed": False, "job": job, "duplicate": True}
+        raise PrinterUnavailable(f"printd said {exc.code}: {detail}")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PrinterUnavailable(
+            f"could not reach printd at {url}: {exc}. The label may or may "
+            f"not have printed - ask it with GET /printed before sending "
+            f"this job again.")
+
+
+def _sign_job(secret, job, body):
+    digest = hashlib.sha256(body).hexdigest()
+    return hmac.new((secret or "").encode(),
+                    f"{job}\n{digest}".encode(), hashlib.sha256).hexdigest()
+
+
+# Backends that hand the job to something else rather than touching a
+# device. The print lock belongs to whoever actually writes to the
+# printer: on Phase 3 the client and printd are the *same Pi*, so a
+# client that holds the lock while waiting for printd deadlocks against
+# printd trying to take it. Verified - it hung until the client timed out.
+REMOTE_BACKENDS = {"pi-http"}
+
+
 LANGUAGE_BACKENDS = {
     "TSPL": "tspl",
     "ZPL": "zpl",
@@ -519,6 +693,7 @@ BACKENDS = {
     "zpl": print_zpl,
     "tspl": print_tspl,
     "escpos": print_escpos,
+    "pi-http": print_pi_http,
 }
 
 
