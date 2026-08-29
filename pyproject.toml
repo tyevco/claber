@@ -24,6 +24,12 @@ mplabel = "mplabel.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# install_pi.sh does a non-editable install, so anything not declared here
+# simply is not on the Pi - the app would serve 404s for its own frontend
+# while working perfectly from a git checkout.
+[tool.setuptools.package-data]
+mplabel = ["static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

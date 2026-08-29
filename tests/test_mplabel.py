@@ -8,8 +8,11 @@ invented names and an unused tracking number.
 """
 
 import email
+import json
+import re
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -262,6 +265,8 @@ def test_code_never_collides_with_an_unshipped_parcel(db, monkeypatch):
         db.execute("INSERT INTO sales (message_id, code, status) "
                    "VALUES (?,?,'printed')", (f"<m{n}>", code))
     db.commit()
+    # Only one code left, so the random guesses all miss and the
+    # exhaustive walk has to be the thing that answers.
     for _ in range(20):
         assert cli.allocate_code(db) == "D"
 
@@ -468,6 +473,21 @@ def test_ship_by_parcel_code(db):
     assert db.execute("SELECT status FROM sales").fetchone()[0] == "shipped"
 
 
+def test_the_old_decimal_codes_are_still_valid(db, tmp_path):
+    """The decimal codes are a subset of the alphabet, which is what makes
+    this a change with no migration - the ~15 parcels already carrying one
+    keep working."""
+    from mplabel import cli
+
+    db.execute("INSERT INTO sales (message_id, code) VALUES ('<old>', '042')")
+    db.commit()
+    assert cli.ensure_code(db, "<old>") == "042"
+
+    plain = tmp_path / "plain.pdf"
+    label.to_4x6(LABEL_PDF, plain)
+    label.stamp_code(plain, tmp_path / "x.pdf", "042")
+
+
 def test_reprint_keeps_the_same_code(db):
     """The paper, the screen and the sheet have to agree, so allocation
     has to be idempotent."""
@@ -510,6 +530,22 @@ def test_stamp_rejects_an_unprintable_code(tmp_path, bad):
     label.to_4x6(LABEL_PDF, plain)
     with pytest.raises(ValueError, match="capital letters"):
         label.stamp_code(plain, tmp_path / "x.pdf", bad)
+
+
+def test_the_widest_code_still_fits_on_the_label(tmp_path):
+    """812 dots is the print head. A code that runs past the edge is
+    clipped, and a clipped code is worse than none - it still looks like
+    a number."""
+    from mplabel import printers
+
+    plain = tmp_path / "plain.pdf"
+    label.to_4x6(LABEL_PDF, plain)
+    for code in ("WWW", "000", "MQW"):
+        out = tmp_path / f"{code}.pdf"
+        label.stamp_code(plain, out, code)
+        _d, w, _wb, h = printers.render_bitmap(out, 203)
+        assert (w, h) == (812, 1218), f"{code} changed the page size"
+
 
 
 # ------------------------------------------------------------- rasterise
@@ -1230,3 +1266,584 @@ def test_sheet_tabs_have_matching_header_widths(db):
     for name, (sql, headers) in sheets.TABS.items():
         cur = db.execute(sql)
         assert len(cur.description) == len(headers), f"{name} column mismatch"
+
+
+# ------------------------------------------------- two processes, one Pi
+
+def test_connect_db_turns_on_wal_and_a_busy_timeout(tmp_path):
+    """The poll loop is no longer the only writer.
+
+    Under the default rollback journal, a web request overlapping a poll
+    gives `database is locked`, and it would surface as a failed print in
+    the middle of a batch. journal_mode lives in the file; busy_timeout is
+    per-connection, so every opener has to ask for it."""
+    from mplabel import cli
+
+    conn = cli.connect_db(tmp_path)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+
+def test_two_connections_can_write_the_same_database(tmp_path):
+    from mplabel import cli
+
+    a = cli.connect_db(tmp_path)
+    b = cli.connect_db(tmp_path)
+    for i in range(20):
+        conn = a if i % 2 == 0 else b
+        conn.execute("INSERT INTO sales (message_id, item) VALUES (?, ?)",
+                     (f"<m{i}>", "Stoneware vase"))
+        conn.commit()
+    assert a.execute("SELECT COUNT(*) FROM sales").fetchone()[0] == 20
+
+
+def test_migration_adds_columns_to_an_existing_database(tmp_path):
+    """CREATE TABLE IF NOT EXISTS will not touch a table that already
+    exists, so a database holding real sales never gains a new column
+    unless MIGRATIONS says so. The row has to survive it."""
+    from mplabel import cli
+
+    # The real schema minus the column, rather than a hand-written subset:
+    # a trimmed copy is how the db fixture drifted until it had no
+    # message_id and tests passed against a table the code never meets.
+    old_schema = cli.SCHEMA.replace("    code         TEXT,\n", "")
+    assert "code" not in old_schema, "SCHEMA reformatted - fix this test"
+
+    old = sqlite3.connect(tmp_path / "sales.db")
+    old.executescript(old_schema)
+    old.execute("INSERT INTO sales (message_id, item) "
+                "VALUES ('<real>', 'Stoneware vase')")
+    old.commit()
+    old.close()
+
+    conn = cli.connect_db(tmp_path)
+    assert "code" in {r[1] for r in conn.execute("PRAGMA table_info(sales)")}
+    assert conn.execute(
+        "SELECT item FROM sales WHERE message_id='<real>'"
+    ).fetchone()[0] == "Stoneware vase"
+
+
+def _lock_cfg(tmp_path, home=None):
+    return {"printer_backend": "zpl", "printer_dpi": "203",
+            "printer_darkness": "8", "printer_device": str(tmp_path / "lp0"),
+            "home": str(tmp_path if home is None else home),
+            "label_code": "no"}
+
+
+def test_print_label_serialises_concurrent_jobs(tmp_path, monkeypatch):
+    """_write_raw hands the whole job over in one write because this
+    firmware drops bytes arriving while the head moves. Two writers
+    interleaved is a garbage label - so the poll loop and the web app have
+    to queue, not race."""
+    import threading
+    import time as _time
+
+    from mplabel import cli, printers
+
+    events = []
+
+    def fake_send(pdf_path, backend, **kwargs):
+        events.append("start")
+        _time.sleep(0.05)
+        events.append("end")
+
+    monkeypatch.setattr(printers, "send", fake_send)
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    cfg = _lock_cfg(tmp_path)
+
+    threads = [threading.Thread(target=cli.print_label, args=(cfg, pdf))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert events == ["start", "end", "start", "end"], \
+        "the second job started before the first finished"
+
+
+def test_print_label_still_prints_when_the_lock_cannot_be_made(
+        tmp_path, monkeypatch, caplog):
+    """probe/selftest/file run above connect_db on purpose, so a printer
+    test keeps working when the data directory is missing or unwritable -
+    which is exactly when you need one. A lock we cannot take must not
+    become the thing that stops a label."""
+    from mplabel import cli, printers
+
+    sent = []
+    monkeypatch.setattr(printers, "send",
+                        lambda *a, **k: sent.append(a))
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+
+    # /dev/null is not a directory, so mkdir underneath it cannot succeed.
+    cfg = _lock_cfg(tmp_path, home="/dev/null/nope")
+    cli.print_label(cfg, pdf)
+
+    assert len(sent) == 1, "the label must still print"
+    assert "without a lock" in caplog.text
+
+
+# ------------------------------------------------------------ the web app
+
+def _http(url, method="GET", data=None, cookie=None, headers=None):
+    """One request through the real server. Returns (status, headers, body)."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    body = _json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, method=method)
+    if cookie:
+        req.add_header("Cookie", cookie)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+@pytest.fixture
+def app(tmp_path):
+    """A real server on an ephemeral port, against a real database."""
+    import threading
+
+    from mplabel import cli, web
+
+    conn = cli.connect_db(tmp_path)
+    conn.execute(
+        "INSERT INTO sales (message_id, item, buyer, price, ship_by, code, "
+        "ship_to, tracking, status) VALUES "
+        "('<m1>', 'Stoneware vase', 'Sam Sample', 15.0, '2026-09-04', '042',"
+        " '2 FICTION RD, SHELBYVILLE IN 46176', '9400100000000000000000',"
+        " 'to_ship')")
+    conn.commit()
+
+    cfg = {"home": str(tmp_path),
+           "web_password_hash": web.hash_password("hunter2"),
+           "web_session_days": "30", "web_secure_cookie": "no"}
+    srv = web.Server(("127.0.0.1", 0), cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}", conn
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _login(base, password="hunter2"):
+    status, headers, _ = _http(f"{base}/api/login", "POST",
+                               {"password": password})
+    return status, (headers.get("Set-Cookie") or "").split(";")[0]
+
+
+def test_password_hash_round_trips_and_rejects(tmp_path):
+    from mplabel import web
+
+    stored = web.hash_password("hunter2")
+    assert web.verify_password("hunter2", stored)
+    assert not web.verify_password("hunter3", stored)
+    # A mangled config line must lock her out, not raise.
+    assert not web.verify_password("hunter2", "garbage")
+    assert not web.verify_password("hunter2", "")
+
+
+def test_session_token_is_signed_and_expires():
+    from mplabel import web
+
+    cfg = {"web_password_hash": "scrypt$1$2$3$aaaa$bbbb"}
+    token = web.issue_token(cfg, days=1)
+    assert web.valid_token(cfg, token)
+    # Tampering with the payload breaks the signature.
+    payload, sig = token.split(".")
+    assert not web.valid_token(cfg, payload[:-2] + "xx." + sig)
+    # Expiry is enforced.
+    assert not web.valid_token(cfg, token, now=time.time() + 2 * 86400)
+
+
+def test_changing_the_password_invalidates_old_sessions():
+    """The signing key is derived from the password hash, so there is no
+    separate secret to manage and a password change logs every phone out."""
+    from mplabel import web
+
+    old = {"web_password_hash": web.hash_password("hunter2")}
+    token = web.issue_token(old, days=30)
+    new = {"web_password_hash": web.hash_password("something-else")}
+    assert web.valid_token(old, token)
+    assert not web.valid_token(new, token)
+
+
+@pytest.mark.parametrize("attempt", [
+    "../../etc/passwd",
+    "/../../etc/passwd",
+    "%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    "..%2f..%2fetc%2fpasswd",
+    "/labels/../../../../etc/passwd",
+])
+def test_static_paths_cannot_escape(attempt):
+    from mplabel import web
+
+    assert web.safe_static_path(attempt) is None
+
+
+def test_the_dot_filter_bypass_stays_inside():
+    """`....//` is the bypass for filters that strip `../` exactly once -
+    strip it and what is left is `../`. This resolves the path instead of
+    editing it, so `....` is only an odd directory name and the result is
+    still under static/: a 404, not a file read."""
+    from mplabel import web
+
+    got = web.safe_static_path("....//....//etc/passwd")
+    assert got is not None
+    assert got.is_relative_to(web.STATIC.resolve())
+
+
+def test_label_path_must_live_under_home(tmp_path):
+    """The path comes from the database, but a row edited by hand must not
+    turn into an arbitrary file read."""
+    from mplabel import web
+
+    outside = tmp_path.parent / "secret.pdf"
+    outside.write_bytes(b"%PDF-1.4\n")
+    assert web.safe_label_path(tmp_path, str(outside)) is None
+
+    inside = tmp_path / "labels" / "ok_4x6.pdf"
+    inside.parent.mkdir(exist_ok=True)
+    inside.write_bytes(b"%PDF-1.4\n")
+    assert web.safe_label_path(tmp_path, str(inside)) == inside
+
+
+def test_endpoints_require_authentication(app):
+    base, _ = app
+    for path in ("/api/orders", "/api/orders/1", "/api/pending", "/api/stats"):
+        status, _, _ = _http(base + path)
+        assert status == 401, f"{path} served data unauthenticated"
+
+
+def test_health_is_open_but_says_nothing(app):
+    base, _ = app
+    status, _, body = _http(f"{base}/healthz")
+    assert status == 200
+    assert json.loads(body) == {"ok": True}
+
+
+def test_login_then_read_the_queue(app):
+    base, _ = app
+    assert _login(base, "wrong")[0] == 401
+
+    status, cookie = _login(base)
+    assert status == 200 and cookie
+
+    status, _, body = _http(f"{base}/api/orders", cookie=cookie)
+    assert status == 200
+    orders = json.loads(body)["orders"]
+    assert len(orders) == 1
+    assert orders[0]["code"] == "042"
+    assert orders[0]["printed"] is False
+
+
+def test_the_queue_does_not_carry_addresses(app):
+    """She is looking at a list in a kitchen. The buyer's home address
+    belongs on the one screen that needs it."""
+    base, _ = app
+    _, cookie = _login(base)
+
+    _, _, body = _http(f"{base}/api/orders", cookie=cookie)
+    assert "ship_to" not in json.loads(body)["orders"][0]
+    assert json.loads(body)["orders"][0]["buyer"] == "Sam"
+
+    _, _, detail = _http(f"{base}/api/orders/1", cookie=cookie)
+    assert "SHELBYVILLE" in json.loads(detail)["ship_to"]
+
+
+def test_mutations_need_the_csrf_header(app):
+    """SameSite=Lax plus a header no cross-origin form can set. Logout is
+    the only mutation until phase 3, but the gate is on the dispatcher."""
+    from mplabel import web
+
+    base, _ = app
+    _, cookie = _login(base)
+
+    web.Handler.ROUTES.append(("POST", r"^/api/_probe$", "h_session", True))
+    web.Handler._COMPILED = [(m, re.compile(p), h, a)
+                             for m, p, h, a in web.Handler.ROUTES]
+    try:
+        status, _, _ = _http(f"{base}/api/_probe", "POST", {}, cookie=cookie)
+        assert status == 400
+        status, _, _ = _http(f"{base}/api/_probe", "POST", {}, cookie=cookie,
+                             headers={"X-Mplabel": "1"})
+        assert status == 200
+    finally:
+        web.Handler.ROUTES.pop()
+        web.Handler._COMPILED = [(m, re.compile(p), h, a)
+                                 for m, p, h, a in web.Handler.ROUTES]
+
+
+def test_traversal_over_http_is_refused(app):
+    base, _ = app
+    status, _, _ = _http(f"{base}/%2e%2e%2f%2e%2e%2fetc%2fpasswd")
+    assert status in (400, 404), "traversal must not reach the filesystem"
+
+
+def test_login_locks_out_after_repeated_failures():
+    from mplabel import web
+
+    t = web.Throttle(limit=3, window=60)
+    assert not t.locked("1.2.3.4")
+    for _ in range(3):
+        t.record_failure("1.2.3.4")
+    assert t.locked("1.2.3.4")
+    # A different client is unaffected, and the window expires.
+    assert not t.locked("5.6.7.8")
+    assert not t.locked("1.2.3.4", now=time.time() + 61)
+
+
+def test_serve_refuses_to_run_without_a_password():
+    """Better to fail loudly at startup than to publish customer addresses
+    to the internet because a config key was missed on an upgrade."""
+    from mplabel import web
+
+    with pytest.raises(SystemExit) as exc:
+        web.serve({"home": "/tmp", "web_password_hash": ""})
+    assert "passwd" in str(exc.value)
+
+
+def test_head_is_answered_not_501(app):
+    """curl -I and health checkers use HEAD; BaseHTTPRequestHandler
+    answers 501 unless it is wired up."""
+    base, _ = app
+    status, headers, body = _http(f"{base}/healthz", method="HEAD")
+    assert status == 200
+    assert body == b""
+    assert headers.get("Content-Length") == "12"
+
+
+# ------------------------------------------------------- the write actions
+
+def test_ship_and_undo_round_trip(app):
+    """Undo exists because marking shipped hides a parcel from the queue,
+    and a mis-tap on a box that has not gone is expensive."""
+    base, conn = app
+    _, cookie = _login(base)
+    hdr = {"X-Mplabel": "1"}
+
+    status, _, _ = _http(f"{base}/api/orders/1/ship", "POST", {},
+                         cookie=cookie, headers=hdr)
+    assert status == 200
+    assert conn.execute("SELECT status FROM sales WHERE id=1").fetchone()[0] \
+        == "shipped"
+
+    _http(f"{base}/api/orders/1/unship", "POST", {}, cookie=cookie, headers=hdr)
+    # Never printed, so it goes back to to_ship rather than printed.
+    assert conn.execute("SELECT status FROM sales WHERE id=1").fetchone()[0] \
+        == "to_ship"
+
+
+def test_unship_returns_a_printed_parcel_to_printed(app):
+    base, conn = app
+    _, cookie = _login(base)
+    conn.execute("UPDATE sales SET printed_at='2026-08-28T09:00:00' WHERE id=1")
+    conn.commit()
+    hdr = {"X-Mplabel": "1"}
+    _http(f"{base}/api/orders/1/ship", "POST", {}, cookie=cookie, headers=hdr)
+    _http(f"{base}/api/orders/1/unship", "POST", {}, cookie=cookie, headers=hdr)
+    assert conn.execute("SELECT status FROM sales WHERE id=1").fetchone()[0] \
+        == "printed"
+
+
+def test_fields_correct_the_record(app):
+    base, conn = app
+    _, cookie = _login(base)
+    hdr = {"X-Mplabel": "1"}
+
+    status, _, body = _http(f"{base}/api/orders/1/fields", "POST",
+                            {"item": "Corrected title", "price": "19.50",
+                             "notes": "packed"},
+                            cookie=cookie, headers=hdr)
+    assert status == 200
+    assert json.loads(body)["item"] == "Corrected title"
+    row = conn.execute("SELECT item, price, notes FROM sales WHERE id=1").fetchone()
+    assert (row[0], row[1], row[2]) == ("Corrected title", 19.5, "packed")
+
+
+def test_fields_rejects_a_bad_price_and_an_empty_patch(app):
+    base, _ = app
+    _, cookie = _login(base)
+    hdr = {"X-Mplabel": "1"}
+    for payload in ({"price": "twenty quid"}, {}):
+        status, _, _ = _http(f"{base}/api/orders/1/fields", "POST", payload,
+                             cookie=cookie, headers=hdr)
+        assert status == 400
+
+
+def test_fields_ignores_columns_it_was_not_offered(app):
+    """The request never names a column - the allow-list does."""
+    base, conn = app
+    _, cookie = _login(base)
+    _http(f"{base}/api/orders/1/fields", "POST",
+          {"item": "ok", "status": "shipped", "code": "999"},
+          cookie=cookie, headers={"X-Mplabel": "1"})
+    row = conn.execute("SELECT status, code FROM sales WHERE id=1").fetchone()
+    assert row[0] == "to_ship" and row[1] == "042"
+
+
+def test_printing_goes_through_the_same_path_as_the_cli(app, tmp_path, monkeypatch):
+    """The endpoint must not reimplement printing - cli.print_label is
+    what takes the flock that keeps it from interleaving with the poller."""
+    from mplabel import cli
+
+    base, conn = app
+    _, cookie = _login(base)
+    pdf = tmp_path / "labels" / "x_4x6.pdf"
+    pdf.parent.mkdir(exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.4\n")
+    conn.execute("UPDATE sales SET label_pdf=? WHERE id=1", (str(pdf),))
+    conn.commit()
+
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+    status, _, _ = _http(f"{base}/api/orders/1/print", "POST", {},
+                         cookie=cookie, headers={"X-Mplabel": "1"})
+    assert status == 200
+    assert len(sent) == 1
+    assert conn.execute("SELECT printed_at FROM sales WHERE id=1").fetchone()[0]
+
+
+def test_batch_dry_run_prints_nothing(app, tmp_path, monkeypatch):
+    from mplabel import cli
+
+    base, conn = app
+    _, cookie = _login(base)
+    pdf = tmp_path / "labels" / "x_4x6.pdf"
+    pdf.parent.mkdir(exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.4\n")
+    conn.execute("UPDATE sales SET label_pdf=? WHERE id=1", (str(pdf),))
+    conn.commit()
+
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+    status, _, body = _http(f"{base}/api/print/pending", "POST",
+                            {"ids": [1], "dry_run": True},
+                            cookie=cookie, headers={"X-Mplabel": "1"})
+    assert status == 200
+    assert sent == [], "a dry run must not reach the printer"
+    assert len(json.loads(body)["would_print"]) == 1
+
+
+def test_one_bad_label_does_not_abandon_the_batch(app, tmp_path, monkeypatch):
+    """Recovering a jammed batch is the whole point of that screen; a
+    single missing file must not strand the rest."""
+    from mplabel import cli
+
+    base, conn = app
+    _, cookie = _login(base)
+    good = tmp_path / "labels" / "good_4x6.pdf"
+    good.parent.mkdir(exist_ok=True)
+    good.write_bytes(b"%PDF-1.4\n")
+    conn.execute("UPDATE sales SET label_pdf=? WHERE id=1", (str(good),))
+    conn.execute("INSERT INTO sales (message_id, item, label_pdf, code) "
+                 "VALUES ('<m2>', 'Missing file', ?, '077')",
+                 (str(tmp_path / "labels" / "gone_4x6.pdf"),))
+    conn.commit()
+
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+    _, _, body = _http(f"{base}/api/print/pending", "POST",
+                       {"ids": [1, 2]}, cookie=cookie,
+                       headers={"X-Mplabel": "1"})
+    out = json.loads(body)
+    assert len(out["printed"]) == 1 and len(out["failed"]) == 1
+
+
+def test_system_endpoint_leaks_no_secrets(app):
+    """imap_password, sheets_key and the password hash all live in the
+    same config dict this reads from."""
+    base, _ = app
+    _, cookie = _login(base)
+    _, _, body = _http(f"{base}/api/system", cookie=cookie)
+    blob = body.decode().lower()
+    for secret in ("password", "scrypt", "sheets_key", "imap"):
+        assert secret not in blob, f"{secret} reached the client"
+
+
+def test_the_app_shell_is_served(app):
+    base, _ = app
+    for path, needle in (("/", b"<title>mplabel</title>"),
+                         ("/app.js", b"esc("),
+                         ("/manifest.json", b"standalone")):
+        status, _, body = _http(base + path)
+        assert status == 200, path
+        assert needle in body, path
+
+
+def test_the_client_escapes_what_facebook_sends():
+    """Item titles come from Marketplace listings, so their text is chosen
+    by someone else. app.js must route every one through esc()."""
+    js = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
+          / "app.js").read_text()
+    assert "function esc(" in js
+
+    # Anything concatenated straight into an HTML string is unescaped by
+    # definition. o/d/p/a/b/s/t/m are the loop variables holding server
+    # data, so a raw `+ o.title` is the bug this is looking for. Numeric
+    # ids are the only safe exception - they cannot carry markup.
+    numeric_ok = {"id", "print_count", "length"}
+    raw = [f"{v}.{f}" for v, f in
+           re.findall(r"\+\s*\b([odpabstm])\.(\w+)", js)
+           if f not in numeric_ok]
+    assert not raw, f"interpolated into HTML without esc(): {sorted(set(raw))}"
+
+
+# ------------------------------------- the web app meets the label backstop
+
+def test_the_web_reprint_refuses_a_mismatched_label(app, tmp_path, monkeypatch):
+    """`label_belongs_to` exists because an archived label once pointed at
+    another buyer, and printing it posts a parcel to a stranger. Reprinting
+    from a phone is the easy path, so it is the one that most needs the
+    check - going straight to print_label would route around it."""
+    from mplabel import cli
+
+    base, conn = app
+    _, cookie = _login(base)
+
+    pdf = tmp_path / "labels" / "x_4x6.pdf"
+    pdf.parent.mkdir(exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.4\n")
+    conn.execute("UPDATE sales SET label_pdf=? WHERE id=1", (str(pdf),))
+    conn.commit()
+
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(cli, "label_belongs_to",
+                        lambda row: (False, "addressed to someone else"))
+
+    status, _, body = _http(f"{base}/api/orders/1/print", "POST", {},
+                            cookie=cookie, headers={"X-Mplabel": "1"})
+    assert status == 400
+    assert "someone else" in json.loads(body)["error"]
+    assert sent == [], "a mismatched label reached the printer"
+
+    # ...and --force still gets through, the same as the CLI.
+    status, _, _ = _http(f"{base}/api/orders/1/print", "POST", {"force": True},
+                         cookie=cookie, headers={"X-Mplabel": "1"})
+    assert status == 200 and len(sent) == 1
+
+
+def test_a_cancelled_order_leaves_the_phone_queue(app):
+    """CLOSED_STATUSES, not `!= shipped`. A cancelled order is closed too,
+    and would otherwise sit in her queue forever asking to be posted."""
+    base, conn = app
+    _, cookie = _login(base)
+
+    _, _, body = _http(f"{base}/api/orders", cookie=cookie)
+    assert len(json.loads(body)["orders"]) == 1
+
+    conn.execute("UPDATE sales SET status='cancelled' WHERE id=1")
+    conn.commit()
+    _, _, body = _http(f"{base}/api/orders", cookie=cookie)
+    assert json.loads(body)["orders"] == []
+
+    _, _, body = _http(f"{base}/api/pending", cookie=cookie)
+    assert json.loads(body)["pending"] == []

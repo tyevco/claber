@@ -18,12 +18,17 @@ cleverness.
 
 ```bash
 pip install -e ".[dev,sheets]"
-pytest                                     # 95 tests, all should pass
+pytest                                     # the whole suite should pass
 pytest tests/test_mplabel.py::test_output_is_exactly_4x6   # one test
 pytest -k tspl                             # printer-language regressions
 python -m mplabel --help
 python -m mplabel file tests/fixtures/label_sample.pdf   # no config needed
 ```
+
+There is no linter, formatter or type checker configured, and no CI.
+`pytest` is the entire gate - one test file, `tests/test_mplabel.py`.
+Do not add tooling without asking; the Pi dependency list is kept short
+on purpose.
 
 Config resolution order: `MPLABEL_<KEY>` env var, then
 `/etc/mplabel.conf`, then `~/.config/mplabel.conf`, then `DEFAULTS` in
@@ -33,6 +38,37 @@ that exists, so `~/.config/mplabel.conf` is never read while
 `[mplabel]` section header, without which the parser finds nothing and
 silently falls back to `DEFAULTS`, which looks exactly like an empty
 config.
+
+## The subcommands
+
+All are `python -m mplabel <cmd>` (installed as `mplabel`). Grouped by
+what they touch, because that is what decides whether they are safe to
+run against a real database.
+
+| Reads mail | |
+|---|---|
+| `check` | poll once, record, do **not** print |
+| `run [--loop]` | poll and print; `--loop` is what systemd runs |
+| `scan [--limit N]` | survey Facebook subjects, change nothing. Feeds open work #2 |
+| `backfill [--limit N] [--restart]` | classify old mail into `mail_events` |
+
+| Prints | |
+|---|---|
+| `file <pdf> [-o] [--rotate] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
+| `probe` | printers, USB devices, IEEE-1284 id |
+| `selftest` | tiny text-only TSPL label |
+| `test-print` | reprint the newest label |
+| `reprint <ref>` | reprint one |
+| `pending [--since] [--all] [--dry-run]` | labels recorded but never printed; today only by default |
+
+| Database only | |
+|---|---|
+| `list` / `stats` / `ship <ref>` | outstanding orders, analytics, mark shipped |
+| `import <path> --format dyi\|csv\|saved [--state ...]` | listings from a file |
+| `sheets [--dry-run]` | push to Google Sheets |
+
+`probe`, `selftest` and `file` run above `connect_db` in `main()` - see
+the note below on why.
 
 ## Deploying to the Pi
 
@@ -159,7 +195,7 @@ hardware or a real Facebook account.
 | Ship-by year inference | **Verified** by unit test incl. New Year rollover and leap day. Parse with an explicit year; year-less `strptime` defaults to 1900 and loses Feb 29. |
 | G4 speaks TSPL | **Verified on the hardware.** `tspl_selftest` rendered correctly — `TSPL OK` in large type, the following lines smaller and each on its own line, i.e. `TEXT 40,80,"4",0,2,2` executed rather than echoed — and a real label then printed through the `tspl` backend. |
 | **The IEEE-1284 id lies on this unit** | **Verified.** `probe` reads `MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;` — every word of which points at ESC/POS, and it is wrong. The same string calls this thermal printer an "Impact Printer", so the descriptor is boilerplate the OEM never edited. An ESC/POS text selftest printed *nothing*, which is what a TSPL parser does with commands it does not recognise. Do not switch backends on the strength of the id; print something first. USB `28e9:02ad`, CUPS sees `usb://Clabel-/G4`. |
-| Parcel code placement | **Verified.** The 3-digit code renders upright in the header strip above the label's border, top right, clear of the postage indicia, the addresses and the tracking barcode. Confirmed on the label output; **not yet** confirmed on a thermal print, where edge margins are tighter, nor scanner-tested. |
+| Parcel code placement | **Verified.** The 3-character code renders upright in the header strip above the label's border, top right, clear of the postage indicia, the addresses and the tracking barcode. Checked by rendering for the widest code the alphabet allows (`WWW`) as well as an all-digit one, and both right-align on the same margin. Confirmed on the label output; **not yet** confirmed on a thermal print, where edge margins are tighter, nor scanner-tested. |
 | The raw data path works | **Verified on the hardware:** bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. If a label comes out wrong from here, suspect the raster or the geometry, not the transport. |
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
 | `escpos` backend | **UNUSED and unproven.** Written while the id was believed, kept because the job structure is unit-tested and some sibling models really do speak ESC/POS. Nothing it produces has ever printed. Its banding size and trailing form feed are guesses. |
@@ -187,6 +223,14 @@ nominal-size window instead. `test_output_is_exactly_4x6` guards this.
 source PDF returns every line mirrored (`sIPA` for `USPS APIs`) because
 the text is drawn rotated. `cli.process_message` deliberately calls
 `extract_label_fields(out_pdf)`.
+
+**Five backends, two ways in.** `printers.BACKENDS` is
+`cups-pdf`, `cups-raster`, `zpl`, `tspl`, `escpos` - the last three write
+raw bytes to `printer_device`, the first two go through a CUPS
+`printer_queue`. Separately, `LANGUAGE_BACKENDS` maps what `probe`
+detected to a `printer_backend` value, and it deliberately has no entry
+for EPL or PCL: `probe` must name the language plainly rather than
+suggest a value `send()` would reject with `Unknown backend`.
 
 **TSPL has the opposite bit polarity to ZPL and ESC/POS.** TSPL prints on
 a *clear* bit; ZPL and ESC/POS print on a *set* bit. So

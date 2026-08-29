@@ -1,0 +1,371 @@
+/* mplabel PWA — ported from the March Vector design system.
+ *
+ * Two deliberate departures from the source design:
+ *
+ * 1. No webfonts. colors_and_type.css pulls Fraunces, EB Garamond and
+ *    JetBrains Mono from fonts.googleapis.com and Inter from a bundled
+ *    variable TTF. This is served by a Raspberry Pi that must not depend
+ *    on the internet at render time, so the stacks below fall back to
+ *    system faces. The design's optical-size axis (`opsz`) goes with
+ *    them; the type scale and weights are kept.
+ * 2. The iOS device frame in the source is canvas chrome - bezel,
+ *    dynamic island, a drawn keyboard. On a real iPhone iOS supplies all
+ *    of that, so drawing it would put a fake phone inside a real one.
+ *    What is kept from it is the safe-area padding it stood in for.
+ */
+
+:root {
+  --mv-font-sans: ui-sans-serif, system-ui, -apple-system, "SF Pro Text",
+                  "Segoe UI", Roboto, sans-serif;
+  --mv-font-display: ui-serif, Georgia, "Times New Roman", serif;
+  --mv-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+/* Dark is the default, not the alternate: she uses this in the evening
+   and in badly lit shops. */
+[data-mp] {
+  --bg:#100e09; --rai:#1b180f; --sun:#0a0906; --elev:#252017;
+  --fg:#f4efe6; --mut:#a89f8b; --sub:#6b6355;
+  --bd:#2f2a22; --bds:#4a4338;
+  --ac:#6ebd72; --aci:#0e0c07; --act:#1a2f1c;
+  --al:#ff7a5c; --alt:#2b1611; --ale:#7a3423;
+  --wa:#d4b25a; --wat:#292013;
+  --cbg:#f4efe6; --cfg:#12100b;
+}
+[data-mp="light"] {
+  --bg:#fbf8f2; --rai:#ffffff; --sun:#f4efe6; --elev:#f4efe6;
+  --fg:#1b180f; --mut:#6b6355; --sub:#a89f8b;
+  --bd:#e6dfd0; --bds:#d0c5af;
+  --ac:#3d9a46; --aci:#ffffff; --act:#dcecda;
+  --al:#ad2a1b; --alt:#faeae5; --ale:#e0b6a9;
+  --wa:#8a6a1e; --wat:#f7edd6;
+  --cbg:#1b180f; --cfg:#fbf8f2;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg); color: var(--fg);
+  font-family: var(--mv-font-sans);
+  -webkit-font-smoothing: antialiased;
+  /* Stop the whole page rubber-banding under the fixed tab bar. */
+  overscroll-behavior-y: none;
+}
+
+button {
+  font: inherit; color: inherit; background: none; border: none;
+  padding: 0; margin: 0; cursor: pointer; text-align: left;
+  -webkit-tap-highlight-color: transparent;
+}
+input, textarea, select { font: inherit; color: inherit; }
+a { color: var(--ac); }
+
+@keyframes mpPulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+@keyframes mpRise  { from{transform:translateY(10px);opacity:0}
+                     to{transform:translateY(0);opacity:1} }
+
+/* ------------------------------------------------------------- layout */
+
+#app { height: 100%; display: flex; flex-direction: column; }
+
+.screen {
+  height: 100%; display: flex; flex-direction: column; min-height: 0;
+}
+.head {
+  flex: none; display: flex; align-items: flex-end; gap: 10px;
+  padding: calc(env(safe-area-inset-top) + 16px) 18px 8px;
+}
+.head--row { align-items: center; }
+.head--rule { border-bottom: 1px solid var(--bd); padding-bottom: 11px; }
+.eyebrow {
+  font-size: 10.5px; font-weight: 600; letter-spacing: .14em;
+  color: var(--mut); text-transform: uppercase;
+}
+.title {
+  font-family: var(--mv-font-display); font-weight: 500;
+  font-size: 30px; letter-spacing: -.02em; margin-top: 2px;
+}
+.title--sm { font-size: 23px; }
+.title--xs { font-size: 19px; margin-top: 0; }
+
+.scroll {
+  flex: 1; min-height: 0; overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 0 18px 120px;
+  display: flex; flex-direction: column; gap: 9px;
+}
+/* A column flexbox shrinks its children when the content overflows, and
+   this one always overflows - that is what makes it scroll. Anything with
+   `overflow:hidden` (the detail grid) has no min-content floor to stop
+   it, so it collapses to a couple of pixels and simply vanishes off the
+   screen. Nothing in a scroller should ever flex. */
+.scroll > * { flex: none; }
+
+.iconbtn {
+  width: 44px; height: 44px; border-radius: 12px; flex: none;
+  border: 1px solid var(--bd); background: var(--rai);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 17px;
+}
+
+/* --------------------------------------------------------------- chips */
+
+.chips {
+  flex: none; display: flex; gap: 8px; padding: 10px 18px;
+  overflow-x: auto; scrollbar-width: none;
+}
+.chips::-webkit-scrollbar { display: none; }
+.chip {
+  display: flex; flex-direction: column; gap: 2px; flex: none;
+  padding: 9px 13px; border-radius: 11px;
+  background: var(--rai); border: 1px solid var(--bd);
+}
+.chip b {
+  font-family: var(--mv-font-mono); font-size: 15px; font-weight: 600;
+}
+.chip span { font-size: 10.5px; color: var(--mut); }
+.chip--alert { background: var(--alt); border-color: var(--ale); }
+.chip--alert b, .chip--alert span { color: var(--al); }
+.chip--money b { color: var(--ac); }
+
+/* --------------------------------------------------------- queue rows */
+
+.row { display: flex; gap: 7px; align-items: stretch; }
+.rail { width: 3px; border-radius: 2px; flex: none; background: transparent; }
+.rail--box { background: var(--bds); }
+
+.card {
+  flex: 1; min-width: 0; display: flex; gap: 12px; padding: 11px;
+  border-radius: 13px; border: 1px solid var(--bd); background: var(--rai);
+}
+/* `flex:1` above is horizontal - the card fills the row beside its rail.
+   A card sitting directly in .scroll is in a *column* flexbox, where the
+   same rule makes it stretch to fill the screen instead. */
+.scroll > .card { align-items: center; }
+.card--alert { border-color: var(--ale); background: var(--alt); }
+
+.codecol {
+  flex: none; display: flex; flex-direction: column; gap: 5px;
+  align-items: center; width: 60px;
+}
+/* The parcel code is the anchor: it is written on a box in the hallway,
+   and she reads it off the paper before she reads anything on screen. */
+.code {
+  width: 60px; height: 45px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--mv-font-mono); font-size: 22px; font-weight: 700;
+  background: var(--cbg); color: var(--cfg);
+}
+.code--alert { background: var(--al); color: var(--alt); }
+.due {
+  font-family: var(--mv-font-mono); font-size: 9px; font-weight: 600;
+  letter-spacing: .07em; color: var(--mut); text-align: center;
+}
+.due--soon { color: var(--wa); }
+.due--now  { color: var(--al); }
+
+.meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.lead {
+  font-size: 11px; color: var(--sub);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* Her titles run long and share their opening words, so two lines of the
+   distinguishing part beats one line of the shared prefix. */
+.distinct {
+  font-size: 14.5px; font-weight: 600; line-height: 1.28;
+  letter-spacing: -.01em; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.line {
+  display: flex; align-items: baseline; gap: 8px; margin-top: 3px;
+}
+.line .who {
+  font-size: 12.5px; color: var(--mut);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.line .amt {
+  font-family: var(--mv-font-mono); font-size: 12.5px; font-weight: 600;
+  margin-left: auto;
+}
+.warn {
+  font-size: 11.5px; font-weight: 600; color: var(--al); margin-top: 4px;
+}
+.foot { text-align: center; padding: 12px 0 0; font-size: 11.5px; color: var(--sub); }
+
+/* -------------------------------------------------------------- detail */
+
+.grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+  background: var(--bd); border: 1px solid var(--bd); border-radius: 12px;
+  overflow: hidden;
+}
+.cell { background: var(--rai); padding: 11px 13px; }
+.cell dt {
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--mut); font-weight: 600; margin: 0;
+}
+.cell dd { margin: 3px 0 0; font-size: 15px; font-weight: 600; }
+.cell dd.mono { font-family: var(--mv-font-mono); font-size: 17px; }
+
+.panel {
+  border: 1px solid var(--bd); border-radius: 12px; background: var(--rai);
+  padding: 13px; display: flex; flex-direction: column; gap: 11px;
+}
+.panel .sep { height: 1px; background: var(--bd); }
+.track {
+  font-family: var(--mv-font-mono); font-size: 13px; font-weight: 500;
+  letter-spacing: .03em; margin-top: 4px;
+  white-space: nowrap; overflow-x: auto;
+}
+.addr { margin-top: 5px; display: flex; flex-direction: column; gap: 1px; }
+.addr span { font-size: 13.5px; line-height: 1.45; }
+.hint { font-size: 11px; color: var(--sub); margin-top: 7px; line-height: 1.5; }
+
+.bigcode {
+  width: 94px; height: 68px; border-radius: 10px; flex: none;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; background: var(--cbg); color: var(--cfg);
+}
+.bigcode b { font-family: var(--mv-font-mono); font-size: 36px; line-height: 1; }
+.bigcode span {
+  font-family: var(--mv-font-mono); font-size: 8px; letter-spacing: .12em;
+  opacity: .65; margin-top: 3px;
+}
+.bigcode--alert { background: var(--al); color: var(--alt); }
+
+.state {
+  font-size: 11.5px; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+/* ------------------------------------------------------------ controls */
+
+.field {
+  width: 100%; background: var(--rai); border: 1px solid var(--bd);
+  border-radius: 11px; padding: 14px 13px; font-size: 15px; outline: none;
+}
+.field:focus { border-color: var(--ac); }
+
+.dock {
+  position: fixed; left: 0; right: 0; bottom: 82px; z-index: 15;
+  padding: 12px 18px 14px; display: flex; gap: 10px;
+  background: linear-gradient(to top, var(--bg) 68%, transparent);
+}
+/* Hold-to-confirm rather than tap: printing spends paper and marking a
+   parcel shipped hides it from the queue. Both are awkward to undo with
+   a box already taped shut. */
+.hold {
+  flex: 1; position: relative; overflow: hidden; height: 54px;
+  border-radius: 14px; background: var(--ac); color: var(--aci);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14.5px; font-weight: 600;
+}
+.hold--ghost {
+  flex: none; width: 118px; background: var(--rai); color: var(--fg);
+  border: 1px solid var(--bds); font-size: 13.5px;
+}
+.hold--wide { width: 100%; }
+.hold[disabled] { opacity: .45; }
+.hold .fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+  background: rgba(0,0,0,.24);
+}
+.hold--ghost .fill { background: var(--act); }
+.hold span { position: relative; }
+
+/* ---------------------------------------------------------------- tabs */
+
+.tabs {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+  height: calc(82px + env(safe-area-inset-bottom));
+  padding: 0 6px env(safe-area-inset-bottom);
+  background: var(--rai); border-top: 1px solid var(--bd);
+  display: flex; align-items: flex-start;
+}
+.tab {
+  flex: 1; height: 56px; position: relative;
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 5px;
+}
+.tab i { height: 2px; width: 22px; border-radius: 2px; background: transparent; }
+.tab span { font-size: 11.5px; color: var(--mut); letter-spacing: -.01em; }
+.tab[aria-current="true"] i { background: var(--ac); }
+.tab[aria-current="true"] span { color: var(--fg); font-weight: 600; }
+.badge {
+  position: absolute; top: 6px; right: 14px; min-width: 16px; height: 16px;
+  border-radius: 99px; background: var(--al); color: var(--alt);
+  font-family: var(--mv-font-mono); font-size: 9.5px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; padding: 0 4px;
+}
+
+/* --------------------------------------------------------------- toast */
+
+.toast {
+  position: fixed; left: 16px; right: 16px; z-index: 60;
+  bottom: calc(96px + env(safe-area-inset-bottom));
+  animation: mpRise .2s ease-out;
+  display: flex; align-items: center; gap: 11px;
+  padding: 13px 15px; border-radius: 13px;
+  background: var(--elev); border: 1px solid var(--bds);
+  box-shadow: 0 12px 32px -10px rgba(0,0,0,.6);
+}
+.toast i {
+  width: 8px; height: 8px; border-radius: 99px; background: var(--ac); flex: none;
+}
+.toast.bad i { background: var(--al); }
+.toast p { flex: 1; margin: 0; font-size: 13px; line-height: 1.4; }
+.toast button { font-size: 12.5px; font-weight: 600; color: var(--ac); flex: none; }
+
+/* --------------------------------------------------------------- login */
+
+.login {
+  height: 100%; display: flex; flex-direction: column; justify-content: center;
+  gap: 14px; padding: 24px 22px calc(24px + env(safe-area-inset-bottom));
+}
+.login .title { font-size: 34px; }
+.login p { margin: 0; font-size: 13.5px; color: var(--mut); line-height: 1.55; }
+.login .err { color: var(--al); font-weight: 600; }
+
+/* ------------------------------------------------------------ empty/aux */
+
+.empty {
+  padding: 40px 14px; text-align: center;
+  display: flex; flex-direction: column; gap: 9px; align-items: center;
+}
+.empty h2 {
+  font-family: var(--mv-font-display); font-size: 23px; font-weight: 500; margin: 0;
+}
+.empty p { margin: 0; font-size: 13.5px; color: var(--mut); line-height: 1.55; max-width: 245px; }
+
+.check {
+  width: 24px; height: 24px; border-radius: 7px; flex: none;
+  border: 1.5px solid var(--bds); background: transparent;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: var(--aci);
+}
+.check[data-on="1"] { background: var(--ac); border-color: var(--ac); }
+
+.bar { height: 6px; border-radius: 99px; background: var(--elev); overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 99px; background: var(--ac); }
+
+.list { display: flex; flex-direction: column; gap: 0; }
+.list .item {
+  display: flex; align-items: center; gap: 10px; padding: 13px;
+  border-bottom: 1px solid var(--bd);
+}
+.list .item:last-child { border-bottom: none; }
+.list .item span:first-child { flex: 1; font-size: 14px; }
+.list .item .val {
+  font-family: var(--mv-font-mono); font-size: 12.5px; color: var(--mut);
+}
+
+.note { font-size: 12.5px; color: var(--mut); line-height: 1.55; }
+.sectionhead {
+  font-size: 11px; font-weight: 600; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--mut);
+}
+.soon {
+  border: 1px dashed var(--bds); border-radius: 12px; padding: 16px;
+  display: flex; flex-direction: column; gap: 7px; background: var(--sun);
+}
