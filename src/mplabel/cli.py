@@ -18,6 +18,7 @@ environment. See mplabel.conf.example.
 import argparse
 import configparser
 import email
+import fcntl
 import hashlib
 import imaplib
 import io
@@ -30,6 +31,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -65,7 +67,7 @@ DEFAULTS = {
     "media_tracking": "gap",
     "gap_inches": "0.12",
     "escpos_band_rows": "128",
-    # A 3-digit code printed small in the top right, so a stack of parcels
+    # A 3-character code printed small in the top right, so a stack of parcels
     # can be told apart at a glance. Stored on the sale and mirrored to the
     # sheet; the archived PDF is left unstamped.
     "label_code": "yes",
@@ -82,6 +84,20 @@ DEFAULTS = {
     "sheets_id": "",
     "sheets_name": "Marketplace",
     "sheets_after_poll": "yes",
+    # The phone app. Bind to loopback by default: the intended route in is
+    # a Cloudflare tunnel, and binding 0.0.0.0 would also answer anything
+    # else that can reach the Pi. Set web_bind = 0.0.0.0 for LAN-only use.
+    "web_bind": "127.0.0.1",
+    "web_port": "8080",
+    # scrypt hash of the one shared password; `mplabel passwd` prints it.
+    # Empty means the app refuses to start rather than run unauthenticated.
+    "web_password_hash": "",
+    "web_session_days": "30",
+    # yes | no | auto. auto sets the cookie's Secure flag when the request
+    # arrived over HTTPS, which behind cloudflared means trusting
+    # X-Forwarded-Proto. Forcing yes on a plain-HTTP LAN test makes the
+    # browser drop the cookie and the login fails with no visible reason.
+    "web_secure_cookie": "auto",
 }
 
 SCHEMA = """
@@ -117,6 +133,15 @@ CREATE INDEX IF NOT EXISTS idx_listing ON sales(listing_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_order
     ON sales(order_id) WHERE order_id IS NOT NULL;
 """
+
+# (table, column, declaration) for every column added after the first
+# install. CREATE TABLE IF NOT EXISTS will not touch a database that
+# already holds real sales, so a new column has to be named here as well
+# as in the SCHEMA it belongs to - otherwise it exists on fresh installs
+# and nowhere else, and the difference only shows up on her Pi.
+MIGRATIONS = [
+    ("sales", "code", "TEXT"),
+]
 
 
 # ----------------------------------------------------------------- config
@@ -157,6 +182,18 @@ def connect_db(home):
     try:
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
+        # Two processes share this file now - the poll loop and the web
+        # app - and the default rollback journal turns that into
+        # "database is locked" the first time they overlap, which would
+        # surface as a failed print in the middle of a nine-item batch.
+        #
+        # journal_mode is a property of the file and persists; busy_timeout
+        # is per-connection, so every opener has to ask for it. Under WAL,
+        # synchronous=NORMAL is still crash-safe and is much kinder to an
+        # SD card than FULL.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA)
         # listings owns its own tables, but the poll loop writes mail_events
         # as it goes, so they have to exist from the start. Both scripts are
@@ -164,12 +201,18 @@ def connect_db(home):
         conn.executescript(listings_mod.SCHEMA)
         # ...which is exactly why a new column needs saying separately: the
         # database already holds real sales and CREATE TABLE IF NOT EXISTS
-        # will not touch them.
-        have = {r[1] for r in conn.execute("PRAGMA table_info(sales)")}
-        for column, decl in (("code", "TEXT"),):
-            if column not in have:
-                conn.execute(f"ALTER TABLE sales ADD COLUMN {column} {decl}")
-                log.info("added sales.%s to the existing database", column)
+        # will not touch them. See MIGRATIONS.
+        wanted = {}
+        for table, column, decl in MIGRATIONS:
+            wanted.setdefault(table, []).append((column, decl))
+        for table, columns in wanted.items():
+            have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for column, decl in columns:
+                if column not in have:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                    log.info("added %s.%s to the existing database",
+                             table, column)
 
         # idx_listing used to be UNIQUE, which made a second sale of the
         # same listing impossible - and a cancel-and-rebuy is exactly that.
@@ -399,6 +442,45 @@ def label_belongs_to(row):
     return True, ""
 
 
+@contextmanager
+def print_lock(cfg):
+    """Hold the printer for the length of one job.
+
+    Two things reach the printer now - the poll loop and the web app - and
+    `printers._write_raw` deliberately hands the whole job over in a single
+    write, because this firmware discards bytes that arrive while the head
+    is moving. Two writers interleaved produce one garbage label, or a job
+    that silently vanishes. The lock has to span the settle pause too,
+    which is why it wraps `printers.send` rather than living inside it.
+
+    Blocking, not LOCK_NB: a reprint from her phone should queue behind the
+    poller, never fail.
+
+    Best effort, though. `probe`, `selftest` and `file` deliberately run
+    above `connect_db` so a printer test still works when the data
+    directory is missing or unwritable - which is precisely when you need
+    one. A lock we cannot create must therefore be a warning and not an
+    error, or this would reintroduce the failure it was written to avoid.
+    """
+    path = Path(cfg.get("home") or tempfile.gettempdir()) / ".print.lock"
+    fh = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except OSError as exc:
+        log.warning("printing without a lock (%s): %s", path, exc)
+        if fh is not None:
+            fh.close()
+            fh = None
+    try:
+        yield
+    finally:
+        if fh is not None:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+
+
 def print_label(cfg, pdf_path, code=None):
     backend = cfg["printer_backend"]
     dpi = int(cfg["printer_dpi"])
@@ -438,7 +520,8 @@ def print_label(cfg, pdf_path, code=None):
     log.info("printing %s via %s%s", Path(pdf_path).name, backend,
              f" [{code}]" if code else "")
     try:
-        printers.send(pdf_path, backend, **kwargs)
+        with print_lock(cfg):
+            printers.send(pdf_path, backend, **kwargs)
     finally:
         if tmp is not None:
             tmp.unlink(missing_ok=True)
@@ -664,6 +747,27 @@ def cmd_file(cfg, args):
         print(f"  {k}: {v}")
     if args.print_it:
         print_label(cfg, out)
+
+
+def cmd_passwd():
+    """Print the `web_password_hash` line for mplabel.conf.
+
+    Prompted rather than taken as an argument, so the password does not
+    land in shell history or in the process list on a machine two people
+    share."""
+    import getpass
+
+    from . import web as web_mod
+
+    first = getpass.getpass("password for the phone app: ")
+    if not first:
+        raise SystemExit("empty password")
+    if first != getpass.getpass("again: "):
+        raise SystemExit("they do not match")
+    print("\nPut this in the [mplabel] section of /etc/mplabel.conf:\n")
+    print(f"web_password_hash = {web_mod.hash_password(first)}\n")
+    print("Then restart the app. Changing it logs out every phone, "
+          "because the session signing key is derived from this line.")
 
 
 def sync_sheets(cfg, conn, dry_run=False):
@@ -958,6 +1062,11 @@ def main():
     p.add_argument("--dry-run", action="store_true",
                    help="list them without printing")
     sub.add_parser("stats", help="analytics summary in the terminal")
+    p = sub.add_parser("serve", help="run the phone app")
+    p.add_argument("--bind", help="default 127.0.0.1; the intended route "
+                                  "in is a Cloudflare tunnel")
+    p.add_argument("--port", type=int)
+    sub.add_parser("passwd", help="hash a password for web_password_hash")
 
     args = ap.parse_args()
     logging.basicConfig(
@@ -991,6 +1100,9 @@ def main():
     if args.cmd == "file":
         cmd_file(cfg, args)
         return
+    if args.cmd == "passwd":
+        cmd_passwd()
+        return
 
     conn = connect_db(cfg["home"])
 
@@ -1020,6 +1132,11 @@ def main():
         backfill_mod.run(cfg, conn, args.limit, resume=not args.restart)
     elif args.cmd == "sheets":
         sync_sheets(cfg, conn, dry_run=args.dry_run)
+    elif args.cmd == "serve":
+        # Imported here rather than at the top: web imports cli back, and
+        # a module-level import either way is a cycle.
+        from . import web as web_mod
+        web_mod.serve(cfg, bind=args.bind, port=args.port)
     elif args.cmd == "import":
         listings_mod.refresh(conn)
         if args.format == "saved":
