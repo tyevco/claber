@@ -13,6 +13,7 @@ import importlib.util
 import json
 import re
 import sqlite3
+import threading
 import sys
 import time
 from datetime import datetime
@@ -3133,3 +3134,301 @@ def test_every_raw_backend_honours_settle():
         assert "settle" in inspect.signature(fn).parameters, name
         assert "settle" in printers.backend_kwargs(dict(__import__(
             "mplabel.cli", fromlist=["cli"]).DEFAULTS), name)
+
+
+# ------------------------------------------------------ printd, the split
+
+@pytest.fixture
+def printd(tmp_path, monkeypatch):
+    """A real printd on an ephemeral port, with the device faked out."""
+    import threading
+
+    from mplabel import printd as printd_mod, printers
+
+    sent = []
+    monkeypatch.setattr(printers, "send",
+                        lambda path, backend, **kw: sent.append(
+                            (backend, Path(path).read_bytes())))
+    # Keep the lock out of /run/lock so tests never contend with a real one.
+    monkeypatch.setattr(printers, "lock_path",
+                        lambda *a, **k: tmp_path / "print.lock")
+
+    cfg = {"printer_backend": "tspl", "printer_device": str(tmp_path / "lp0"),
+           "printer_dpi": "203", "printer_darkness": "8", "printer_speed": "4",
+           "media_tracking": "gap", "gap_inches": "0.12",
+           "printer_head_dots": "812", "settle_seconds": "0",
+           "home": str(tmp_path), "printd_secret": "s3cret",
+           "printd_state_dir": str(tmp_path / "printd")}
+    srv = printd_mod.Server(("127.0.0.1", 0), cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}", sent, srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _print_req(base, body, job="j1", secret="s3cret", protocol="1",
+               deadline="5", sign_with=None):
+    from mplabel import printd as printd_mod
+
+    sig = printd_mod.sign(sign_with if sign_with is not None else secret,
+                          job, body)
+    return _http_raw(f"{base}/print", body, {
+        "Content-Type": "application/pdf", "X-MPLabel-Protocol": protocol,
+        "X-MPLabel-Job": job, "X-MPLabel-Sig": sig,
+        "X-MPLabel-Deadline": deadline})
+
+
+def _http_raw(url, body, headers):
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, data=body, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+PDF = b"%PDF-1.4\n" + b"x" * 200
+
+
+def test_printd_prints_a_signed_job(printd):
+    base, sent, _ = printd
+    status, payload = _print_req(base, PDF)
+    assert status == 200 and payload["printed"] is True
+    assert len(sent) == 1 and sent[0][0] == "tspl"
+    assert sent[0][1] == PDF, "the bytes that printed were not the bytes sent"
+
+
+def test_printd_rejects_an_unsigned_or_tampered_job(printd):
+    base, sent, _ = printd
+
+    assert _print_req(base, PDF, sign_with="wrong")[0] == 401
+    # A signature over different bytes must not carry: the failure being
+    # guarded against is a parcel posted to the wrong person, and a label
+    # is only bytes.
+    from mplabel import printd as printd_mod
+    good = printd_mod.sign("s3cret", "j9", PDF)
+    status, _ = _http_raw(f"{base}/print", PDF + b"tampered", {
+        "Content-Type": "application/pdf", "X-MPLabel-Protocol": "1",
+        "X-MPLabel-Job": "j9", "X-MPLabel-Sig": good,
+        "X-MPLabel-Deadline": "5"})
+    assert status == 401
+    assert sent == []
+
+
+def test_printd_refuses_an_unknown_protocol(printd):
+    base, sent, _ = printd
+    assert _print_req(base, PDF, protocol="99")[0] == 400
+    assert sent == []
+
+
+def test_printd_will_not_print_the_same_job_twice(printd):
+    """The journal is durable so this survives a restart - which is what
+    follows a printer fault."""
+    base, sent, srv = printd
+    assert _print_req(base, PDF, job="dup")[0] == 200
+    status, payload = _print_req(base, PDF, job="dup")
+    assert status == 409 and payload["printed"] is False
+    assert len(sent) == 1
+
+    # A fresh Server over the same state dir still knows.
+    from mplabel import printd as printd_mod
+    again = printd_mod.Journal(Path(srv.cfg["printd_state_dir"]) / "done.jsonl")
+    assert again.seen("dup")
+
+
+def test_printd_rejects_a_body_that_is_not_a_pdf(printd):
+    base, sent, _ = printd
+    assert _print_req(base, b"not a pdf at all")[0] == 400
+    assert sent == []
+
+
+def test_healthz_answers_while_a_print_is_wedged(printd, monkeypatch):
+    """A single-threaded printd would serialise /healthz behind a stuck
+    write, so the one command you would run to diagnose a jam hangs in
+    exactly the case it exists for."""
+    import threading
+
+    from mplabel import printers
+
+    base, sent, _ = printd
+    release = threading.Event()
+
+    def wedged(path, backend, **kw):
+        release.wait(timeout=5)
+        sent.append((backend, b""))
+
+    monkeypatch.setattr(printers, "send", wedged)
+    t = threading.Thread(target=_print_req, args=(base, PDF), daemon=True)
+    t.start()
+    time.sleep(0.3)
+
+    status, _, body = _http(f"{base}/healthz")
+    assert status == 200
+    health = json.loads(body)
+    assert health["printing"] is True, "a wedge must be visible, not silent"
+    assert health["printing_for"] >= 0
+    release.set()
+    t.join(timeout=5)
+
+
+def test_a_queued_job_is_refused_rather_than_printed_late(printd, monkeypatch):
+    """She has already given up by then. Printing to an empty room ten
+    minutes later is worse than a clean refusal."""
+    import threading
+
+    from mplabel import printers
+
+    base, sent, _ = printd
+    release = threading.Event()
+    monkeypatch.setattr(printers, "send",
+                        lambda *a, **k: release.wait(timeout=5))
+
+    t = threading.Thread(target=_print_req, args=(base, PDF), daemon=True)
+    t.start()
+    time.sleep(0.3)
+    status, payload = _print_req(base, PDF, job="second", deadline="0.2")
+    assert status == 410
+    assert "within" in payload["error"]
+    release.set()
+    t.join(timeout=5)
+
+
+def test_printd_survives_a_backend_that_raises_systemexit(printd, monkeypatch):
+    """printers.send still raises SystemExit for an unknown backend, and
+    socketserver only catches Exception. A daemon that dies on a printer
+    fault and dies again on the retry is worse than one that says 503."""
+    from mplabel import printers
+
+    base, _sent, _ = printd
+
+    def boom(*a, **k):
+        raise SystemExit("unknown backend")
+
+    monkeypatch.setattr(printers, "send", boom)
+    status, payload = _print_req(base, PDF, job="boom")
+    assert status == 503
+    assert "unknown backend" in payload["error"]
+    # Still serving.
+    assert _http(f"{base}/healthz")[0] == 200
+
+
+def test_the_pi_http_backend_round_trips_through_print_label(printd, tmp_path,
+                                                             monkeypatch):
+    """The split must be invisible to every caller: print_label, reprint,
+    pending and the phone app all go through printers.send unchanged."""
+    from mplabel import cli, printers
+
+    base, sent, _ = printd
+    # printd's own fixture patched printers.send; restore the real one so
+    # the client backend is genuinely exercised.
+    monkeypatch.undo()
+    inner = []
+    monkeypatch.setattr(printers, "lock_path",
+                        lambda *a, **k: tmp_path / "print.lock")
+    monkeypatch.setattr(printers, "send", printers.send)
+
+    pdf = tmp_path / "l.pdf"
+    label.to_4x6(LABEL_PDF, pdf)
+    cfg = dict(cli.DEFAULTS)
+    cfg.update({"printer_backend": "pi-http", "printd_url": base,
+                "printd_secret": "s3cret", "home": str(tmp_path),
+                "label_code": "no"})
+    # Only the transport is under test here, so keep the real device out.
+    monkeypatch.setattr(printers, "print_tspl",
+                        lambda path, **kw: inner.append(Path(path).read_bytes()))
+    printers.BACKENDS["tspl"] = printers.print_tspl
+
+    cli.print_label(cfg, pdf)
+    assert len(inner) == 1
+    assert inner[0] == pdf.read_bytes(), "the PDF changed in transit"
+
+
+def test_pi_http_reports_an_unreachable_printd_as_printer_unavailable():
+    """It must be the same exception a missing device raises, or the poll
+    loop and the phone app stop handling it."""
+    from mplabel import printers
+
+    with pytest.raises(printers.PrinterUnavailable) as exc:
+        printers.print_pi_http(__file__, url="http://127.0.0.1:1",
+                               secret="x", timeout=1)
+    assert "may or may not have printed" in str(exc.value)
+
+
+def test_a_remote_backend_does_not_hold_the_lock_the_daemon_needs(tmp_path,
+                                                                  monkeypatch):
+    """Phase 3 runs printd on the *same Pi* over loopback, so the client
+    and the daemon resolve the same lock file. A client that holds it
+    while waiting for printd deadlocks against printd trying to take it -
+    two file descriptions, one flock. It hung until the client timed out.
+
+    The lock belongs to whoever actually writes to the device."""
+    from mplabel import cli, printers
+
+    monkeypatch.setattr(printers, "lock_path",
+                        lambda *a, **k: tmp_path / "print.lock")
+
+    held = []
+
+    def fake_send(path, backend, **kw):
+        # Whatever the client did with the lock, the daemon must still be
+        # able to take it.
+        with printers.print_lock({"home": str(tmp_path)}, required=True):
+            held.append(backend)
+
+    monkeypatch.setattr(printers, "send", fake_send)
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+
+    cfg = dict(cli.DEFAULTS)
+    cfg.update({"printer_backend": "pi-http", "home": str(tmp_path),
+                "printd_url": "http://127.0.0.1:1", "printd_secret": "x",
+                "label_code": "no"})
+
+    done = threading.Event()
+
+    def run():
+        cli.print_label(cfg, pdf)
+        done.set()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    assert done.wait(timeout=5), "print_label deadlocked against printd"
+    assert held == ["pi-http"]
+
+
+def test_a_local_backend_still_takes_the_lock(tmp_path, monkeypatch):
+    """The counterpart: nothing above was allowed to weaken the local
+    path, where two processes on one Pi really do share the device."""
+    from mplabel import cli, printers
+
+    monkeypatch.setattr(printers, "lock_path",
+                        lambda *a, **k: tmp_path / "print.lock")
+    locked = []
+
+    def fake_send(path, backend, **kw):
+        # LOCK_NB from a second description must fail while print_label
+        # holds it.
+        import fcntl as _fcntl
+        with open(tmp_path / "print.lock", "w") as fh:
+            try:
+                _fcntl.flock(fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                locked.append("free")
+                _fcntl.flock(fh, _fcntl.LOCK_UN)
+            except OSError:
+                locked.append("held")
+
+    monkeypatch.setattr(printers, "send", fake_send)
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    cfg = dict(cli.DEFAULTS)
+    cfg.update({"printer_backend": "tspl", "home": str(tmp_path),
+                "label_code": "no"})
+    cli.print_label(cfg, pdf)
+    assert locked == ["held"], "the local path stopped locking the device"

@@ -1,0 +1,32 @@
+[Unit]
+Description=Marketplace label print service
+After=network-online.target time-sync.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=lp
+WorkingDirectory=/opt/mplabel
+ExecStart=/opt/mplabel/venv/bin/python -m mplabel printd
+Restart=always
+RestartSec=10
+
+# printd_secret belongs here or in /etc/mplabel.conf, not in the unit.
+EnvironmentFile=-/etc/mplabel.env
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+# The spool and the done journal. The print lock lives in /run/lock, which
+# is shared deliberately - a hand-run `mplabel reprint` over ssh reaches
+# the same printer and must contend for it. PrivateTmp is therefore NOT
+# set here: it would give this unit its own /tmp and silently stop the
+# fallback lock path from interlocking with anything else.
+ReadWritePaths=/home/pi/marketplace /run/lock
+
+[Install]
+WantedBy=multi-user.target
