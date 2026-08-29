@@ -555,7 +555,10 @@ def test_bitmap_pinned_to_exact_dots(tmp_path, dpi, w, h):
     from mplabel import printers
     out = tmp_path / "o.pdf"
     label.to_4x6(LABEL_PDF, out)
-    data, width_px, width_bytes, height = printers.render_bitmap(out, dpi)
+    # head_dots=None: this asserts the dot-count pinning, and 300dpi is
+    # deliberately wider than the G4 head that render_bitmap now guards.
+    data, width_px, width_bytes, height = printers.render_bitmap(
+        out, dpi, head_dots=None)
     assert (width_px, height) == (w, h)
     assert len(data) == width_bytes * height
 
@@ -1377,8 +1380,10 @@ def test_print_label_still_prints_when_the_lock_cannot_be_made(
     pdf = tmp_path / "l.pdf"
     pdf.write_bytes(b"%PDF-1.4\n")
 
-    # /dev/null is not a directory, so mkdir underneath it cannot succeed.
-    cfg = _lock_cfg(tmp_path, home="/dev/null/nope")
+    # /dev/null is not a directory, so nothing can be created under it.
+    monkeypatch.setattr(printers, "lock_path",
+                        lambda *a, **k: Path("/dev/null/nope/x.lock"))
+    cfg = _lock_cfg(tmp_path)
     cli.print_label(cfg, pdf)
 
     assert len(sent) == 1, "the label must still print"
@@ -1527,7 +1532,15 @@ def test_health_is_open_but_says_nothing(app):
     base, _ = app
     status, _, body = _http(f"{base}/healthz")
     assert status == 200
-    assert json.loads(body) == {"ok": True}
+    payload = json.loads(body)
+    assert payload["ok"] is True
+    # The build stamp is here so a skewed Pi is visible without ssh. It
+    # must stay the only extra thing: this endpoint is unauthenticated.
+    assert set(payload) == {"ok", "build"}
+    assert set(payload["build"]) == {"rev", "printers_sha", "source"}
+    blob = body.decode().lower()
+    for leak in ("buyer", "tracking", "ship_to", "password", "imap"):
+        assert leak not in blob
 
 
 def test_login_then_read_the_queue(app):
@@ -1618,7 +1631,9 @@ def test_head_is_answered_not_501(app):
     status, headers, body = _http(f"{base}/healthz", method="HEAD")
     assert status == 200
     assert body == b""
-    assert headers.get("Content-Length") == "12"
+    # The length must describe the body a GET would have returned.
+    _s, _h, full = _http(f"{base}/healthz")
+    assert headers.get("Content-Length") == str(len(full))
 
 
 # ------------------------------------------------------- the write actions
@@ -1847,3 +1862,136 @@ def test_a_cancelled_order_leaves_the_phone_queue(app):
 
     _, _, body = _http(f"{base}/api/pending", cookie=cookie)
     assert json.loads(body)["pending"] == []
+
+
+# ------------------------------------------------ printer failure handling
+
+def test_a_missing_printer_is_catchable_as_an_exception(tmp_path):
+    """`SystemExit` derives from BaseException, so it sails through every
+    `except Exception` in this system: the poll loop's handler, the
+    per-message handler, and web._dispatch's catch-all. The poller died
+    rather than logging a failed print, and from the phone the error was
+    swallowed by threading and showed as a bare connection close."""
+    from mplabel import printers
+
+    with pytest.raises(printers.PrinterUnavailable):
+        printers._write_raw(str(tmp_path / "nope"), b"SIZE 4,6", settle=0)
+
+    # The property that actually matters: an ordinary handler catches it.
+    try:
+        printers._write_raw(str(tmp_path / "nope"), b"SIZE 4,6", settle=0)
+    except Exception as exc:
+        assert "not found" in str(exc)
+    else:
+        pytest.fail("nothing raised")
+
+
+def test_render_refuses_to_overflow_the_print_head(tmp_path):
+    """812 dots is the head. CLAUDE.md records an 824-dot page ejecting a
+    second near-blank label; printer_dpi=300 renders 1200 dots, which is
+    the same lesson four times over. printers.py invites the value - its
+    own comment says 'some printers are 300'."""
+    from mplabel import printers
+
+    pdf = tmp_path / "l.pdf"
+    label.to_4x6(LABEL_PDF, pdf)
+
+    data, w, _wb, _h = printers.render_bitmap(pdf, 203)
+    assert w == 812
+
+    with pytest.raises(ValueError, match="print head|head_dots|812"):
+        printers.render_bitmap(pdf, 300, head_dots=812)
+
+
+def test_two_prints_of_one_sale_do_not_share_a_temp_file(tmp_path, monkeypatch):
+    """The stamped copy was keyed on code and PID. web.Server is a
+    ThreadingHTTPServer, so two handler threads share a PID - and a
+    double-tap on a laggy phone is two POSTs for the same sale, hence the
+    same code. One thread truncated the file the other was reading."""
+    import threading
+
+    from mplabel import cli, printers
+
+    pdf = tmp_path / "l.pdf"
+    label.to_4x6(LABEL_PDF, pdf)
+
+    seen = []
+
+    def slow_send(path, backend, **kwargs):
+        # Hold the path open the way a real render does, then record what
+        # the bytes were at the end of the job.
+        data = Path(path).read_bytes()
+        time.sleep(0.05)
+        seen.append((str(path), data == Path(path).read_bytes()))
+
+    monkeypatch.setattr(printers, "send", slow_send)
+    cfg = _lock_cfg(tmp_path)
+    cfg["label_code"] = "yes"
+
+    threads = [threading.Thread(target=cli.print_label, args=(cfg, pdf, "W7X"))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(seen) == 2
+    assert len({p for p, _ in seen}) == 2, "both jobs used the same temp path"
+    assert all(intact for _, intact in seen), "a job's file changed under it"
+
+
+def test_pending_will_not_print_a_label_for_the_wrong_buyer(db, tmp_path,
+                                                            monkeypatch, capsys):
+    """cmd_reprint and web._print_one both check label_belongs_to.
+    cmd_pending only checked that the file existed - and it is the batch
+    path, so it is the one that would post several parcels to strangers."""
+    from mplabel import cli
+
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    today = datetime.now().strftime("%Y-%m-%d")
+    db.execute("INSERT INTO sales (message_id, item, buyer, received_at, "
+               "label_pdf, ship_to) VALUES ('<a>','Vase','Sam',?,?,'SAM, 1 RD')",
+               (f"{today}T09:00:00-07:00", str(pdf)))
+    db.commit()
+
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(cli, "label_belongs_to",
+                        lambda row: (False, "addressed to someone else"))
+
+    cli.cmd_pending({}, db, _pending_args(dry_run=False))
+    out = capsys.readouterr().out
+    assert sent == [], "a mismatched label reached the printer"
+    assert "someone else" in out or "refus" in out.lower()
+
+
+def test_backend_kwargs_match_every_backend_signature():
+    """The kwargs were built inline in print_label, so a mismatch between
+    them and a backend's signature only showed up as a TypeError at the
+    moment of printing. Every key must be a parameter the target actually
+    takes."""
+    import inspect
+
+    from mplabel import cli, printers
+
+    cfg = dict(cli.DEFAULTS)
+    for name, fn in printers.BACKENDS.items():
+        params = set(inspect.signature(fn).parameters)
+        got = set(printers.backend_kwargs(cfg, name))
+        assert got <= params, f"{name}: {sorted(got - params)} not accepted"
+
+
+def test_every_raw_backend_honours_settle():
+    """print_zpl silently dropped settle_seconds. The pause exists because
+    this firmware discards bytes arriving while the head is still moving,
+    which is true whatever language the job is written in."""
+    import inspect
+
+    from mplabel import printers
+
+    for name in ("tspl", "zpl", "escpos"):
+        fn = printers.BACKENDS[name]
+        assert "settle" in inspect.signature(fn).parameters, name
+        assert "settle" in printers.backend_kwargs(dict(__import__(
+            "mplabel.cli", fromlist=["cli"]).DEFAULTS), name)

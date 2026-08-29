@@ -16,16 +16,48 @@ Pick one with PRINTER_BACKEND in the config. If you do not know which,
 run `python3 printers.py --probe` to see what is attached.
 """
 
+import fcntl
+import logging
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 import time
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+
+log = logging.getLogger("mplabel.printers")
 
 DEFAULT_DPI = 203          # 203 dpi is standard; some printers are 300
 LABEL_W_IN = 4.0
 LABEL_H_IN = 6.0
+
+# Dots across the print head. The G4 is 812 at 203dpi, and anything wider
+# is clipped by the hardware - see the note in CLAUDE.md about an 824-dot
+# page ejecting a second, near-blank label. Configurable because a 300dpi
+# printer has a wider head; checked by default because the failure is
+# silent and costs a label every time.
+DEFAULT_HEAD_DOTS = 812
+
+# How long to wait on `lp`. Both CUPS backends run with check=True, and a
+# CUPS queue that is disabled or waiting on a device can block forever -
+# which, from the poll loop, is indistinguishable from a hung poller.
+CUPS_TIMEOUT = 60
+
+
+class PrinterUnavailable(Exception):
+    """The printer cannot be reached: no device node, or CUPS has it.
+
+    Deliberately an Exception and not SystemExit. SystemExit derives from
+    BaseException, so it escaped every `except Exception` in this system -
+    the poll loop's handler, the per-message handler, and web._dispatch's
+    catch-all. The poller died on a switched-off printer instead of
+    logging a failed print, and from the phone the error was swallowed by
+    threading and arrived as a bare closed connection with no message.
+    `cli.main` turns this back into a SystemExit so the command line still
+    exits cleanly."""
 
 # ESC/POS control sequences, spelled numerically so they survive being
 # copied around and stay greppable against the command tables.
@@ -58,7 +90,8 @@ def render_png(pdf_path, png_path, dpi=DEFAULT_DPI):
     return pil
 
 
-def render_bitmap(pdf_path, dpi=DEFAULT_DPI, invert=False):
+def render_bitmap(pdf_path, dpi=DEFAULT_DPI, invert=False,
+                  head_dots=DEFAULT_HEAD_DOTS):
     """Render to packed 1-bit-per-pixel rows for raw printer languages.
 
     Returns (data, width_px, width_bytes, height). A set bit means a black
@@ -72,6 +105,18 @@ def render_bitmap(pdf_path, dpi=DEFAULT_DPI, invert=False):
 
     want_w = round(LABEL_W_IN * dpi)
     want_h = round(LABEL_H_IN * dpi)
+
+    # The dot count was pinned to the label size and never compared with
+    # the head. printer_dpi = 300 is a plausible edit - the comment on
+    # DEFAULT_DPI invites it - and renders 1200 dots onto an 812-dot head.
+    # That is the same failure as the 824-dot page in CLAUDE.md, four
+    # times over, and it is silent: the overflow just does not print.
+    if head_dots and want_w > head_dots:
+        raise ValueError(
+            f"{dpi}dpi renders {want_w} dots across, wider than the "
+            f"{head_dots}-dot print head - the overflow is clipped and "
+            f"ejects a second, near-blank label. Lower printer_dpi, or "
+            f"raise printer_head_dots if this printer really is wider.")
 
     doc = pdfium.PdfDocument(str(pdf_path))
     try:
@@ -118,7 +163,7 @@ def print_cups_pdf(pdf_path, printer=None, media="Custom.4x6in",
     for opt in extra:
         cmd += ["-o", opt]
     cmd.append(str(pdf_path))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=CUPS_TIMEOUT)
 
 
 def print_cups_raster(pdf_path, printer=None, dpi=DEFAULT_DPI,
@@ -132,11 +177,17 @@ def print_cups_raster(pdf_path, printer=None, dpi=DEFAULT_DPI,
     for opt in extra:
         cmd += ["-o", opt]
     cmd.append(str(png))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=CUPS_TIMEOUT)
 
 
-def print_zpl(pdf_path, device="/dev/usb/lp0", dpi=DEFAULT_DPI, darkness=None):
-    data, width_px, width_bytes, height = render_bitmap(pdf_path, dpi, invert=False)
+def print_zpl(pdf_path, device="/dev/usb/lp0", dpi=DEFAULT_DPI, darkness=None,
+              head_dots=DEFAULT_HEAD_DOTS, settle=2.0):
+    # `settle` was the one raw backend that silently dropped it. The pause
+    # exists because this class of firmware discards bytes that arrive
+    # while the head is still moving, and that applies whatever language
+    # the job was written in.
+    data, width_px, width_bytes, height = render_bitmap(
+        pdf_path, dpi, invert=False, head_dots=head_dots)
     total = width_bytes * height
 
     head = ["^XA", f"^PW{width_px}", f"^LL{height}", "^LH0,0"]
@@ -146,11 +197,12 @@ def print_zpl(pdf_path, device="/dev/usb/lp0", dpi=DEFAULT_DPI, darkness=None):
            + f"\n^FO0,0^GFA,{total},{total},{width_bytes},"
            + data.hex().upper()
            + "^FS\n^XZ\n")
-    _write_raw(device, zpl.encode("ascii"))
+    _write_raw(device, zpl.encode("ascii"), settle=settle)
 
 
 def build_tspl(pdf_path, dpi=DEFAULT_DPI, darkness=None, speed=None,
-               media="gap", gap_in=0.12, copies=1):
+               media="gap", gap_in=0.12, copies=1,
+               head_dots=DEFAULT_HEAD_DOTS):
     """Assemble a complete TSPL job as bytes.
 
     media: 'gap' for die-cut labels (the normal case for 4x6 shipping
@@ -162,8 +214,8 @@ def build_tspl(pdf_path, dpi=DEFAULT_DPI, darkness=None, speed=None,
     command on continuous stock makes the printer hunt for a gap it will
     never find and throw a media error."""
     # TSPL bitmaps are inverted relative to ZPL: a clear bit prints.
-    data, _width_px, width_bytes, height = render_bitmap(pdf_path, dpi,
-                                                         invert=True)
+    data, _width_px, width_bytes, height = render_bitmap(
+        pdf_path, dpi, invert=True, head_dots=head_dots)
     head = [f"SIZE {LABEL_W_IN},{LABEL_H_IN}"]
 
     if media == "gap":
@@ -190,8 +242,9 @@ def build_tspl(pdf_path, dpi=DEFAULT_DPI, darkness=None, speed=None,
 
 def print_tspl(pdf_path, device="/dev/usb/lp0", dpi=DEFAULT_DPI,
                darkness=None, speed=None, media="gap", gap_in=0.12,
-               settle=2.0):
-    payload = build_tspl(pdf_path, dpi, darkness, speed, media, gap_in)
+               settle=2.0, head_dots=DEFAULT_HEAD_DOTS):
+    payload = build_tspl(pdf_path, dpi, darkness, speed, media, gap_in,
+                         head_dots=head_dots)
     _write_raw(device, payload, settle=settle)
 
 
@@ -212,7 +265,7 @@ def tspl_selftest(device="/dev/usb/lp0", media="gap", gap_in=0.12):
 
 
 def build_escpos(pdf_path, dpi=DEFAULT_DPI, media="gap", band_rows=128,
-                 feed_dots=0, copies=1):
+                 feed_dots=0, copies=1, head_dots=DEFAULT_HEAD_DOTS):
     """Assemble a complete ESC/POS raster job as bytes.
 
     The G4 self-describes as `COMMAND SET:ESC/POS` with no TSPL anywhere
@@ -233,8 +286,8 @@ def build_escpos(pdf_path, dpi=DEFAULT_DPI, media="gap", band_rows=128,
     if band_rows < 1:
         raise ValueError("band_rows must be at least 1")
 
-    data, _width_px, width_bytes, height = render_bitmap(pdf_path, dpi,
-                                                        invert=False)
+    data, _width_px, width_bytes, height = render_bitmap(
+        pdf_path, dpi, invert=False, head_dots=head_dots)
     job = bytearray()
     for _ in range(int(copies)):
         job += ESC_INIT
@@ -258,11 +311,12 @@ def build_escpos(pdf_path, dpi=DEFAULT_DPI, media="gap", band_rows=128,
 
 def print_escpos(pdf_path, device="/dev/usb/lp0", dpi=DEFAULT_DPI,
                  darkness=None, media="gap", band_rows=128, feed_dots=0,
-                 settle=2.0):
+                 settle=2.0, head_dots=DEFAULT_HEAD_DOTS):
     # darkness is accepted so every raw backend takes the same config keys,
     # but it is not sent: ESC/POS density is vendor-specific and the G4
     # documents no command for it. Set darkness on the unit itself.
-    payload = build_escpos(pdf_path, dpi, media, band_rows, feed_dots)
+    payload = build_escpos(pdf_path, dpi, media, band_rows, feed_dots,
+                           head_dots=head_dots)
     _write_raw(device, payload, settle=settle)
 
 
@@ -285,6 +339,114 @@ def escpos_selftest(device="/dev/usb/lp0"):
     _write_raw(device, body)
 
 
+def lock_path(cfg=None, device=None):
+    """Where the print lock for one printer lives.
+
+    `/run/lock` first: it is the standard place, it is world-writable
+    (1777) so any identity that can reach the printer can take the lock,
+    and it is outside any unit's PrivateTmp. Keyed on the device so two
+    printers do not block each other. Falls back to the data directory,
+    then to a temp dir, because a printer test has to keep working on a
+    box where neither exists."""
+    cfg = cfg or {}
+    device = device or cfg.get("printer_device") or "default"
+    name = "mplabel-" + re.sub(r"[^A-Za-z0-9_.-]", "_", Path(device).name)
+    run_lock = Path("/run/lock")
+    if run_lock.is_dir() and os.access(run_lock, os.W_OK):
+        return run_lock / f"{name}.lock"
+    home = cfg.get("home")
+    if home:
+        return Path(home) / f".{name}.lock"
+    return Path(tempfile.gettempdir()) / f"{name}.lock"
+
+
+@contextmanager
+def print_lock(cfg=None, device=None, required=False):
+    """Hold the printer for the length of one job.
+
+    More than one thing reaches the printer - the poll loop, the web app,
+    and a person running `mplabel reprint` over ssh. `_write_raw` hands
+    the whole job over in a single write because this firmware discards
+    bytes arriving while the head is moving, so two writers interleaved
+    produce one garbage label or a job that silently vanishes. The lock
+    spans the settle pause too.
+
+    Blocking, not LOCK_NB: a reprint from her phone should queue behind
+    the poller, never fail.
+
+    `required` decides what an unobtainable lock means. For the CLI it is
+    a warning: `probe`, `selftest` and `file` deliberately run above
+    `connect_db` so a printer test still works when the data directory is
+    missing, and a lock we cannot take must not become the thing that
+    stops a label. A long-running daemon has no such excuse and should
+    pass required=True, so the failure is loud rather than a silent loss
+    of interlocking."""
+    path = lock_path(cfg, device)
+    fh = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 0o666 at creation: whoever prints first must not lock everyone
+        # else out. The file holds nothing - only the flock matters.
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            os.fchmod(fd, 0o666)
+        except OSError:
+            pass          # not the owner; the existing mode has to do
+        fh = os.fdopen(fd, "r+")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    except OSError as exc:
+        if fh is not None:
+            fh.close()
+            fh = None
+        if required:
+            raise PrinterUnavailable(
+                f"cannot take the print lock at {path}: {exc}")
+        log.warning("printing without a lock (%s): %s", path, exc)
+    try:
+        yield
+    finally:
+        if fh is not None:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+
+
+def backend_kwargs(cfg, backend=None):
+    """The keyword arguments `send()` needs for one backend, from config.
+
+    Extracted from cli.print_label so that anything else driving a printer
+    - a print daemon, a test - builds them the same way rather than
+    growing a second, drifting copy."""
+    backend = backend or cfg["printer_backend"]
+    dpi = int(cfg["printer_dpi"])
+    darkness = int(cfg["printer_darkness"]) if cfg.get("printer_darkness") else None
+    head = int(cfg.get("printer_head_dots") or DEFAULT_HEAD_DOTS)
+    settle = float(cfg.get("settle_seconds", 2.0))
+
+    if backend.startswith("cups"):
+        kwargs = {"printer": cfg.get("printer_queue") or None}
+        if backend == "cups-raster":
+            kwargs["dpi"] = dpi
+        return kwargs
+    if backend == "tspl":
+        return {"device": cfg["printer_device"], "dpi": dpi,
+                "darkness": darkness,
+                "speed": int(cfg["printer_speed"]) if cfg.get("printer_speed") else None,
+                "media": cfg.get("media_tracking", "gap"),
+                "gap_in": float(cfg.get("gap_inches", 0.12)),
+                "head_dots": head,
+                "settle": settle}
+    if backend == "escpos":
+        # ESC/POS has no gap-distance command - the printer finds the gap
+        # itself on a form feed - so gap_inches does not apply here.
+        return {"device": cfg["printer_device"], "dpi": dpi,
+                "media": cfg.get("media_tracking", "gap"),
+                "band_rows": int(cfg.get("escpos_band_rows", 128)),
+                "head_dots": head,
+                "settle": settle}
+    return {"device": cfg["printer_device"], "dpi": dpi,
+            "darkness": darkness, "head_dots": head, "settle": settle}
+
+
 def _write_raw(device, payload, settle=2.0):
     """Write the whole job in one burst, then pause.
 
@@ -295,7 +457,7 @@ def _write_raw(device, payload, settle=2.0):
     printer a moment before the next one."""
     dev = Path(device)
     if not dev.exists():
-        raise SystemExit(
+        raise PrinterUnavailable(
             f"{device} not found. Check `ls /dev/usb/` and that the usblp "
             f"module is loaded (`lsmod | grep usblp`). If CUPS has claimed "
             f"the printer it will have unbound usblp - you cannot use a "
@@ -371,7 +533,7 @@ def send(pdf_path, backend="cups-pdf", **kwargs):
 
 # -------------------------------------------------------------------- probe
 
-def probe():
+def probe(cups=False):
     """Show what is plugged in and which backend is likely to work."""
     print("=== USB devices ===")
     if shutil.which("lsusb"):
@@ -417,9 +579,17 @@ def probe():
     if not found:
         print("no raw nodes to query")
 
-    print("\n=== CUPS-detected devices ===")
-    if shutil.which("lpinfo"):
-        subprocess.run(["sudo", "lpinfo", "-v"])
+    # Behind a flag on purpose. `lpinfo -v` runs CUPS's libusb backend in
+    # discovery mode, and that can claim the printer and unbind usblp -
+    # which is the very failure this command exists to diagnose. A probe
+    # must not be able to break the thing it is probing.
+    if cups:
+        print("\n=== CUPS-detected devices ===")
+        if shutil.which("lpinfo"):
+            subprocess.run(["sudo", "lpinfo", "-v"], timeout=CUPS_TIMEOUT)
+    else:
+        print("\n(skipping `lpinfo -v`: it can claim the printer and unbind "
+              "usblp. Pass --cups if you want it.)")
 
 
 if __name__ == "__main__":

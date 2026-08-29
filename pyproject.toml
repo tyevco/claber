@@ -7,11 +7,14 @@ name = "mplabel"
 version = "0.1.0"
 description = "Facebook Marketplace shipping-label printer and sales/listings tracker for Raspberry Pi"
 requires-python = ">=3.9"
+# Upper bounds mirror requirements.txt - see the note there. pypdf 7 is
+# the one that matters: it removes the page-merge path stamp_code depends
+# on, and nothing about that failure would announce itself.
 dependencies = [
-    "pypdf>=5.0",
-    "pdfplumber>=0.11",
-    "pypdfium2>=4.0",
-    "Pillow>=10.0",
+    "pypdf>=5.0,<7",
+    "pdfplumber>=0.11,<1.0",
+    "pypdfium2>=4.0,<6",
+    "Pillow>=10.0,<14",
 ]
 
 [project.optional-dependencies]

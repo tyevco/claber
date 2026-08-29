@@ -42,8 +42,18 @@ from pathlib import Path
 from urllib.parse import urlparse, unquote
 
 from . import listings as listings_mod
+from . import build as build_mod
+from . import printers as printers_mod
 
 log = logging.getLogger("mplabel.web")
+
+
+class PrintError(Exception):
+    """A print failed for a reason she can act on: printer off, out of
+    paper, label does not match the sale. Mapped to 502 with the message
+    intact, rather than the blanket 500 that read as "internal error" on
+    the one screen where the cause matters."""
+
 
 STATIC = Path(__file__).parent / "static"
 COOKIE_NAME = "mplabel_session"
@@ -242,6 +252,11 @@ def _order_row(r):
         # recorded-but-unprinted one has a file waiting. One is a state,
         # the other is a job.
         "has_label": bool(r["label_pdf"]),
+        # A print failure is written to sales.notes, and Pending is the
+        # screen she looks at after one. Without this the note existed
+        # only on the detail screen of an order she has no reason to
+        # suspect.
+        "notes": r["notes"],
     }
 
 
@@ -397,6 +412,12 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 return self.serve_static(path)
             self.fail(404, "no such endpoint")
+        except PrintError as exc:
+            # 502, not 500: the printer failed, not this server, and she
+            # needs the actual reason. The blanket handler below rendered
+            # a switched-off printer as the literal "internal error".
+            log.error("print failed: %s", exc)
+            self.fail(502, str(exc))
         except ValueError as exc:
             self.fail(400, str(exc))
         except BrokenPipeError:
@@ -409,8 +430,12 @@ class Handler(BaseHTTPRequestHandler):
     # --- handlers
 
     def h_health(self):
-        """Unauthenticated on purpose, and says nothing about the data."""
-        self.json({"ok": True})
+        """Unauthenticated on purpose, and says nothing about the data.
+
+        The build stamp is not data - it is the only way to tell whether
+        the Pi is running the code you think it is, which the version
+        string cannot do because it never moves."""
+        self.json({"ok": True, "build": build_mod.stamp()})
 
     def h_login(self):
         who = self.client_id()
@@ -522,8 +547,23 @@ class Handler(BaseHTTPRequestHandler):
         row = self._sale(sid)
         if row is None:
             return
-        self.db().execute("UPDATE sales SET status='shipped' WHERE id=?",
-                          (row["id"],))
+        # Closing a sale that has a label on file but no recorded print is
+        # a contradiction worth keeping rather than erasing: either the
+        # label printed and was recorded as failed, or she posted a parcel
+        # with no label. Note it so `pending` and the sheet show why.
+        #
+        # Deliberately NOT stamping printed_at. That would invent a print
+        # that never happened - and a local-pickup sale has no label at
+        # all, so shipping it unprinted is simply correct.
+        if row["label_pdf"] and not row["printed_at"]:
+            self.db().execute(
+                "UPDATE sales SET status='shipped', "
+                "notes=COALESCE(notes || ' | ', '') || ? WHERE id=?",
+                ("shipped from the phone with no recorded print",
+                 row["id"]))
+        else:
+            self.db().execute(
+                "UPDATE sales SET status='shipped' WHERE id=?", (row["id"],))
         self.db().commit()
         self.json({"ok": True, "code": row["code"]})
 
@@ -596,7 +636,16 @@ class Handler(BaseHTTPRequestHandler):
                 f"{row['item']!r} for {row['buyer']!r}.")
         conn = self.db()
         code = cli_mod.ensure_code(conn, row["message_id"])
-        cli_mod.print_label(self.cfg, str(path), code)
+        try:
+            cli_mod.print_label(self.cfg, str(path), code)
+        except printers_mod.PrinterUnavailable as exc:
+            # Note it on the sale so Pending can show why, then re-raise
+            # as a PrintError so she gets the reason and not the word
+            # "internal".
+            conn.execute("UPDATE sales SET notes=? WHERE id=?",
+                         (f"print failed: {exc}", row["id"]))
+            conn.commit()
+            raise PrintError(str(exc))
         cli_mod.mark_printed(conn, row["message_id"])
         return code
 
@@ -620,6 +669,12 @@ class Handler(BaseHTTPRequestHandler):
             self.db().execute("SELECT * FROM sales WHERE id=?",
                               (int(i),)).fetchone() for i in ids)
             if r is not None]
+        # Idempotent unless forced. A batch of nine can outlive
+        # Cloudflare's 100s edge timeout, and she then sees an error for
+        # labels that did print - with the same nine still selected and
+        # every reason to press the button again.
+        if not body.get("force"):
+            rows = [r for r in rows if not r["printed_at"]]
         if body.get("dry_run"):
             return self.json({"dry_run": True,
                               "would_print": [_order_row(r) for r in rows]})
