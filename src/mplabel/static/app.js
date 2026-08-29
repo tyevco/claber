@@ -127,6 +127,16 @@ function holdCancel() {
 
 /* ------------------------------------------------------------- actions */
 
+/* One mutating action at a time. A laggy connection invites a second
+   tap, and two POSTs for the same sale used to collide over the same
+   stamped temp file server-side. The button is also disabled while
+   this is set, so the guard is visible rather than just defensive. */
+async function exclusive(fn) {
+  if (S.busy) return;
+  S.busy = true; render();
+  try { await fn(); } finally { S.busy = false; render(); }
+}
+
 async function load() {
   try {
     var r = await Promise.all([api('/api/orders'), api('/api/pending')]);
@@ -156,6 +166,7 @@ async function openDetail(id) {
 }
 
 async function markShipped(id, code) {
+  return exclusive(async function () {
   try {
     await api('/api/orders/' + id + '/ship', { method: 'POST' });
     S.screen = 'ship';
@@ -163,6 +174,7 @@ async function markShipped(id, code) {
     toast('Code ' + code + ' is shipped and free again.',
           { undo: function () { unship(id); } });
   } catch (e) { toast(e.message, { bad: true }); }
+  });
 }
 
 async function unship(id) {
@@ -171,15 +183,18 @@ async function unship(id) {
 }
 
 async function reprint(id) {
+  return exclusive(async function () {
   try {
     var r = await api('/api/orders/' + id + '/print', { method: 'POST' });
     await load();
     toast('Label ' + r.code + ' sent to the printer.');
   } catch (e) { toast(e.message, { bad: true }); }
+  });
 }
 
 async function batchPrint() {
   if (!S.sel.length) return;
+  return exclusive(async function () {
   try {
     var r = await api('/api/print/pending',
                       { method: 'POST', body: { ids: S.sel, dry_run: S.dry } });
@@ -190,7 +205,16 @@ async function batchPrint() {
     toast(n + (n === 1 ? ' label' : ' labels') + ' sent to the printer.' +
           (r.failed.length ? ' ' + r.failed.length + ' failed.' : ''),
           { bad: r.failed.length > 0 });
-  } catch (e) { toast(e.message, { bad: true }); }
+  } catch (e) {
+    // The batch may have partly succeeded before the edge timed out, so
+    // reload rather than trusting the selection on screen. The server
+    // skips anything already printed, which makes a re-fire safe.
+    S.sel = [];
+    await load();
+    toast(e.message + ' Re-check Pending before printing again.',
+          { bad: true });
+  }
+  });
 }
 
 /* -------------------------------------------------------------- screens */
@@ -333,7 +357,8 @@ function detailView() {
     '</div>' +
 
     '<div class="dock">' +
-      '<button class="hold" id="h-ship"><span class="fill"></span>' +
+      '<button class="hold" id="h-ship"' + (S.busy ? ' disabled' : '') +
+        '><span class="fill"></span>' +
         '<span>Hold to mark shipped</span></button>' +
       '<button class="hold hold--ghost" id="h-print"' +
         (d.has_label ? '' : ' disabled') + '><span class="fill"></span>' +
