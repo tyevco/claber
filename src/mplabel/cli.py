@@ -117,6 +117,18 @@ DEFAULTS = {
     # X-Forwarded-Proto. Forcing yes on a plain-HTTP LAN test makes the
     # browser drop the cookie and the login fails with no visible reason.
     "web_secure_cookie": "auto",
+    # The print service. `printer_backend = pi-http` sends jobs here
+    # instead of straight to a device; every other printer_* key stays
+    # on the machine with the printer, which is the machine being tuned.
+    # Rolling back the split is one line: set printer_backend to tspl.
+    "printd_bind": "127.0.0.1",
+    "printd_port": "9101",
+    "printd_url": "",
+    # Shared secret. Both sides need the same value; printd refuses to
+    # start without one rather than accept unsigned jobs.
+    "printd_secret": "",
+    "printd_timeout": "45",
+    "printd_state_dir": "",
 }
 
 SCHEMA = """
@@ -470,7 +482,7 @@ print_lock = printers.print_lock
 
 def print_label(cfg, pdf_path, code=None):
     backend = cfg["printer_backend"]
-    kwargs = printers.backend_kwargs(cfg, backend)
+    kwargs = printers.backend_kwargs(cfg, backend, code=code)
 
     # Stamp a throwaway copy rather than the archive, so a reprint cannot
     # double-stamp and labels/<ref>_4x6.pdf stays as Facebook sent it.
@@ -492,9 +504,16 @@ def print_label(cfg, pdf_path, code=None):
 
     log.info("printing %s via %s%s", Path(pdf_path).name, backend,
              f" [{code}]" if code else "")
+    # Only lock when this process is the one touching the printer. With a
+    # remote backend printd owns the device and takes the lock itself -
+    # and since Phase 3 runs printd on the same Pi over loopback, holding
+    # it here would deadlock against printd trying to acquire it.
     try:
-        with printers.print_lock(cfg):
+        if backend in printers.REMOTE_BACKENDS:
             printers.send(pdf_path, backend, **kwargs)
+        else:
+            with printers.print_lock(cfg):
+                printers.send(pdf_path, backend, **kwargs)
     finally:
         if tmp is not None:
             tmp.unlink(missing_ok=True)
@@ -952,6 +971,25 @@ def cmd_supvan_test_print(cfg, args):
           "  mostly black        -> try --invert\n"
           "  sheared diagonally  -> the width is wrong; --width 320/352/384\n"
           "  nothing at all      -> try --lzma alone|xz|raw, or --announce raw")
+def cmd_status(cfg):
+    """Ask the printer how it is. Phase 2 of the split plan.
+
+    Answers one question that nothing else can: does this unit talk
+    back? If it does, a print can be refused when the paper is out and
+    the parcel stays visible in Pending. If it does not, at-least-once
+    is the best available and that is worth writing down rather than
+    assuming either way."""
+    info = printers.ask_status(cfg["printer_device"])
+    print(f"device   {info['device']}")
+    if info["answered"]:
+        print(f"answered yes, to {info.get('query')}")
+        print(f"raw      {info['raw']}")
+        print(f"state    {', '.join(info['flags'])}")
+        print("\nThis printer can be asked. Worth wiring into printd so a\njob is refused when the paper is out - record it as VERIFIED.")
+    else:
+        print("answered no")
+        print(f"note     {info['note']}")
+        print("\nNothing to read back, so a failed print cannot be detected\nin software. Record that as a finding: printing stays at-least-once and\nthe paper is the only source of truth.")
 
 
 def cmd_passwd():
@@ -1480,6 +1518,11 @@ def _main():
                                   "in is a Cloudflare tunnel")
     p.add_argument("--port", type=int)
     sub.add_parser("passwd", help="hash a password for web_password_hash")
+    sub.add_parser("status", help="ask the printer how it is (does it "
+                                  "answer at all?)")
+    p = sub.add_parser("printd", help="run the print service")
+    p.add_argument("--bind")
+    p.add_argument("--port", type=int)
 
     args = ap.parse_args()
     logging.basicConfig(
@@ -1523,6 +1566,14 @@ def _main():
         return
     if args.cmd == "passwd":
         cmd_passwd()
+        return
+    if args.cmd == "status":
+        cmd_status(cfg)
+        return
+    if args.cmd == "printd":
+        # No database: this half knows about paper, not orders.
+        from . import printd as printd_mod
+        printd_mod.serve(cfg, bind=args.bind, port=args.port)
         return
 
     conn = connect_db(cfg["home"])

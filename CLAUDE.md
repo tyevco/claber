@@ -214,6 +214,8 @@ hardware or a real Facebook account.
 | The mailbox mixes buying and selling | **Verified.** `You placed an order: <item>`, `Offer submitted: <item>` and `Confirm if you received your order: <item>` are *her purchases*. They carry the **seller's** listing id, so they are classified `purchase`, kept out of the listings table by `BUYER_KINDS`, and their listing id is dropped at record time. Counting them would invent listings that were never for sale and drag sell-through down. |
 | DYI export schema | **ASSUMED.** Undocumented and reshuffled by Meta; importer walks for shape rather than assuming paths. |
 | Saved-page JSON shape | **ASSUMED.** Field names from public GraphQL modules; fixture is synthetic. |
+| `printd` split (`pi-http`) | **Works, but only against a fake device.** A signed job crosses as a ~2KB PDF and is rendered to ~124KB of TSPL on the printd side; dedup, deadline-refusal, bad-signature and SystemExit-survival all covered. **Never run against the real printer**, and deploying it is gated on the label geometry below. |
+| Printer status readback | **UNKNOWN, and it is the experiment worth running.** `mplabel status` asks; nobody has ever tried reading from this unit. If it answers, a failed print becomes visible instead of silent. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 
 When the user reports real-world results, move rows up this table and
@@ -394,6 +396,26 @@ never bite. Helvetica letters are not one width - W is nearly twice I - so
 `label._text_width` measures the white patch from real advance widths
 rather than assuming the digit width, or a code like WWW spills off its own
 background.
+
+**A successful write does not mean a label came out.** `_write_raw`
+pushes the whole job into the printer's buffer and never reads back, so
+out of paper, head open, a jam and a wrong `gap_inches` all look like a
+clean print: `mark_printed` sets `printed_at` and the row *leaves* the
+Pending query. The one physical failure that loses a parcel is the one
+that hides it from the recovery path - and the phone app removes the
+last defence, which was a person standing near the printer. `mplabel
+status` is the experiment: it asks the printer how it is and reports
+whether this unit answers at all. **Whether it does is UNKNOWN** - no
+bidirectional read has ever been tried on this hardware. Run it, and
+record the answer either way.
+
+**The print lock belongs to whoever writes to the device.** With
+`printer_backend = pi-http` the client must *not* hold it: printd runs
+on the same Pi over loopback and resolves the same lock file, so a
+client holding it while waiting deadlocks against printd trying to take
+it - two file descriptions, one flock. Verified: it hung until the
+client timed out. `printers.REMOTE_BACKENDS` is what `print_label`
+checks, and two tests pin both halves.
 
 **The parcel code is stamped on a copy, never the archive.** `labels/<ref>_4x6.pdf` stays as Facebook sent it; `print_label` stamps a throwaway file on its way to the printer. That is what makes a reprint safe - there is no way to double-stamp, and no stamped/not-stamped flag to keep straight. It also means the ~15 orders already recorded pick up a code the moment they print.
 
