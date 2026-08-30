@@ -8,6 +8,7 @@ invented names and an unused tracking number.
 """
 
 import email
+import importlib.util
 import json
 import re
 import sqlite3
@@ -1330,6 +1331,15 @@ def _lock_cfg(tmp_path, home=None):
             "label_code": "no"}
 
 
+# The print lock is flock, so these two only mean anything where flock
+# exists. Skipping is honest: off-target there is no poll loop to contend
+# with either, and the Pi is where this has to hold.
+needs_flock = pytest.mark.skipif(
+    importlib.util.find_spec("fcntl") is None,
+    reason="fcntl is Unix-only; the print lock is a deployment-target concern")
+
+
+@needs_flock
 def test_print_label_serialises_concurrent_jobs(tmp_path, monkeypatch):
     """_write_raw hands the whole job over in one write because this
     firmware drops bytes arriving while the head moves. Two writers
@@ -1363,6 +1373,7 @@ def test_print_label_serialises_concurrent_jobs(tmp_path, monkeypatch):
         "the second job started before the first finished"
 
 
+@needs_flock
 def test_print_label_still_prints_when_the_lock_cannot_be_made(
         tmp_path, monkeypatch, caplog):
     """probe/selftest/file run above connect_db on purpose, so a printer
@@ -1781,8 +1792,10 @@ def test_the_app_shell_is_served(app):
 def test_the_client_escapes_what_facebook_sends():
     """Item titles come from Marketplace listings, so their text is chosen
     by someone else. app.js must route every one through esc()."""
+    # encoding, not the platform default: cp1252 chokes on this file, so
+    # without it the test only passes where the locale happens to be UTF-8.
     js = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
-          / "app.js").read_text()
+          / "app.js").read_text(encoding="utf-8")
     assert "function esc(" in js
 
     # Anything concatenated straight into an HTML string is unescaped by

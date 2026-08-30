@@ -18,7 +18,6 @@ environment. See mplabel.conf.example.
 import argparse
 import configparser
 import email
-import fcntl
 import hashlib
 import imaplib
 import io
@@ -35,6 +34,14 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    # Windows has no fcntl. The Pi is the deployment target and the print
+    # lock matters there, but importing this module has to work anywhere or
+    # the tests cannot run off-target - which is where they are written.
+    fcntl = None
 
 from . import backfill as backfill_mod
 from . import label
@@ -464,6 +471,11 @@ def print_lock(cfg):
     """
     path = Path(cfg.get("home") or tempfile.gettempdir()) / ".print.lock"
     fh = None
+    if fcntl is None:
+        # Off-target, so there is no poller to contend with either.
+        log.debug("no fcntl on this platform; printing without a lock")
+        yield
+        return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(path, "w")
