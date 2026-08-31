@@ -58,8 +58,14 @@ if ! grep -q '^usblp' /etc/modules 2>/dev/null; then
 fi
 modprobe usblp 2>/dev/null || true
 
-cp udev/99-clabel-g4.rules /etc/udev/rules.d/
-udevadm control --reload-rules && udevadm trigger || true
+# Every rule, not just the G4's: the label maker needs one too, and
+# copying them by name means a new device is silently left out.
+cp udev/*.rules /etc/udev/rules.d/
+udevadm control --reload-rules || true
+# hidraw needs an explicit add: a bare trigger defaults to `change`, which
+# left /dev/hidraw0 root-only while the rule itself matched perfectly.
+udevadm trigger || true
+udevadm trigger --subsystem-match=hidraw --action=add || true
 
 cat <<EOF
 

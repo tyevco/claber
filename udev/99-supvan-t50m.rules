@@ -1,0 +1,19 @@
+# /etc/udev/rules.d/99-supvan-t50m.rules
+#
+# SUPVAN / KATA Symbol T50M Pro - the 48mm label maker used for inventory
+# tags, NOT for shipping labels. Reload with:
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=hidraw --action=add
+#
+# It is not a USB printer. It enumerates as a vendor-defined HID device
+# (usage page 0xFF00) plus a fake CD-ROM holding the Windows installer, so
+# there is no usblp binding and no /dev/usb/lpN for it. Writes go to
+# /dev/hidraw0, which is root-only by default - hence this rule.
+#
+# Do not confuse the two printers: /dev/usb/lp0 is the CLABEL G4 that
+# prints the 4x6 shipping labels. Sending one's bytes to the other prints
+# nothing useful at best.
+#
+# Verified on the hardware: with this rule the node becomes
+# crw-rw---- root lp, and the service user can open it read-write.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1820", ATTRS{idProduct}=="207f", MODE="0660", GROUP="lp"
