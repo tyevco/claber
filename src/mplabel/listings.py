@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS listings (
     source        TEXT,                    -- email | dyi | csv | manual
     first_seen    TEXT,
     last_seen     TEXT,
+    inventory_code TEXT,
     notes         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_listing_state ON listings(state);

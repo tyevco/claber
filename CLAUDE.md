@@ -64,7 +64,10 @@ run against a real database.
 | Database only | |
 |---|---|
 | `list` / `stats` / `ship <ref>` | outstanding orders, analytics, mark shipped |
+| `cancel <ref>` | the buyer pulled out; not a sale, and the parcel code is freed |
+| `verify` | do archived labels still match their sales |
 | `import <path> --format dyi\|csv\|saved [--state ...]` | listings from a file |
+| `inventory [-o F] [--state S] [--all]` | CSV of inventory labels for the label maker |
 | `sheets [--dry-run]` | push to Google Sheets |
 
 `probe`, `selftest` and `file` run above `connect_db` in `main()` - see
@@ -285,6 +288,25 @@ one. If `v_aging` shows blank prices, the percentages are lying.
 **The unit of a sale is the order, not the listing.** `already_seen` keys on message_id and order_id; `sales.listing_id` is a plain index, not UNIQUE. A buyer cancels, someone else buys the same item, and Facebook sends a second label email with the same listing_id - which the old unique index and the old listing_id check both silently rejected. `mplabel cancel` closes the dead order without counting it as revenue.
 
 **Check a label still matches its sale before printing it.** `label_belongs_to` re-reads the recipient off the PDF and compares it with the `ship_to` recorded from that same page when the sale was filed; `reprint` refuses on a mismatch, and `mplabel verify` sweeps the archive. This is the backstop for anything that leaves a row pointing at the wrong file - the failure is silent and the consequence is a parcel posted to a stranger.
+
+**Two codes, two lifetimes - do not merge them.** The **parcel** code
+(`sales.code`, 3 chars) is about the boxes waiting to go out, so it is
+released for reuse the moment a parcel ships. The **inventory** code
+(`listings.inventory_code`, 4 chars) is stuck to a thing on a shelf and is
+never reused, including after the item sells - recycling it would leave the
+label on a box in the loft naming something else. Same alphabet, different
+rules; `ensure_inventory_codes` deliberately does not scope its `taken` set
+by state, where `allocate_code` deliberately does.
+
+**Nothing here drives the label maker.** The KATA/SUPVAN T50M Pro is a
+48mm consumer label maker, and it takes work only through SUPVAN's own
+editor over Bluetooth or USB - there is no raw command language to send.
+So `mplabel inventory` writes a CSV and stops; the join is a file, not a
+printer backend. It is written **utf-8-sig**, because her titles carry
+accents and curly quotes and Excel on Windows reads a plain utf-8 CSV as
+mojibake - and whatever the editor shows is what gets printed. It cannot
+print 4x6 shipping labels either: 48mm is 384 dots against the 812 the
+pipeline emits, so that stays with the G4.
 
 **The parcel code is a handle, not just a marking.** `reprint` and `ship`
 both accept it (`cli.find_sale`), case-insensitively, alongside listing id

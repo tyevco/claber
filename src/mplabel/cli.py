@@ -17,6 +17,7 @@ environment. See mplabel.conf.example.
 
 import argparse
 import configparser
+import csv
 import email
 import hashlib
 import imaplib
@@ -148,6 +149,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_order
 # and nowhere else, and the difference only shows up on her Pi.
 MIGRATIONS = [
     ("sales", "code", "TEXT"),
+    ("listings", "inventory_code", "TEXT"),
 ]
 
 
@@ -918,6 +920,83 @@ def cmd_pending(cfg, conn, args):
     print(f"printed {sent} of {len(rows)}")
 
 
+INVENTORY_CODE_LENGTH = 4
+
+
+def ensure_inventory_codes(conn):
+    """Give every listing a stable code, and never hand one out twice.
+
+    Unlike the parcel code this is *not* recycled. A parcel code is about
+    the boxes waiting to go out, so it comes back once one ships; an
+    inventory code is stuck to a thing on a shelf and has to stay true for
+    as long as that thing exists - including after it sells, or the label
+    on the box in the loft starts naming something else.
+
+    Four characters over the same 32-symbol alphabet is about a million
+    codes, so 'never reuse' costs nothing."""
+    taken = {(r[0] or "").upper() for r in conn.execute(
+        "SELECT inventory_code FROM listings WHERE inventory_code IS NOT NULL")}
+    rows = conn.execute(
+        "SELECT listing_id FROM listings WHERE inventory_code IS NULL "
+        "OR inventory_code = ''").fetchall()
+    for row in rows:
+        while True:
+            code = "".join(random.choice(CODE_ALPHABET)
+                           for _ in range(INVENTORY_CODE_LENGTH))
+            if code not in taken:
+                break
+        taken.add(code)
+        conn.execute("UPDATE listings SET inventory_code=? WHERE listing_id=?",
+                     (code, row["listing_id"]))
+    conn.commit()
+    return len(rows)
+
+
+def cmd_inventory(cfg, conn, args):
+    """Write a CSV of inventory labels for the label maker.
+
+    The T50M Pro is driven by SUPVAN's own editor, which imports a
+    spreadsheet and batch-prints - so the join here is a file, not a
+    printer backend. Nothing in this project talks to that device.
+
+    Written as utf-8-sig: her titles carry accents and curly quotes
+    ("Jean-Francois", the Otagiri pieces), and Excel on Windows reads a
+    plain utf-8 CSV as mojibake, which would print onto the labels."""
+    listings_mod.refresh(conn)
+    fresh = ensure_inventory_codes(conn)
+
+    sql = ("SELECT inventory_code, title, price, state, listing_id "
+           "FROM listings WHERE title IS NOT NULL")
+    params = []
+    if not args.all:
+        sql += " AND state = ?"
+        params.append(args.state)
+    rows = conn.execute(sql + " ORDER BY title", params).fetchall()
+    if not rows:
+        print(f"no {args.state} listings with a title - use --all to widen")
+        return
+
+    out = Path(args.output or "inventory-labels.csv")
+    with open(out, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        # `barcode` repeats the code so the template can bind a barcode
+        # field to its own column; `short_title` is pre-truncated because
+        # 48mm does not hold one of her full titles.
+        w.writerow(["code", "barcode", "short_title", "title", "price",
+                    "state", "listing_id"])
+        for r in rows:
+            price = "" if r["price"] is None else f"{r['price']:.2f}"
+            title = r["title"] or ""
+            w.writerow([r["inventory_code"], r["inventory_code"],
+                        title[:38], title, price, r["state"],
+                        r["listing_id"]])
+
+    print(f"wrote {len(rows)} label(s) to {out}"
+          + (f"  ({fresh} new code(s) assigned)" if fresh else ""))
+    print("Import it in SUPVAN's editor, bind the fields once as a "
+          "template, then batch print.")
+
+
 def cmd_verify(cfg, conn, args):
     """Check every archived label still matches the sale it belongs to.
 
@@ -1040,6 +1119,13 @@ def main():
     p.add_argument("--force", action="store_true",
                    help="print even if the label does not match the record")
     sub.add_parser("verify", help="check archived labels against their sales")
+    p = sub.add_parser("inventory",
+                       help="CSV of inventory labels for the label maker")
+    p.add_argument("-o", "--output", help="default inventory-labels.csv")
+    p.add_argument("--state", default="active",
+                   help="which listings (default: active)")
+    p.add_argument("--all", action="store_true",
+                   help="every listing, whatever its state")
     p = sub.add_parser("ship", help="mark as shipped")
     p.add_argument("ref", help=ref_help)
     p = sub.add_parser("cancel", help="the buyer pulled out; not a sale")
@@ -1136,6 +1222,8 @@ def main():
         cmd_cancel(cfg, conn, args)
     elif args.cmd == "verify":
         cmd_verify(cfg, conn, args)
+    elif args.cmd == "inventory":
+        cmd_inventory(cfg, conn, args)
     elif args.cmd == "test-print":
         cmd_test_print(cfg, conn, args)
     elif args.cmd == "scan":

@@ -7,6 +7,7 @@ reproduces the exact page geometry of a real Marketplace label with
 invented names and an unused tracking number.
 """
 
+import csv
 import email
 import importlib.util
 import json
@@ -447,6 +448,98 @@ def test_two_orders_for_one_listing_keep_separate_labels(db, tmp_path):
     assert len({r["label_pdf"] for r in rows}) == 2
     for r in rows:
         assert Path(r["label_pdf"]).exists()
+
+
+# ------------------------------------------------------- inventory labels
+
+def _inv_args(**kw):
+    import argparse
+    return argparse.Namespace(**{"output": None, "state": "active",
+                                 "all": False, **kw})
+
+
+def test_inventory_codes_are_stable_and_never_reused(db):
+    """A parcel code comes back once the parcel ships. An inventory code is
+    stuck to a thing on a shelf, so it must stay true for as long as that
+    thing exists - including after it sells, or the label on the box in the
+    loft starts naming something else."""
+    from mplabel import cli
+
+    for i in range(6):
+        listings.upsert_listing(db, f"L{i}", "t", title=f"Item {i}",
+                                price=10.0 + i, state="active")
+    assert cli.ensure_inventory_codes(db) == 6
+
+    codes = {r[0] for r in db.execute(
+        "SELECT inventory_code FROM listings")}
+    assert len(codes) == 6, "codes collided"
+    for c in codes:
+        assert len(c) == cli.INVENTORY_CODE_LENGTH
+        assert set(c) <= set(cli.CODE_ALPHABET)
+
+    # Running again changes nothing...
+    assert cli.ensure_inventory_codes(db) == 0
+    assert {r[0] for r in db.execute(
+        "SELECT inventory_code FROM listings")} == codes
+
+    # ...and a sold listing keeps its code rather than releasing it.
+    db.execute("UPDATE listings SET state='sold' WHERE listing_id='L1'")
+    db.commit()
+    listings.upsert_listing(db, "NEW", "t", title="Later", state="active")
+    cli.ensure_inventory_codes(db)
+    new = db.execute("SELECT inventory_code FROM listings WHERE "
+                     "listing_id='NEW'").fetchone()[0]
+    assert new not in codes, "a sold listing's code was handed out again"
+
+
+def test_inventory_csv_survives_her_titles(tmp_path, db, capsys):
+    """Her titles carry accents and curly quotes. Excel on Windows reads a
+    plain utf-8 CSV as mojibake, and whatever it shows is what gets printed
+    onto the label."""
+    from mplabel import cli
+
+    title = "The Gleaners by Jean-François Millet — Otagiri “Crown”"
+    listings.upsert_listing(db, "L1", "t", title=title, price=28.0,
+                            state="active")
+    out = tmp_path / "inv.csv"
+    cli.cmd_inventory({}, db, _inv_args(output=str(out)))
+
+    raw = out.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "no BOM: Excel will mangle this"
+    rows = list(csv.reader(out.read_text(encoding="utf-8-sig").splitlines()))
+    assert rows[0] == ["code", "barcode", "short_title", "title", "price",
+                       "state", "listing_id"]
+    assert rows[1][3] == title
+    assert rows[1][0] == rows[1][1], "barcode column mirrors the code"
+    assert len(rows[1][2]) <= 38, "short_title must fit a 48mm label"
+    assert rows[1][4] == "28.00"
+
+
+def test_inventory_defaults_to_what_is_on_the_shelf(tmp_path, db, capsys):
+    from mplabel import cli
+
+    listings.upsert_listing(db, "A", "t", title="Still here", state="active")
+    listings.upsert_listing(db, "B", "t", title="Gone", state="sold")
+    out = tmp_path / "inv.csv"
+
+    cli.cmd_inventory({}, db, _inv_args(output=str(out)))
+    body = out.read_text(encoding="utf-8-sig")
+    assert "Still here" in body and "Gone" not in body
+
+    cli.cmd_inventory({}, db, _inv_args(output=str(out), all=True))
+    body = out.read_text(encoding="utf-8-sig")
+    assert "Still here" in body and "Gone" in body
+
+
+def test_inventory_leaves_a_missing_price_blank(tmp_path, db):
+    """Better an empty field on the label than the word None."""
+    from mplabel import cli
+
+    listings.upsert_listing(db, "A", "t", title="No price", state="active")
+    out = tmp_path / "inv.csv"
+    cli.cmd_inventory({}, db, _inv_args(output=str(out)))
+    rows = list(csv.reader(out.read_text(encoding="utf-8-sig").splitlines()))
+    assert rows[1][4] == ""
 
 
 def test_find_sale_by_parcel_code(db):
