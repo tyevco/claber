@@ -2306,6 +2306,115 @@ def test_supvan_bulk_goes_bare_over_usb():
                                 len(payload))[3] == 123
 
 
+# --- the in-repo LZMA1 encoder ------------------------------------------
+#
+# This is the one corner of the T50M Pro work that can be settled on this
+# machine instead of by spending a label: liblzma is the reference, and it
+# has to accept what we produce.
+
+@pytest.mark.parametrize("name,payload", [
+    ("test pattern", None),                      # rendered below
+    ("all zeros", bytes(4096)),
+    ("all ones", b"\xff" * 4096),
+    ("one byte", b"\x5a"),
+    ("incompressible", bytes((i * 37 + 11) % 256 for i in range(2048))),
+])
+def test_lzma1_round_trips_through_liblzma(name, payload):
+    """liblzma must decode it, with the declared size, to the original.
+
+    Every other fact about this printer cost a label to learn. This one
+    does not have to: if the reference decoder disagrees with us, the
+    firmware's certainly will."""
+    import lzma
+    from mplabel import lzma1
+
+    if payload is None:
+        payload, _s, _r = supvan.render_test_pattern(384, 32)
+    stream = lzma1.compress(payload)
+    assert lzma.decompress(stream, format=lzma.FORMAT_ALONE) == payload
+
+
+def test_lzma1_emits_no_end_of_stream_marker():
+    """The whole reason this module exists.
+
+    The device takes a declared size with no marker. Python's encoder
+    always writes one and cannot be told not to; the marker is
+    entropy-coded, so it cannot be trimmed off afterwards either. Both
+    halves were proved against the captured print - it will not decode as
+    unknown-size, ours would - and the printer refused ours either way.
+
+    Blanking the declared size forces liblzma to look for a marker, so a
+    stream that decodes here has one and this encoder has regressed."""
+    import lzma
+    from mplabel import lzma1
+
+    raw, _s, _r = supvan.render_test_pattern(384, 32)
+    stream = lzma1.compress(raw)
+    unknown_size = stream[:5] + b"\xff" * 8 + stream[13:]
+    with pytest.raises(lzma.LZMAError):
+        lzma.decompress(unknown_size, format=lzma.FORMAT_ALONE)
+
+
+def test_lzma1_header_is_byte_identical_to_the_captured_print():
+    """12288 bytes at 8KB, which is exactly what the vendor app sent."""
+    from mplabel import lzma1
+
+    raw, _s, _r = supvan.render_test_pattern(384, 256)
+    assert len(raw) == 12288
+    assert lzma1.compress(raw)[:13].hex(" ") == \
+        "5d 00 20 00 00 00 30 00 00 00 00 00 00"
+
+
+def test_lzma1_output_fits_the_announce_field():
+    """0x5c carries the length in 16 bits, so a full label has to fit.
+
+    Literals-only compresses worse than liblzma, and the worst case is
+    slightly *larger* than the input - which for a 12288-byte label is
+    still well inside 65535, but is worth pinning before someone raises
+    the label height."""
+    from mplabel import lzma1
+
+    raw, _s, _r = supvan.render_test_pattern(384, 256)
+    assert len(lzma1.compress(raw)) < 0xFFFF
+
+
+def test_lzma1_refuses_an_empty_payload():
+    """There is no such thing as a zero-row label, and an empty
+    range-coded body would be a puzzling thing to hand a printer."""
+    from mplabel import lzma1
+
+    with pytest.raises(ValueError):
+        lzma1.compress(b"")
+
+
+def test_supvan_defaults_to_the_device_encoder():
+    """compress_bitmap's default has to be the shape that prints.
+
+    'alone' is liblzma's, and liblzma writes a marker - the failure this
+    spent several labels finding. Leaving it as the default would put the
+    known-bad stream back in the default path."""
+    import lzma
+
+    raw, _s, _r = supvan.render_test_pattern(384, 32)
+    default = supvan.compress_bitmap(raw)
+    assert default == supvan.compress_bitmap(raw, "device")
+    assert lzma.decompress(default, format=lzma.FORMAT_ALONE) == raw
+
+
+def test_supvan_cli_defaults_to_the_device_encoder(monkeypatch, capsys):
+    """Through main(), because an argparse default has silently overridden
+    the module default once already."""
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "device container" in out
+    assert "size declared" in out
+    assert "head 5d 00 20 00 00" in out
+
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
 
@@ -2349,13 +2458,14 @@ def test_supvan_cli_declares_the_size_by_default(monkeypatch, capsys,
     assert "dict 8192" in out, "the dictionary must match the captured print"
 
 
-def test_supvan_our_stream_is_not_readable_by_liblzma():
-    """A known divergence, pinned so it is not mistaken for a bug.
+def test_supvan_the_alone_container_is_the_one_that_cannot_print():
+    """Why `device` exists, kept as a test rather than as a comment.
 
-    Python always appends an end-of-stream marker, and liblzma refuses a
-    declared size alongside one. The captured stream has no marker and
-    reads back fine. The consumer is the printer's decoder, which stops at
-    the declared size - so this is checked against the device, not here."""
+    Python always appends an end-of-stream marker, and liblzma then
+    refuses its own output when a size is also declared. The captured
+    print has no marker and reads back fine. This is the stream the
+    printer accepted, positioned for, and never completed - three times -
+    and `--lzma alone` is the way back to reproducing that."""
     import lzma
     raw, _s, _r = supvan.render_test_pattern(384, 64)
     with pytest.raises(lzma.LZMAError):

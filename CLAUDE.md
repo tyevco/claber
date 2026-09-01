@@ -109,6 +109,8 @@ src/mplabel/
   backfill.py    one-off mailbox survey and historical import
   savedpage.py   parse a saved Marketplace selling page
   sheets.py      Google Sheets sync via service account
+  supvan.py      T50M Pro label maker: HID transport, frames, status
+  lzma1.py       literals-only LZMA1 encoder, no end-of-stream marker
 
 tests/fixtures/   synthetic stand-ins; make_label.py regenerates the PDF
 mplabel.conf.example, systemd/mplabel.service, udev/99-clabel-g4.rules
@@ -202,8 +204,8 @@ hardware or a real Facebook account.
 | Parcel code placement | **Verified.** The 3-character code renders upright in the header strip above the label's border, top right, clear of the postage indicia, the addresses and the tracking barcode. Checked by rendering for the widest code the alphabet allows (`WWW`) as well as an all-digit one, and both right-align on the same margin. Confirmed on the label output; **not yet** confirmed on a thermal print, where edge margins are tighter, nor scanner-tested. |
 | The T50M Pro is a HID device, not a printer | **Verified on the hardware.** USB `1820:207f`, enumerating as a vendor-defined HID pipe (usage page 0xFF00) *plus* a fake CD-ROM holding the Windows installer. No usblp binding, so it has **no /dev/usb/lpN** - writes go to `/dev/hidraw0`. Its report descriptor declares 64-byte input and output reports with **no Report ID**, so a hidraw write is 65 bytes: a leading `0x00` then the 64-byte payload. Bidirectional, so it can be asked for status before anything is printed. `udev/99-supvan-t50m.rules` makes the node group-writable; without it the node is root-only. **`/dev/usb/lp0` is the G4** - do not confuse them. |
 | The T50M Pro's command sequence | **Verified on the hardware: a replayed stream printed a label.** `mplabel supvan-test-print --replay <file>` sent 123 bytes captured from the vendor app and the printer produced the label. So the transport, the frames, the `0x5c` announce carrying the compressed length, the `0x10` buffer-full with its second value of 60, and the status polling are all correct - this repo can drive the device. Six frames are pinned byte-for-byte against a USBPcap capture. |
-| Generating the bitmap stream | **BLOCKED on the encoder, not the protocol.** liblzma accepts the captured stream with its declared size and rejects one built here: their encoder omits the end-of-stream marker, Python's always writes one, and a declared size beside a marker is invalid. Truncating does not help - the marker is entropy-coded, not trailing bytes. An unknown-size stream with the correct dictionary and 48x256 image was tried and **also refused**, so the device wants the vendor's exact shape: size declared, no marker. Proved both ways - their stream fails to decode as unknown-size ("ended before the end-of-stream marker"), ours decodes fine that way. Finishing this needs an encoder that can emit a declared size without a marker, which the stdlib cannot: either a new dependency, or a small literals-only LZMA1 range coder written here. Both are decisions to take deliberately. `mplabel inventory` remains the working route. |
-| The T50M Pro's payload protocol | **Command and status path verified on the hardware; the bitmap path is not.** `mplabel supvan-probe` polled the device and decoded its reply (`08 00 00 10 00 00`), which settles the 65-byte hidraw write with its leading `0x00`, the 8-byte frame including the big-endian `wValue`, and the byte-0 flags. The status reply carries **one leading byte before the flags** (`STATUS_PREFIX_LEN`), which the analysis missed: decoding from offset 0 reported "media not recognised" on a healthy idle printer. Settled by opening the media cover and re-polling - the byte that moved was the one the offset predicts. Both real captures are pinned as tests. Still **UNKNOWN**: See `docs/supvan-t50m-protocol.md`: 8-byte command frames (`C0 40 <wValue> <opcode> 00 08 00`) padded into 64-byte reports, the opcode table, the status bits, the print sequence, and the fact that the bitmap is **LZMA** compressed - which Python's stdlib covers, so no new dependency. Still unknown: the uncompressed row format and bit polarity, the exact dot width, and the RFID label authentication. `supvan.py` implements the parts the document does settle - the 65-byte hidraw write, the frame builders, the opcode names, the status decode and `supvan-probe` - **written from that document only and never run against the hardware**, so every line of it is ASSUMED until someone plugs the thing in. Nothing prints. |
+| Generating the bitmap stream | **Solved, and verifiable without hardware.** The device wants an LZMA1 alone stream with the size **declared** and **no end-of-stream marker**. Python's `lzma` always writes a marker, cannot be told not to, and the marker is entropy-coded so it cannot be trimmed - proved both ways: blank the declared size and the captured stream will not decode (no marker), ours will (has one). `src/mplabel/lzma1.py` is a literals-only LZMA1 encoder written here for exactly that shape, so the stdlib-only rule holds. It is the one part of this printer's story that is checkable on this machine: liblzma must decode its output back to the original bytes, which the tests assert over five payloads including the incompressible worst case. Its header is byte-identical to the captured print. **Not yet confirmed on paper** - the encoder is right, the image it encodes still has an unverified bit polarity and row origin. |
+| The T50M Pro's payload protocol | **Verified on the hardware, except the raster's orientation.** `supvan-probe` settled the 65-byte hidraw write with its leading `0x00`, the 8-byte frame with its big-endian `wValue`, and the byte-0 flags. The status reply carries **one leading byte before the flags** (`STATUS_PREFIX_LEN`), which the analysis missed: decoding from offset 0 reported "media not recognised" on a healthy idle printer, and opening the media cover and re-polling showed the byte that moved was the one the offset predicts. Both captures are pinned as tests, as are six command frames from a USBPcap capture. The bulk data is **bare 64-byte reports after the `0x5c` announce** - no wrapper; the Bluetooth capture's `0xbb`/`10 02 aa` framing is RFCOMM's and belongs to that transport only. **The `0x5d` label authentication is not required to print** - the replay never sends it. Still unknown: bit polarity and row origin, both one label each to settle. See `docs/supvan-t50m-protocol.md`. |
 | The raw data path works | **Verified on the hardware:** bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. If a label comes out wrong from here, suspect the raster or the geometry, not the transport. |
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
 | `escpos` backend | **UNUSED and unproven.** Written while the id was believed, kept because the job structure is unit-tested and some sibling models really do speak ESC/POS. Nothing it produces has ever printed. Its banding size and trailing form feed are guesses. |
@@ -304,15 +306,25 @@ label on a box in the loft naming something else. Same alphabet, different
 rules; `ensure_inventory_codes` deliberately does not scope its `taken` set
 by state, where `allocate_code` deliberately does.
 
-**Nothing here drives the label maker.** The KATA/SUPVAN T50M Pro is a
-48mm consumer label maker, and it takes work only through SUPVAN's own
-editor over Bluetooth or USB. There *is* a command language - see
-`docs/supvan-t50m-protocol.md` and `supvan.py`, which speaks enough of it
-to poll status - but not enough of it is known to put ink on a label:
-the row format, the bit polarity, the dot width and the RFID label
-authentication are all undetermined, and `supvan.print_bitmap` raises
-saying so. So `mplabel inventory` writes a CSV and stops; the join is a
-file, not a printer backend. It is written **utf-8-sig**, because her titles carry
+**A decode failure on the T50M Pro looks exactly like a media fault.**
+Every rejected stream came back as `media_seating_error`, reached *after*
+the head had positioned - which reads as a physical problem and is not
+one. Several labels went on reseating the roll and inspecting the stock
+before a replayed stream printed and proved the media was fine all along.
+If it positions and then reports a seating error, suspect the bitmap.
+
+**The label maker is driven directly, but is not yet a printer backend.**
+The KATA/SUPVAN T50M Pro is a 48mm consumer label maker that ships with
+SUPVAN's own editor. `supvan.py` speaks its protocol - status, the print
+sequence, and `lzma1.py` for the compressed bitmap in the one shape its
+firmware accepts - and `mplabel supvan-test-print` sends a test pattern.
+A *replayed* vendor stream printed; our own encoder is verified against
+liblzma but **has not yet printed**, and the image's bit polarity and row
+origin still need a label each to read off. So nothing renders an
+inventory label automatically yet.
+
+`mplabel inventory` still writes a CSV for the vendor editor and that
+route is unaffected. The CSV is **utf-8-sig**, because her titles carry
 accents and curly quotes and Excel on Windows reads a plain utf-8 CSV as
 mojibake - and whatever the editor shows is what gets printed. It cannot
 print 4x6 shipping labels either: 48mm is 384 dots against the 812 the

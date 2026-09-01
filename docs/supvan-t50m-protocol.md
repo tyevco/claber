@@ -219,9 +219,21 @@ reply arrives.
 
 ## Bitmap data
 
-The image is **LZMA compressed** before transfer. Python's standard library
-`lzma` module covers this, so no new dependency is required — which matters
-here, where the Pi dependency list is deliberately short.
+The image is **LZMA compressed** before transfer — the LZMA1 "alone"
+container, an 8KB dictionary, the uncompressed size declared, and **no
+end-of-stream marker**.
+
+Python's standard library `lzma` module decodes that but cannot produce
+it: it always appends a marker, offers no way to suppress one, and the
+marker is entropy-coded so it cannot be trimmed off afterwards. That is
+not a detail. The device refuses a stream carrying a marker, and refusing
+looks exactly like a media fault — see below.
+
+`src/mplabel/lzma1.py` is a literals-only LZMA1 encoder written for this,
+which keeps the Pi dependency list where it is. It compresses worse than
+liblzma and that costs nothing at this size, and unlike everything else
+in this document it can be **checked without hardware**: liblzma has to
+decode its output, with the declared size, back to the original bytes.
 
 The vendor application compresses at level 9, splits large images into
 several compressed buffers, and chooses between per-buffer and combined
@@ -274,11 +286,11 @@ earlier attempt from this repo got both wrong - 64MB then 64KB, and
 "unknown" for the size - and each wrong guess produced the same symptom:
 a job the printer accepted, positioned for, and never completed.
 
-One divergence to know about: Python always appends an end-of-stream
-marker, and liblzma refuses to read back a stream that declares a size
-and carries one. The captured stream has no marker. The consumer is the
-printer's decoder, which stops at the declared size, so a stream built
-here cannot be verified locally - only on the device.
+**There is no end-of-stream marker**, and that turned out to be the whole
+remaining blocker. Proved in both directions: blank out the declared size
+and the captured stream will not decode, so it has no marker; do the same
+to a stream from Python's encoder and it decodes, so it has one. The
+device takes the first shape and refuses the second.
 
 ### The raster
 
@@ -325,80 +337,57 @@ Three corrections to what came before:
 The LZMA header is `5d 00 20 00 00 00 30 00 00 00 00 00 00`, identical to
 the Bluetooth capture: 8KB dictionary, size declared.
 
-### What is still missing, after the capture
+### What the USB capture settled
 
-With the dictionary at 8192 and the size declared - both taken from the
-captured print, both verified in the stream we send - the USB attempt
-fails exactly as it did before: accepted, positioned, then
-`media_seating_error` after about a second. **So the LZMA header was not
-the blocker.** That is worth knowing: it removes the whole compression
-question from the list.
+The bulk data is sent as **bare 64-byte reports after the `0x5c`
+announce**, with no wrapper of any kind. The Bluetooth capture's `0xbb`
+opcode and `10 02 aa` marker are RFCOMM framing and belong to that
+transport only. This repo's HID path was already right.
 
-The remaining difference from the working print is the **framing of the
-bulk data**. Over RFCOMM it travels under its own opcode `0xbb`, with a
-marker of `10 02 aa` instead of `10 01 aa` and a two-byte per-image
-field; over HID this repo sends bare 64-byte chunks after the `0x5c`
-announce. Whether the HID path needs an equivalent wrapper cannot be
-inferred from a Bluetooth capture - the two transports frame everything
-differently, and only the opcodes are shared.
+`0x5c` carries the **compressed** length. `0x10` (buffer-full) carries it
+again with a second value of 60.
 
-**That question needs a USB capture** of the vendor application printing:
-Wireshark with USBPcap on an x64 Windows machine, filtered to this device
-alone. The thing to read is narrow - the reports sent between `0x5c` and
-`0x10`. If they carry a header, ours needs the same; if they are bare
-LZMA, the transport was right and something else is wrong.
+### The replay: a printed label
 
-Until then, further attempts cost labels for an ambiguous signal. The
-supported route is `mplabel inventory` and the vendor editor.
+`mplabel supvan-test-print --replay <captured.lzma>` — the extracted
+stream from the capture, pushed through this repo's own code — **printed a
+label**. That single result settles a list of things that were open, and
+retires two theories outright:
 
-### What the USB experiment established
+- The transport, the 65-byte hidraw write, the frame layout, the opcode
+  sequence, the `0x5c` announce, the `0x10` buffer-full value and the
+  status polling are all **correct**.
+- **The RFID/label authentication at `0x5d` is not required to print.**
+  The replay never sends it.
+- **The `media_seating_error` was never about media.** It is what this
+  device reports when it cannot decode the stream. That is worth
+  remembering: a decode failure here is indistinguishable from a physical
+  fault, and chasing the roll costs labels for nothing.
 
+So the only thing separating this repo from the vendor application was the
+compressed stream itself, and that narrowed to one property — the
+end-of-stream marker, above. `lzma1.py` now produces the vendor's shape,
+header for header:
 
+```
+5d 00 20 00 00 00 30 00 00 00 00 00 00      the captured print
+5d 00 20 00 00 00 30 00 00 00 00 00 00      mplabel supvan-test-print
+```
 
-`mplabel supvan-test-print` got as far as the device accepting a job and
-acting on it, but never to a printed label. What was learned:
+### Still not determined
 
-- **`0x5c`'s length is the number of bytes about to be streamed**, not the
-  uncompressed image size. Announcing 5760 and sending 67 made the device
-  stop answering entirely and require a power cycle — it blocks waiting
-  for the count it was promised.
-- **The job is genuinely accepted.** `0x13` sets `busy` and `printing`,
-  and the head performs a positioning move: on one attempt the media
-  audibly pulled back.
-- **It then ends in `media_seating_error`**, with `printing` clearing
-  after roughly a second. That is the device abandoning the job, not
-  hanging on the data — and it happened identically across every LZMA
-  container and dictionary size tried.
-- A stalled attempt leaves the media out of position, so the *next*
-  attempt reports a seating error before it can start. Reseat between
-  runs.
+The encoder is verified against liblzma but the *image* it encodes is
+still a guess in two respects, and both are cheap to settle now that a
+label can be produced:
 
-That the failure is a **media** error, is reached after positioning, and
-does not change with the payload, points away from the bitmap encoding
-and towards the one step the experiment skips entirely: the label
-authentication at `0x5d`. The media itself is readable — `0x30` returns
-59 bytes of tag data and no error flags are set at rest — so this looks
-like a validation step the firmware requires before committing a job,
-rather than unreadable media.
+- **Bit polarity** — whether a set bit is a black dot or a white one.
+  `--invert` flips it. The test pattern is blocks, so the answer is
+  visible at a glance from one print.
+- **Row order and origin** — 48 bytes per row and 384 dots across are
+  confirmed from the captured image, but which end of the row is dot 0,
+  and which end of the roll is row 0, are not.
 
-**Before more of this is guessed at**, print one label from the vendor's
-own phone application. Nothing here has ever confirmed that this printer
-and this roll can produce a label at all, which makes every negative
-result ambiguous: a protocol gap and a media problem look identical from
-this side.
-
-**Not yet determined**, and needed before anything can print:
-
-- the uncompressed row format — bytes per row, bit order, and whether a set
-  bit means a black dot or a white one
-- the exact dot width for this model (~384 at 48mm and 203 dpi, but the
-  application carries a real constant per model)
-- how media width and label length are communicated
-- the RFID/label authentication exchange (`0x5d`), and whether printing is
-  refused without it
-
-Those live in the vendor's image-encoding module and the media handling,
-and are the remaining work for anyone implementing this.
+Neither can be read off a capture; both need one label each.
 
 ## If implementing
 

@@ -24,6 +24,8 @@ arithmetic and are tested off-target.
 
 import os
 
+from . import lzma1
+
 try:
     import select
 except ImportError:                    # pragma: no cover - select is stdlib
@@ -589,42 +591,41 @@ LZMA_LC, LZMA_LP, LZMA_PB = 3, 0, 2
 LZMA_DICT_SIZE = 8192
 
 
-def compress_bitmap(data, fmt="alone", preset=9,
+def compress_bitmap(data, fmt="device", preset=9,
                     dict_size=LZMA_DICT_SIZE, declare_size=True):
-    """LZMA-compress a bitmap the way the device is thought to expect it.
+    """LZMA-compress a bitmap the way the device expects it.
 
-    The document establishes that the payload is LZMA. It does not
-    establish the container, and LZMA has several: the 13-byte "alone"
-    header, xz, and raw with no header at all.
+    The device accepts exactly one shape, established by comparing a
+    captured print from the vendor's application against everything this
+    could produce: the 13-byte "alone" container, an 8KB dictionary, the
+    uncompressed size **declared**, and **no end-of-stream marker**.
 
-    The alone container is assembled by hand rather than taken from
-    `lzma.compress(format=FORMAT_ALONE)`, for two reasons that both look
-    like they matter to an embedded decoder:
+    That last one is why `fmt` defaults to `device` and not to `alone`.
+    Python's `lzma` always appends a marker and gives no way to suppress
+    it, and because the marker is entropy-coded it cannot be trimmed off
+    afterwards either. Both directions were checked: the captured stream
+    will not decode as unknown-size, so it carries no marker; ours will,
+    so it does. The printer refused ours whichever size we declared.
 
-    - Python's preset 9 asks for a 64MB dictionary. `dict_size` defaults
-      to 64KB, which is what an embedded decoder can actually allocate.
-    - Python declares the uncompressed size as *unknown*, eight 0xFF
-      bytes. A decoder that sizes its output buffer from that field has
-      nothing to work with, so `declare_size` writes the real length.
+    So `device` uses `lzma1.compress`, a literals-only encoder written
+    here. It compresses worse than liblzma - no matches - and that costs
+    nothing at this size. What it buys is the one shape the firmware
+    takes.
 
-    `declare_size` is **on**, because a captured print from the vendor's
-    own application declares it: the header reads
-    `5d 00 20 00 00 00 30 00 00 00 00 00 00` - 8KB dictionary, 12288 bytes
-    of image.
+    The other containers are kept because each was a real experiment and
+    naming them is how the failures stay legible:
 
-    One divergence to know about: liblzma will not read our stream back,
-    because Python always appends an end-of-stream marker and liblzma
-    rejects a declared size alongside one. The captured stream has no such
-    marker and reads back fine. The consumer here is the printer's
-    decoder, not liblzma, and embedded decoders stop at the declared size
-    and ignore what follows - but it does mean this is checked against the
-    device rather than on this machine.
+    - `alone`   liblzma's, with a marker. Refused by the device.
+    - `raw`     no header at all. Refused.
+    - `xz`      the modern container. Refused.
 
-    Both are inferences about this firmware rather than documented facts,
-    which is why both are arguments."""
+    `declare_size` only applies to `alone`; `device` always declares,
+    because a stream without a marker is undecodable without it."""
     import lzma
     import struct
 
+    if fmt == "device":
+        return lzma1.compress(data, dict_size=dict_size)
     if fmt == "xz":
         return lzma.compress(data, format=lzma.FORMAT_XZ, preset=preset)
 

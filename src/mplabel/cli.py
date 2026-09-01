@@ -929,7 +929,7 @@ def cmd_supvan_test_print(cfg, args):
           "it is the next clue:\n"
           "  mostly black        -> try --invert\n"
           "  sheared diagonally  -> the width is wrong; --width 320/352/384\n"
-          "  nothing at all      -> try --lzma xz|raw, or --announce raw")
+          "  nothing at all      -> try --lzma alone|xz|raw, or --announce raw")
 
 
 def cmd_passwd():
@@ -1332,8 +1332,12 @@ def main():
                         "which matches the captured print)")
     p.add_argument("--invert", action="store_true",
                    help="flip the bit polarity")
-    p.add_argument("--lzma", choices=["alone", "xz", "raw"], default="alone",
-                   help="LZMA container (default %(default)s)")
+    p.add_argument("--lzma", choices=["device", "alone", "xz", "raw"],
+                   default="device",
+                   help="LZMA container (default %(default)s). 'device' is the "
+                        "in-repo literals-only encoder, the only one that "
+                        "emits a declared size with no end marker - which is "
+                        "the only shape this firmware accepts")
     p.add_argument("--announce", choices=["compressed", "raw"],
                    default="compressed",
                    help="which length 0x5c carries (default %(default)s)")
