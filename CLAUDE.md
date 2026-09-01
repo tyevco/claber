@@ -57,7 +57,7 @@ run against a real database.
 | `file <pdf> [-o] [--rotate] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
 | `probe` | printers, USB devices, IEEE-1284 id |
 | `selftest` | tiny text-only TSPL label |
-| `supvan-probe [--device]` | status of the 48mm inventory label maker. Reads only - moves no paper |
+| `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
 | `pending [--since] [--all] [--dry-run]` | labels recorded but never printed; today only by default |

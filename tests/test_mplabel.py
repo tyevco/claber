@@ -2186,6 +2186,46 @@ def test_supvan_decodes_the_real_captures(captured, expected):
     assert "media_not_recognised" not in lit, "the phantom error is back"
 
 
+def test_supvan_safe_probe_list_excludes_everything_that_prints():
+    """SAFE_PROBE_OPCODES is a safety boundary, not a convenience list.
+
+    Adding an opcode to it asserts the device will not print, feed, or be
+    written to. Start-print in particular would leave the device waiting
+    for bitmap data a probe never sends. This is the guard against someone
+    adding one because the probe looked incomplete."""
+    safe = {op for op, _name in supvan.SAFE_PROBE_OPCODES}
+    for dangerous in (supvan.OP_START_PRINT, supvan.OP_BUFFER_FULL,
+                      supvan.OP_STOP_PRINT, supvan.OP_NEXT_FRAME_IS_BULK,
+                      supvan.OP_SET_RFID_DATA,
+                      supvan.OP_NEXT_FRAME_IS_FIRMWARE):
+        assert dangerous not in safe, f"0x{dangerous:02x} moves paper or writes"
+    assert supvan.OP_INQUIRY_STATUS in safe
+
+
+def test_supvan_deep_probe_asks_each_question_and_keeps_going(monkeypatch):
+    """A device that will not answer one command may answer the next, and
+    which ones fail is the finding. Stopping at the first would hide it."""
+    dev = _FakeDevice(b"\x08" + b"\x00" * (supvan.REPORT_SIZE - 1))
+    monkeypatch.setattr(supvan, "SupvanDevice", lambda *a, **k: dev)
+
+    reads = {"n": 0}
+    real_read = dev.read_report
+
+    def flaky(*a, **k):
+        reads["n"] += 1
+        if reads["n"] == 2:
+            raise supvan.SupvanError("timed out")
+        return real_read(*a, **k)
+
+    monkeypatch.setattr(dev, "read_report", flaky)
+    results = supvan.probe_deep("fake")
+
+    assert [op for _n, op, _r, _e in results] == \
+        [op for op, _n in supvan.SAFE_PROBE_OPCODES]
+    assert results[1][3] == "timed out" and results[1][2] is None
+    assert results[2][2] is not None, "it stopped at the first failure"
+
+
 def test_supvan_missing_device_says_which_node_and_which_printer(tmp_path):
     """There is no /dev/hidraw0 on a dev machine and there does not need
     to be. The message has to name the node and keep the two printers

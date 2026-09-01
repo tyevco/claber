@@ -789,6 +789,26 @@ def cmd_supvan_probe(cfg, args):
         raise SystemExit(str(exc))
     print(supvan_mod.format_status(status))
 
+    if not getattr(args, "deep", False):
+        return
+
+    # Everything below still moves no paper - see SAFE_PROBE_OPCODES, which
+    # is a safety boundary rather than a convenience. The replies to the
+    # revision and media commands have no known format, so they are shown
+    # raw: the point is to learn whether they share the status reply's
+    # leading byte, and whether they answer at all.
+    print("\nsafe read-only commands (no paper moves):")
+    for name, opcode, reply, error in supvan_mod.probe_deep(device):
+        head = f"  0x{opcode:02x} {name:<24}"
+        if error:
+            print(f"{head} no reply: {error}")
+            continue
+        shown = reply[:16]
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in shown)
+        print(f"{head} {shown.hex(' ')}  |{text}|")
+    print("\nReply formats for revision and media were never determined, so "
+          "these are raw.\nSend them on if you want them decoded.")
+
 
 def cmd_passwd():
     """Print the `web_password_hash` line for mplabel.conf.
@@ -1165,6 +1185,9 @@ def main():
                             "prints nothing and moves no paper")
     p.add_argument("--device", help="hidraw node, default supvan_device "
                                     "from the config (/dev/hidraw0)")
+    p.add_argument("--deep", action="store_true",
+                   help="also send the other read-only commands and show "
+                        "their raw replies; still moves no paper")
     p = sub.add_parser("scan", help="survey Facebook mail, change nothing")
     p.add_argument("--limit", type=int, default=2000)
     p = sub.add_parser("backfill", help="build listing history from old mail")

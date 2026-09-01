@@ -92,6 +92,26 @@ OPCODE_NAMES = {
 # not a bug you get to fix twice.
 FORBIDDEN_OPCODES = {OP_NEXT_FRAME_IS_FIRMWARE}
 
+# Opcodes that ask the device a question and do not move paper, in the
+# order a deep probe sends them. This list is a safety boundary, not a
+# convenience: everything omitted is omitted on purpose.
+#
+#   0x13 start print, 0x10 buffer full, 0x5c bulk, 0x14 stop  - all part
+#        of putting ink on a label, and 0x13 in particular leaves the
+#        device waiting for data that a probe will never send.
+#   0x5d RFID  - writes label authentication data. Not a question.
+#   0xc6       - the firmware path; build_command refuses it outright.
+#
+# Adding to this list means asserting the device will not print, feed or
+# have anything written to it. A test pins the exclusions.
+SAFE_PROBE_OPCODES = (
+    (OP_INQUIRY_STATUS, "inquiry status"),
+    (OP_CHECK_DEVICE, "check device"),
+    (OP_READ_REVISION, "read revision"),
+    (OP_READ_FIRMWARE_REVISION, "read firmware revision"),
+    (OP_RETURN_MEDIA_INFO, "media info"),
+)
+
 
 # -------------------------------------------------------- command frames
 
@@ -423,6 +443,33 @@ def poll_status(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
     """Open, poll once, close. Raises SupvanError with a plain reason."""
     with SupvanDevice(path, timeout) as dev:
         return dev.status()
+
+
+def probe_deep(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
+    """Ask the device every question that does not move paper.
+
+    One status poll proved the transport, but only one opcode and one
+    reply shape. This walks SAFE_PROBE_OPCODES and returns
+    [(name, opcode, reply_or_None, error_or_None)] so the reply framing
+    can be compared across commands - which matters, because the status
+    reply turned out to carry a leading byte that the analysis missed, and
+    whether the others do the same is unknown.
+
+    Replies to the revision and media commands are returned raw. Their
+    formats were never determined, so nothing here pretends to decode
+    them; a timeout on one is a finding, not a failure."""
+    results = []
+    with SupvanDevice(path, timeout) as dev:
+        for opcode, name in SAFE_PROBE_OPCODES:
+            try:
+                dev.command(opcode)
+                results.append((name, opcode, dev.read_report(), None))
+            except SupvanError as exc:
+                # Keep going. A device that will not answer one question
+                # may answer the next, and the pattern of which fail is
+                # more informative than stopping at the first.
+                results.append((name, opcode, None, str(exc)))
+    return results
 
 
 # ---------------------------------------------------------- not built yet
