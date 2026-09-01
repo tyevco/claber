@@ -929,8 +929,15 @@ def cmd_supvan_test_print(cfg, args):
         declare_size=args.declare_size)
 
     print(f"device : {device}")
-    print(f"pattern: {args.width} dots wide, {stride} bytes/row, {rows} rows"
-          + (", inverted" if args.invert else ""))
+    ink = sum(bin(b).count("1") for b in raw)
+    blank = sum(1 for y in range(rows) if not any(raw[y * stride:(y + 1) * stride]))
+    print(f"pattern: {args.style}, {args.width} dots wide, {stride} bytes/row, "
+          f"{rows} rows" + (", inverted" if args.invert else ""))
+    # Ink and blank rows are printed because they are live variables, not
+    # decoration: the device took 0.13% ink in 7 reports and refused 7.54%
+    # in 12, and which of those it objects to is the open question.
+    print(f"         {100 * ink / (len(raw) * 8):.2f}% ink, "
+          f"{blank}/{rows} rows blank")
     print(f"raw    : {len(raw)} bytes")
     print(f"lzma   : {len(compressed)} bytes, {args.lzma} container, "
           f"dict {args.dict_size}, "
@@ -1361,11 +1368,14 @@ def main():
                         "generating one. Replaying bytes known to have "
                         "printed separates a wrong sequence from a stream "
                         "the firmware will not decode")
-    p.add_argument("--style", choices=["blocks", "sparse"],
+    p.add_argument("--style", choices=["blocks", "sparse", "scatter"],
                    default="blocks",
                    help="test pattern (default %(default)s). 'sparse' draws "
-                        "the same landmarks in outline: 0.2%% ink against "
-                        "7.6%%, close to the captured print that worked")
+                        "the same landmarks in outline, 0.66%% ink "
+                        "against 7.54%%. 'scatter' is a diagnostic, "
+                        "not a picture: working-print ink at "
+                        "failing-print size, to say which of the two "
+                        "the device objects to")
     p.add_argument("--reencode", metavar="FILE",
                    help="decode a captured LZMA stream and re-encode "
                         "the same image with our encoder. Holds the "

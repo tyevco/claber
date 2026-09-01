@@ -2482,6 +2482,43 @@ def test_supvan_reencode_holds_the_image_still(tmp_path, monkeypatch, capsys):
     assert "head 5d 00 20 00 00" in out
     assert "nothing sent" in out
 
+def test_supvan_scatter_holds_ink_low_and_pushes_the_stream_high():
+    """The diagnostic only works if it varies exactly one thing.
+
+    On hardware the device printed 0.13% ink in 7 reports and refused
+    7.54% in 12. Both moved together, so either could be the cause.
+    `scatter` has to sit at the *working* end for ink and the *failing*
+    end for size, or it answers nothing - so both halves are asserted,
+    against the real measurements rather than against each other."""
+    from mplabel import lzma1
+
+    raw, stride, rows = supvan.render_test_pattern(384, 256, style="scatter")
+    ink = sum(bin(b).count("1") for b in raw) / (len(raw) * 8)
+    stream = len(lzma1.compress(raw))
+
+    # ink near the print that worked (0.13%), far from the one refused
+    assert ink < 0.005, f"{ink:.4%} is not low enough to clear ink"
+    # stream near the one refused (724 bytes / 12 reports), well past the
+    # one that printed (419 / 7)
+    assert stream > 600, f"{stream} bytes will not exercise size"
+    assert -(-stream // 64) >= 10
+
+
+def test_supvan_scatter_leaves_no_row_blank():
+    """Which is how it defeats compression at almost no ink: with no match
+    coder a row holding one dot costs nearly what a full row costs."""
+    raw, stride, rows = supvan.render_test_pattern(384, 256, style="scatter")
+    assert all(any(raw[y * stride:(y + 1) * stride]) for y in range(rows))
+
+
+def test_supvan_every_style_declares_the_same_image_size():
+    """The three patterns differ in ink and in stream length on purpose,
+    and must not differ in anything else - a different row count would be
+    a fourth variable in an experiment that already has too many."""
+    sizes = {style: len(supvan.render_test_pattern(384, 256, style=style)[0])
+             for style in ("blocks", "sparse", "scatter")}
+    assert set(sizes.values()) == {12288}, sizes
+
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
 

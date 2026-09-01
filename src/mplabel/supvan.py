@@ -565,7 +565,26 @@ def render_test_pattern(width_dots=DEFAULT_WIDTH_DOTS, height_dots=120,
         if 0 <= x < width_dots and 0 <= y < height_dots:
             rows[y * stride + (x >> 3)] |= 0x80 >> (x & 7)
 
-    if style == "sparse":
+    if style == "scatter":
+        # Not a picture - a diagnostic. It separates the two things left
+        # standing after the encoder was cleared on hardware.
+        #
+        #                     ink      stream        result
+        #   their image      0.13%   419B, 7 rpts    prints
+        #   blocks           7.54%   724B, 12 rpts   refused
+        #
+        # Both moved together, so either could be the cause. This holds
+        # the ink at the working end (0.26%, twice the print that worked,
+        # 29x less than the one refused) and pushes the stream to the
+        # failing end - 695 bytes in 11 reports - by putting one dot in
+        # every row at an offset that never repeats. With no match coder
+        # that defeats compression almost completely.
+        #
+        # Refused  -> size or report count is the blocker; ink is cleared.
+        # Prints   -> ink is the blocker; size is cleared.
+        for y in range(height_dots):
+            dot((y * 137) % width_dots, y)
+    elif style == "sparse":
         # The same asymmetry drawn in outline. The captured print that is
         # known to have worked is 0.13% ink; the blocks below are 7.6%,
         # which is 60 times as much and a plausible reason for a refusal

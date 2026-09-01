@@ -374,27 +374,41 @@ header for header:
 5d 00 20 00 00 00 30 00 00 00 00 00 00      mplabel supvan-test-print
 ```
 
-**And that is still refused.** The missing end-of-stream marker was a real
-difference and not the operative one. Decoding the captured image shows
-why the comparison was never as clean as it looked - it is **99.87%
-blank**, 124 set bits in 98304, 242 of its 256 rows completely empty.
-Against that, a generated test pattern differs in three measured ways at
-once:
+**And a generated pattern is still refused, but the encoder is not the
+reason.** `--reencode` put the captured *image* through `lzma1.py` and the
+label printed: 419 bytes, 7 reports, a literals-only body with no matches
+in it anywhere. So the firmware accepts what this repo produces, and the
+transport, the framing, the sequence and the encoder are all settled.
 
-| | captured print | generated `blocks` |
-|---|---|---|
-| ink | 0.13% | 7.54% |
-| stream | 123 bytes, 2 reports | 724 bytes, 12 reports |
-| body | match-coded | literals only |
+What is left is the picture. Decoding the captured image shows why the
+original comparison was never clean - it is **99.87% blank**, 124 set bits
+in 98304, 242 of its 256 rows completely empty:
 
-Every attempt so far has varied all three together, which is why none of
-the failures could be attributed. The flags that separate them:
+| | ink | stream | result |
+|---|---|---|---|
+| captured image, vendor encoder | 0.13% | 123 B, 2 reports | prints |
+| captured image, `lzma1.py` | 0.13% | 419 B, 7 reports | **prints** |
+| generated `blocks` | 7.54% | 724 B, 12 reports | refused |
 
-- `--replay FILE` - their bytes, unchanged. Prints.
-- `--reencode FILE` - **their image, our encoder.** Varies the encoder
-  alone; the only test that can clear or convict `lzma1.py`.
-- `--style sparse` - our encoder, 0.66% ink and 9 reports. Moves ink and
-  size together towards the capture, once the encoder is cleared.
+The middle row is what clears the encoder. The first and third still
+differ in two things at once, so `--style scatter` holds one still: one
+dot per row at an offset that never repeats, which is **0.26% ink** - the
+working end - in **695 bytes over 11 reports** - the failing end.
+
+- Refused -> **size or report count** is the blocker, ink is cleared.
+- Prints -> **ink** is the blocker, size is cleared.
+
+Worth noting before that runs: 419 bytes fits inside a 512-byte buffer and
+724 does not, and 512 is exactly 8 reports. If size is the answer, that is
+the shape to expect, and the fix is to split the stream into buffers the
+way the vendor application is described as doing - each announced with
+`0x5c` and closed with `0x10` - rather than sending one long run.
+
+### `pages printed` is not a completion signal
+
+It read **0** immediately after a label came out. The reliable signal is
+the status flags clearing: `busy` and `printing` drop and nothing is left
+but `usb_connected`.
 
 ### Bit polarity, settled without a label
 
@@ -413,12 +427,9 @@ than print it. `--invert` is wrong for this device; the default is right.
   confirmed from the captured image, but which end of the row is dot 0
   and which end of the roll is row 0 are not. `--style sparse` is drawn
   asymmetrically so one printed label answers both.
-- **Whether the firmware needs a match-coded body.** `lzma1.py` emits
-  literals only. Nothing says a decoder can reject that - it is valid
-  LZMA1 and liblzma reads it - but nothing has confirmed the firmware
-  accepts it either. `--reencode` is the test.
-- **Whether stream size or report count matters.** The one stream that
-  printed was 2 reports; everything refused has been 7 or more.
+- **Whether stream size or report count matters.** Settled either way by
+  `--style scatter`; see the table above. 7 reports print, 12 do not, and
+  the boundary has not been found.
 
 ## If implementing
 
