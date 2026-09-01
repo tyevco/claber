@@ -1308,10 +1308,15 @@ def main():
                    help="LZMA dictionary in bytes (default %(default)s). "
                         "Python's preset 9 asks for 64MB, which this device "
                         "cannot allocate")
-    p.add_argument("--declare-size", action="store_true",
-                   help="write the real uncompressed size in the LZMA "
-                        "header instead of 'unknown'. liblzma will not read "
-                        "such a stream back, but the firmware may need it")
+    # On by default: a captured print from the vendor app declares the
+    # size. A store_true flag defaulting to False silently overrode the
+    # module default once already, and the run looked like a fair test of
+    # the fix when it was not.
+    p.add_argument("--no-declare-size", dest="declare_size",
+                   action="store_false", default=True,
+                   help="write 'unknown' as the uncompressed size instead "
+                        "of the real one. The captured print declares it, "
+                        "so this is the experiment, not the default")
     p.add_argument("--abort", action="store_true",
                    help="send stop-print and exit. Clears a device left in "
                         "its printing state by an attempt that stalled")

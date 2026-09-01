@@ -2295,6 +2295,29 @@ def test_supvan_lzma_header_matches_a_captured_print():
     assert int.from_bytes(head[5:13], "little") == len(raw), "size must be declared"
 
 
+@pytest.mark.parametrize("argv,expected", [
+    ([], "size declared"),
+    (["--no-declare-size"], "size unknown"),
+])
+def test_supvan_cli_declares_the_size_by_default(monkeypatch, capsys,
+                                                 argv, expected):
+    """Through the real CLI, not the function default.
+
+    A store_true flag defaulting to False once passed straight over the
+    module default, so a run that printed "size unknown" looked like a
+    fair test of the fix and was not. Only the end-to-end path catches
+    that, which is why this goes through main()."""
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run"] + argv)
+    cli.main()
+    out = capsys.readouterr().out
+    assert expected in out
+    assert "dict 8192" in out, "the dictionary must match the captured print"
+
+
 def test_supvan_our_stream_is_not_readable_by_liblzma():
     """A known divergence, pinned so it is not mistaken for a bug.
 
