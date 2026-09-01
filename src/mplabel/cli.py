@@ -855,14 +855,18 @@ def cmd_supvan_test_print(cfg, args):
 
     raw, stride, rows = supvan_mod.render_test_pattern(
         args.width, args.height, invert=args.invert)
-    compressed = supvan_mod.compress_bitmap(raw, args.lzma)
+    compressed = supvan_mod.compress_bitmap(
+        raw, args.lzma, dict_size=args.dict_size,
+        declare_size=args.declare_size)
 
     print(f"device : {device}")
     print(f"pattern: {args.width} dots wide, {stride} bytes/row, {rows} rows"
           + (", inverted" if args.invert else ""))
     print(f"raw    : {len(raw)} bytes")
     print(f"lzma   : {len(compressed)} bytes, {args.lzma} container, "
-          f"head {compressed[:8].hex(' ')}")
+          f"dict {args.dict_size}, "
+          f"size {'declared' if args.declare_size else 'unknown'}")
+    print(f"         head {compressed[:13].hex(' ')}")
     print(f"announce {args.announce} length, speed {args.speed}")
 
     if args.dry_run:
@@ -1299,6 +1303,15 @@ def main():
                    help="speed value for 0x10 (default %(default)s)")
     p.add_argument("--buffer-len", choices=["compressed", "raw"],
                    help="which length 0x10 carries; defaults to --announce")
+    p.add_argument("--dict-size", type=int,
+                   default=supvan_mod.LZMA_DICT_SIZE,
+                   help="LZMA dictionary in bytes (default %(default)s). "
+                        "Python's preset 9 asks for 64MB, which this device "
+                        "cannot allocate")
+    p.add_argument("--declare-size", action="store_true",
+                   help="write the real uncompressed size in the LZMA "
+                        "header instead of 'unknown'. liblzma will not read "
+                        "such a stream back, but the firmware may need it")
     p.add_argument("--abort", action="store_true",
                    help="send stop-print and exit. Clears a device left in "
                         "its printing state by an attempt that stalled")

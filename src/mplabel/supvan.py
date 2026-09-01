@@ -577,27 +577,63 @@ def render_test_pattern(width_dots=DEFAULT_WIDTH_DOTS, height_dots=120,
     return bytes(rows), stride, height_dots
 
 
-def compress_bitmap(data, fmt="alone", preset=9):
+# LZMA1 defaults. lc=3, lp=0, pb=2 encode to the 0x5d properties byte that
+# appears at the head of every stream this produces.
+LZMA_LC, LZMA_LP, LZMA_PB = 3, 0, 2
+
+# 64KB. The dictionary is the decoder's working buffer, and this runs on a
+# battery-powered label printer, not a desktop: Python's preset 9 asks for
+# **64MB**, which such a device cannot allocate. A decoder handed a
+# dictionary it cannot fit has nowhere to go - which fits a job that is
+# accepted, positioned, and then never completes.
+LZMA_DICT_SIZE = 1 << 16
+
+
+def compress_bitmap(data, fmt="alone", preset=9,
+                    dict_size=LZMA_DICT_SIZE, declare_size=False):
     """LZMA-compress a bitmap the way the device is thought to expect it.
 
     The document establishes that the payload is LZMA. It does not
     establish the container, and LZMA has several: the 13-byte "alone"
-    header, xz, and raw with no header at all. `alone` is the first guess
-    because it is what the JavaScript LZMA implementations in this class
-    of application emit, but it is a guess - hence the argument."""
-    import lzma
+    header, xz, and raw with no header at all.
 
-    if fmt == "alone":
-        return lzma.compress(data, format=lzma.FORMAT_ALONE,
-                             filters=[{"id": lzma.FILTER_LZMA1,
-                                       "preset": preset}])
+    The alone container is assembled by hand rather than taken from
+    `lzma.compress(format=FORMAT_ALONE)`, for two reasons that both look
+    like they matter to an embedded decoder:
+
+    - Python's preset 9 asks for a 64MB dictionary. `dict_size` defaults
+      to 64KB, which is what an embedded decoder can actually allocate.
+    - Python declares the uncompressed size as *unknown*, eight 0xFF
+      bytes. A decoder that sizes its output buffer from that field has
+      nothing to work with, so `declare_size` writes the real length.
+
+    `declare_size` is **off** by default, and deliberately so: liblzma
+    refuses to read back a stream that declares a size and also carries
+    an end-of-stream marker, so turning it on produces something this
+    machine cannot verify. That may be exactly what the firmware wants -
+    embedded decoders often need the size and ignore the marker - but it
+    is an experiment to opt into rather than a default to ship.
+
+    Both are inferences about this firmware rather than documented facts,
+    which is why both are arguments."""
+    import lzma
+    import struct
+
     if fmt == "xz":
         return lzma.compress(data, format=lzma.FORMAT_XZ, preset=preset)
+
+    filters = [{"id": lzma.FILTER_LZMA1, "dict_size": dict_size,
+                "lc": LZMA_LC, "lp": LZMA_LP, "pb": LZMA_PB}]
+    body = lzma.compress(data, format=lzma.FORMAT_RAW, filters=filters)
     if fmt == "raw":
-        return lzma.compress(data, format=lzma.FORMAT_RAW,
-                             filters=[{"id": lzma.FILTER_LZMA1,
-                                       "preset": preset}])
-    raise ValueError(f"unknown lzma container {fmt!r}")
+        return body
+    if fmt != "alone":
+        raise ValueError(f"unknown lzma container {fmt!r}")
+
+    props = (LZMA_PB * 5 + LZMA_LP) * 9 + LZMA_LC
+    size = len(data) if declare_size else 0xFFFFFFFFFFFFFFFF
+    return (bytes([props]) + struct.pack("<I", dict_size)
+            + struct.pack("<Q", size) + body)
 
 
 def abort_print(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
