@@ -228,7 +228,20 @@ ERROR_FLAGS = (
 
 # The page counter lives in bytes 4 and 5.
 PAGES_LOW, PAGES_HIGH = 4, 5
-STATUS_MIN_LEN = 6
+
+# The device prefixes its status reply with one byte before the flags
+# begin. Observed as 0x08, which matches the wLength the command frame
+# asks for, so it reads as "eight bytes follow" - but the value is not
+# relied on, only its presence.
+#
+# This cost a false alarm worth remembering. Decoding from offset 0 made
+# an idle, healthy printer report "media not recognised" while claiming
+# USB was disconnected on a device that was plainly answering over USB.
+# Settled by opening the media cover and polling: the byte that changed
+# was the one this offset predicts, not the one the naive reading did.
+# All flag offsets below are relative to the flags, not to the report.
+STATUS_PREFIX_LEN = 1
+STATUS_MIN_LEN = STATUS_PREFIX_LEN + 6
 
 
 def decode_status(report):
@@ -237,9 +250,14 @@ def decode_status(report):
     Takes the input report as bytes and returns a dict carrying every
     named flag as True or False, plus:
 
-      pages_printed  16-bit count from bytes 4 and 5
+      pages_printed  16-bit count from flag bytes 4 and 5
       errors         the raised flags that mean a job must not start
-      raw            the six meaningful bytes, for logging
+      prefix         the leading byte the device sends before the flags
+      raw            the meaningful bytes as received, for logging
+
+    The report is taken as it comes off the wire, including the device's
+    leading byte - see STATUS_PREFIX_LEN, which is why every offset here
+    is shifted by one before use.
 
     A short buffer raises rather than being padded out: a truncated read
     is a transport problem, and quietly decoding it would report a healthy
@@ -248,13 +266,17 @@ def decode_status(report):
     if len(data) < STATUS_MIN_LEN:
         raise SupvanError(
             f"status report is {len(data)} bytes; the first "
-            f"{STATUS_MIN_LEN} carry the flags and the page counter")
+            f"{STATUS_MIN_LEN} carry the leading byte, the flags and the "
+            f"page counter")
 
-    status = {name: bool(data[off] & mask) for name, off, mask in STATUS_FLAGS}
+    flags = data[STATUS_PREFIX_LEN:]
+    status = {name: bool(flags[off] & mask)
+              for name, off, mask in STATUS_FLAGS}
     # Little-endian: byte 5 is the high byte. Reading it the other way
     # round turns 1 page into 256, which looks plausible for a while.
-    status["pages_printed"] = data[PAGES_LOW] | (data[PAGES_HIGH] << 8)
+    status["pages_printed"] = flags[PAGES_LOW] | (flags[PAGES_HIGH] << 8)
     status["errors"] = [n for n in ERROR_FLAGS if status[n]]
+    status["prefix"] = data[0]
     status["raw"] = data[:STATUS_MIN_LEN]
     return status
 

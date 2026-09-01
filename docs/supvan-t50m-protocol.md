@@ -122,8 +122,18 @@ reach the device.
 
 ## Status report
 
-The device replies to a status poll with a 64-byte input report. The first
-six bytes are meaningful:
+The device replies to a status poll with a 64-byte input report.
+
+**The report begins with one leading byte before the flags.** Observed as
+`0x08`, matching the `wLength` the command asks for, so it reads as "eight
+bytes follow". The offsets in the table below are relative to **the flags**,
+i.e. one byte further into the report than they appear on the wire.
+
+This was not in the original analysis and cost a false alarm: decoding from
+offset 0 made an idle, healthy printer report "media not recognised" while
+claiming USB was disconnected on a device that was answering over USB.
+Opening the media cover and re-polling settled it — the byte that changed
+was the one this offset predicts.
 
 | Byte | Bit | Meaning |
 |---|---|---|
@@ -146,15 +156,17 @@ six bytes are meaningful:
 Bytes 4 and 5 are a 16-bit **little-endian** count of pages printed —
 byte 5 is the high byte.
 
-Two corrections from a real reading (`08 00 00 10 00 00`, idle, no
-usable media):
+Confirmed against the device, media cover closed then open:
 
-- **Byte 3 bit `0x10` is set and is not in the table above.** Meaning
-  unknown; it appears on an otherwise idle device.
-- **Byte 2 bit `0x10` was clear while the device was plugged in over
-  USB and answering**, so reading it as "USB connected" is doubtful.
-  It may mean USB power specifically, or something else entirely.
-  Treat that one bit as unverified.
+```
+08 00 00 10 00 00     idle, cover closed  -> usb connected
+08 00 00 18 00 00     cover open          -> usb connected + cover open
+```
+
+Both decode cleanly once the leading byte is accounted for, and the cover
+bit is the one that moves. Two earlier "anomalies" — an undocumented bit at
+byte 3 and a USB flag that would not light — were both this offset, not
+separate findings.
 
 This is the most useful part of the protocol to implement first: a status
 poll is a safe, read-only round trip that proves the transport works

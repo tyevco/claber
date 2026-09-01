@@ -2088,7 +2088,7 @@ def test_supvan_status_flags_decode_one_bit_at_a_time(name, offset, mask):
     byte offset or a mask shared between two names shows up as two flags
     lighting at once rather than as a plausible-looking status line."""
     report = bytearray(supvan.REPORT_SIZE)
-    report[offset] = mask
+    report[supvan.STATUS_PREFIX_LEN + offset] = mask
     status = supvan.decode_status(bytes(report))
     assert status[name] is True
     lit = [n for n, _o, _m in supvan.STATUS_FLAGS if status[n]]
@@ -2106,14 +2106,16 @@ def test_supvan_page_counter_is_little_endian():
     """Bytes 4 and 5, byte 5 the high byte. Read the other way round, one
     printed page reads as 256 and the mistake stays plausible for a long
     time."""
+    lo = supvan.STATUS_PREFIX_LEN + 4
+    hi = supvan.STATUS_PREFIX_LEN + 5
     report = bytearray(supvan.REPORT_SIZE)
-    report[4], report[5] = 0x01, 0x00
+    report[lo], report[hi] = 0x01, 0x00
     assert supvan.decode_status(bytes(report))["pages_printed"] == 1
 
-    report[4], report[5] = 0x00, 0x01
+    report[lo], report[hi] = 0x00, 0x01
     assert supvan.decode_status(bytes(report))["pages_printed"] == 256
 
-    report[4], report[5] = 0x34, 0x12
+    report[lo], report[hi] = 0x34, 0x12
     assert supvan.decode_status(bytes(report))["pages_printed"] == 0x1234
 
 
@@ -2122,7 +2124,8 @@ def test_supvan_errors_are_separate_from_warnings():
     to abort on 'any error condition' without listing them, so this split
     is ours - keep it visible rather than folding warnings into errors."""
     report = bytearray(supvan.REPORT_SIZE)
-    report[0] = 0x04 | 0x40                    # out of media + battery low
+    # out of media + battery low, past the device's leading byte
+    report[supvan.STATUS_PREFIX_LEN] = 0x04 | 0x40
     status = supvan.decode_status(bytes(report))
     assert status["out_of_media"] and status["battery_low"]
     assert status["errors"] == ["out_of_media"]
@@ -2132,7 +2135,9 @@ def test_supvan_padding_past_byte_six_is_not_interpreted():
     """Only the first six bytes are documented. Whatever the device puts
     in the other 58 must not change the decode."""
     clear = supvan.decode_status(b"\x00" * supvan.REPORT_SIZE)
-    noisy = supvan.decode_status(b"\x00" * 6 + b"\xFF" * 58)
+    noisy = supvan.decode_status(
+        b"\x00" * supvan.STATUS_MIN_LEN
+        + b"\xFF" * (supvan.REPORT_SIZE - supvan.STATUS_MIN_LEN))
     assert {k: v for k, v in noisy.items() if k != "raw"} == \
            {k: v for k, v in clear.items() if k != "raw"}
 
@@ -2146,8 +2151,9 @@ def test_supvan_a_truncated_report_raises():
 
 def test_supvan_status_poll_sends_the_inquiry_and_decodes_the_reply():
     reply = bytearray(supvan.REPORT_SIZE)
-    reply[2] = 0x10                            # USB connected
-    reply[4], reply[5] = 0x09, 0x00            # nine pages
+    n = supvan.STATUS_PREFIX_LEN
+    reply[n + 2] = 0x10                        # USB connected
+    reply[n + 4], reply[n + 5] = 0x09, 0x00    # nine pages
     dev = _FakeDevice(bytes(reply))
 
     status = dev.status()
@@ -2155,6 +2161,29 @@ def test_supvan_status_poll_sends_the_inquiry_and_decodes_the_reply():
     assert dev.sent == [supvan.build_command(supvan.OP_INQUIRY_STATUS)]
     assert status["usb_connected"] and status["pages_printed"] == 9
     assert "USB connected" in supvan.format_status(status)
+
+
+@pytest.mark.parametrize("captured,expected", [
+    ("08 00 00 10 00 00", {"usb_connected"}),
+    ("08 00 00 18 00 00", {"usb_connected", "cover_open"}),
+])
+def test_supvan_decodes_the_real_captures(captured, expected):
+    """The two readings that caught the offset, kept verbatim.
+
+    Decoded from byte 0 these said "media not recognised" on a healthy
+    idle printer, and claimed USB was disconnected on a device that was
+    answering over USB. Opening the media cover moved byte 3, not byte 2,
+    which is what the leading byte predicts and the naive reading does
+    not. If STATUS_PREFIX_LEN is ever "simplified" away, this fails."""
+    report = bytes.fromhex(captured.replace(" ", ""))
+    report += bytes(supvan.REPORT_SIZE - len(report))
+    status = supvan.decode_status(report)
+
+    lit = {n for n, _o, _m in supvan.STATUS_FLAGS if status[n]}
+    assert lit == expected
+    assert status["pages_printed"] == 0
+    assert status["prefix"] == 0x08
+    assert "media_not_recognised" not in lit, "the phantom error is back"
 
 
 def test_supvan_missing_device_says_which_node_and_which_printer(tmp_path):
