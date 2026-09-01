@@ -838,6 +838,21 @@ def cmd_supvan_test_print(cfg, args):
     *how* it comes out wrong."""
     device = args.device or cfg.get("supvan_device",
                                     supvan_mod.DEFAULT_DEVICE)
+    if args.abort:
+        # Worth having as its own path: after a stalled attempt the device
+        # sits in printing state, and the next run would stack on top of a
+        # half-started job rather than starting a clean one.
+        try:
+            status = supvan_mod.abort_print(device)
+        except supvan_mod.SupvanError as exc:
+            raise SystemExit(str(exc))
+        print(f"device : {device}")
+        print("sent stop print (0x14)")
+        print(supvan_mod.format_status(status))
+        if status["printing"]:
+            print("\nStill reporting 'printing'. Power cycle it.")
+        return
+
     raw, stride, rows = supvan_mod.render_test_pattern(
         args.width, args.height, invert=args.invert)
     compressed = supvan_mod.compress_bitmap(raw, args.lzma)
@@ -865,10 +880,15 @@ def cmd_supvan_test_print(cfg, args):
         final = supvan_mod.experimental_print(
             {"compressed": compressed, "raw_len": len(raw)},
             path=device, speed=args.speed, announce=args.announce,
-            on_step=step)
+            buffer_len=args.buffer_len, on_step=step)
     except supvan_mod.SupvanError as exc:
         raise SystemExit(f"\nstopped: {exc}")
 
+    if final.get("stalled"):
+        print("\nThe device accepted the job and never finished it, so it was "
+              "told to stop.\nReseat the media before the next attempt: the "
+              "positioning move leaves it out\nof place, which is the seating "
+              "error that blocks the following run.")
     print(f"\nfinished. pages printed now reads "
           f"{final['pages_printed']}.")
     print("If nothing came out, the page counter says whether the device "
@@ -1277,6 +1297,11 @@ def main():
                    help="which length 0x5c carries (default %(default)s)")
     p.add_argument("--speed", type=int, default=1,
                    help="speed value for 0x10 (default %(default)s)")
+    p.add_argument("--buffer-len", choices=["compressed", "raw"],
+                   help="which length 0x10 carries; defaults to --announce")
+    p.add_argument("--abort", action="store_true",
+                   help="send stop-print and exit. Clears a device left in "
+                        "its printing state by an attempt that stalled")
     p = sub.add_parser("scan", help="survey Facebook mail, change nothing")
     p.add_argument("--limit", type=int, default=2000)
     p = sub.add_parser("backfill", help="build listing history from old mail")

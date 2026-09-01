@@ -600,9 +600,26 @@ def compress_bitmap(data, fmt="alone", preset=9):
     raise ValueError(f"unknown lzma container {fmt!r}")
 
 
+def abort_print(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
+    """Send stop-print and report the status afterwards.
+
+    A job that was accepted but never satisfied leaves the device sitting
+    in its printing state, and the next attempt then stacks on top of a
+    half-started one. This is the way out that is not a power cycle."""
+    with SupvanDevice(path, timeout) as dev:
+        dev.command(OP_STOP_PRINT)
+        try:
+            dev.read_report()
+        except SupvanError:
+            # Some commands answer, some do not. Not answering a stop is
+            # not itself a problem; the status poll below is the check.
+            pass
+        return dev.status()
+
+
 def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
-                       speed=1, announce="compressed", settle=0.2,
-                       on_step=None):
+                       speed=1, announce="compressed", buffer_len=None,
+                       settle=0.2, on_step=None):
     """Walk the documented print sequence with a compressed bitmap.
 
     An experiment. The sequence is from the document; the guesses are the
@@ -623,6 +640,14 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
     compressed = payload["compressed"]
     raw_len = payload["raw_len"]
     announced = len(compressed) if announce == "compressed" else raw_len
+    # 0x5c announces the bulk transfer and 0x10 reports the image length.
+    # The document names both "length" without saying whether either means
+    # the compressed byte count or the uncompressed image, so they are
+    # separately settable and default to the same thing.
+    if buffer_len is None:
+        buffered = announced
+    else:
+        buffered = len(compressed) if buffer_len == "compressed" else raw_len
 
     def check(dev, label):
         status = dev.status()
@@ -640,7 +665,14 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
         dev.command(OP_CHECK_DEVICE)
         dev.read_report()
         _time.sleep(settle)
-        check(dev, "after check device")
+        status_before = check(dev, "after check device")
+
+        if status_before["printing"]:
+            raise SupvanError(
+                "the device is already in its printing state - a previous "
+                "attempt was accepted and never satisfied. Clear it with "
+                "`mplabel supvan-test-print --abort`, or power cycle it, "
+                "before starting another job")
 
         dev.command(OP_START_PRINT, 1)
         dev.read_report()
@@ -665,8 +697,29 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
         say(f"streamed {len(compressed)} bytes in {reports} reports", None, [])
         _time.sleep(settle)
 
-        say(f"buffer full (0x10) len={announced} speed={speed}", None, [])
-        dev.command(OP_BUFFER_FULL, announced, speed)
+        say(f"buffer full (0x10) len={buffered} speed={speed}", None, [])
+        dev.command(OP_BUFFER_FULL, buffered, speed)
         _time.sleep(settle)
 
-        return check(dev, "after buffer full")
+        final = check(dev, "after buffer full")
+
+        # Wait for the job to finish, then clean up after ourselves if it
+        # does not. Observed on the hardware: a job the device accepts but
+        # cannot satisfy leaves it in printing state *and* leaves the media
+        # out of position - the next attempt then reports a seating error
+        # before it can start. Sending stop-print costs nothing when the
+        # job did finish and saves a reseat when it did not.
+        for _ in range(15):
+            if not final["printing"]:
+                break
+            _time.sleep(settle)
+            final = check(dev, "waiting for the job to finish")
+        else:
+            say("still printing - sending stop (0x14) so the device is not "
+                "left mid-job", None, [])
+            dev.command(OP_STOP_PRINT)
+            _time.sleep(settle)
+            final = check(dev, "after stop print")
+            final["stalled"] = True
+
+        return final
