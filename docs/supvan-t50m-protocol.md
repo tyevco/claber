@@ -228,7 +228,69 @@ several compressed buffers, and chooses between per-buffer and combined
 packaging depending on the total compressed size, with a threshold in the
 low thousands of bytes.
 
-### What the experiment established
+## Confirmed from a capture of a working print
+
+A Bluetooth HCI snoop log of the vendor's phone app printing a label
+settled the remaining questions. **The opcodes are the same over both
+transports** - only the framing differs. Over Bluetooth (RFCOMM) a frame
+is:
+
+```
+7e 5a <len:LE16> 10 01 aa <opcode> <params>     phone -> printer
+7e 5a <len:LE16> 10 03 55 <opcode> <params>     printer -> phone
+```
+
+The whole job, with the status polls between each step removed:
+
+```
+TX 0x12 check device      10 01 aa 12 01 00 00 01 00 00 00 00
+TX 0x13 start print       10 01 aa 13 01 00 00 01 00 00 00 00
+TX 0x5c bulk announce     10 01 aa 5c 04 00 00 01 00 02 01 00
+TX 0xbb bulk data (512)   10 02 aa bb <2-byte check> 00 01 <lzma>
+TX 0x10 buffer full       10 01 aa 10 9a 00 00 01 66 00 33 00
+```
+
+Three things that matter:
+
+- **There is no `0x5d`.** Label authentication is not part of a normal
+  print, so it is not what blocks one.
+- **Bulk data travels under its own opcode, `0xbb`**, with a marker of
+  `10 02 aa` rather than `10 01 aa`, and a two-byte field that varies per
+  image - a checksum, most likely.
+- **`0x5c` announces `00 02` = 512**, the size of the frame that follows,
+  not the length of the image.
+
+### The LZMA header, exactly
+
+```
+5d 00 20 00 00 00 30 00 00 00 00 00 00
+|  |________|  |____________________|
+|   dict 8192   uncompressed 12288
+properties (lc=3 lp=0 pb=2)
+```
+
+An **8KB dictionary**, and the uncompressed size **declared**. Every
+earlier attempt from this repo got both wrong - 64MB then 64KB, and
+"unknown" for the size - and each wrong guess produced the same symptom:
+a job the printer accepted, positioned for, and never completed.
+
+One divergence to know about: Python always appends an end-of-stream
+marker, and liblzma refuses to read back a stream that declares a size
+and carries one. The captured stream has no marker. The consumer is the
+printer's decoder, which stops at the declared size, so a stream built
+here cannot be verified locally - only on the device.
+
+### The raster
+
+The captured image decompresses to **12288 bytes = 48 bytes per row x 256
+rows**, confirming **384 dots** across - 48mm at 203dpi, as arithmetic
+suggested. Bit order and polarity are still unconfirmed: rendered either
+way the test label is blocks rather than anything recognisable, so it
+tells us the geometry but not the sense of a set bit.
+
+### What the USB experiment established
+
+
 
 `mplabel supvan-test-print` got as far as the device accepting a job and
 acting on it, but never to a printed label. What was learned:

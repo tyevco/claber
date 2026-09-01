@@ -2275,38 +2275,42 @@ def test_supvan_invert_flips_every_bit():
     assert all(a ^ 0xFF == b for a, b in zip(plain, flipped))
 
 
-def test_supvan_lzma_asks_for_a_dictionary_a_printer_can_allocate():
-    """Python's preset 9 declares a 64MB dictionary, which is the decoder's
-    working buffer. This runs on a battery-powered label maker."""
+def test_supvan_lzma_header_matches_a_captured_print():
+    """Taken from a Bluetooth capture of the vendor app printing a label:
+
+        5d 00 20 00 00 00 30 00 00 00 00 00 00
+        |  |________|  |____________________|
+        |   8KB dict    12288 bytes declared
+        properties
+
+    Both numbers were guessed wrong before this capture - 64MB then 64KB
+    for the dictionary, and "unknown" for the size - and each wrong guess
+    produced the same symptom: a job the printer accepted, positioned for,
+    and never completed."""
+    raw, _s, _r = supvan.render_test_pattern(384, 64)
+    head = supvan.compress_bitmap(raw, "alone")[:13]
+
+    assert head[0] == 0x5D, "lc=3 lp=0 pb=2"
+    assert int.from_bytes(head[1:5], "little") == 8192
+    assert int.from_bytes(head[5:13], "little") == len(raw), "size must be declared"
+
+
+def test_supvan_our_stream_is_not_readable_by_liblzma():
+    """A known divergence, pinned so it is not mistaken for a bug.
+
+    Python always appends an end-of-stream marker, and liblzma refuses a
+    declared size alongside one. The captured stream has no marker and
+    reads back fine. The consumer is the printer's decoder, which stops at
+    the declared size - so this is checked against the device, not here."""
     import lzma
     raw, _s, _r = supvan.render_test_pattern(384, 64)
-    stream = supvan.compress_bitmap(raw, "alone")
-
-    assert int.from_bytes(stream[1:5], "little") == 65536
-    # and it must still be a stream something can actually read
-    assert lzma.decompress(stream, format=lzma.FORMAT_ALONE) == raw
-
-
-def test_supvan_declared_size_is_opt_in_and_unverifiable():
-    """Off by default on purpose. Embedded decoders often need the real
-    size, but liblzma refuses to read back a stream that declares one and
-    also carries an end marker - so turning it on ships something this
-    machine cannot check. That is a deliberate experiment, not a default."""
-    import lzma
-    raw, _s, _r = supvan.render_test_pattern(384, 64)
-
-    default = supvan.compress_bitmap(raw, "alone")
-    assert default[5:13] == b"\xFF" * 8, "the default must say 'unknown'"
-
-    declared = supvan.compress_bitmap(raw, "alone", declare_size=True)
-    assert int.from_bytes(declared[5:13], "little") == len(raw)
-    assert declared[13:] == default[13:], "only the header should differ"
     with pytest.raises(lzma.LZMAError):
-        lzma.decompress(declared, format=lzma.FORMAT_ALONE)
+        lzma.decompress(supvan.compress_bitmap(raw, "alone"),
+                        format=lzma.FORMAT_ALONE)
 
 
 @pytest.mark.parametrize("fmt,magic", [
-    ("alone", b"\x5d\x00\x00"),      # LZMA1 properties byte then dict size
+    ("alone", b"\x5d\x00\x20\x00\x00"),   # properties, then the 8KB dict
     ("xz", b"\xfd7zXZ"),
 ])
 def test_supvan_lzma_containers_differ(fmt, magic):

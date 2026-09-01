@@ -581,16 +581,16 @@ def render_test_pattern(width_dots=DEFAULT_WIDTH_DOTS, height_dots=120,
 # appears at the head of every stream this produces.
 LZMA_LC, LZMA_LP, LZMA_PB = 3, 0, 2
 
-# 64KB. The dictionary is the decoder's working buffer, and this runs on a
-# battery-powered label printer, not a desktop: Python's preset 9 asks for
-# **64MB**, which such a device cannot allocate. A decoder handed a
-# dictionary it cannot fit has nowhere to go - which fits a job that is
-# accepted, positioned, and then never completes.
-LZMA_DICT_SIZE = 1 << 16
+# 8KB, taken from a captured print by the vendor's own app. Not a guess:
+# the header it sends reads `5d 00 20 00 00` - properties 0x5d, dictionary
+# 0x2000. Python's preset 9 asks for 64MB, which a battery-powered label
+# printer cannot allocate, and an earlier guess of 64KB was still eight
+# times too large.
+LZMA_DICT_SIZE = 8192
 
 
 def compress_bitmap(data, fmt="alone", preset=9,
-                    dict_size=LZMA_DICT_SIZE, declare_size=False):
+                    dict_size=LZMA_DICT_SIZE, declare_size=True):
     """LZMA-compress a bitmap the way the device is thought to expect it.
 
     The document establishes that the payload is LZMA. It does not
@@ -607,12 +607,18 @@ def compress_bitmap(data, fmt="alone", preset=9,
       bytes. A decoder that sizes its output buffer from that field has
       nothing to work with, so `declare_size` writes the real length.
 
-    `declare_size` is **off** by default, and deliberately so: liblzma
-    refuses to read back a stream that declares a size and also carries
-    an end-of-stream marker, so turning it on produces something this
-    machine cannot verify. That may be exactly what the firmware wants -
-    embedded decoders often need the size and ignore the marker - but it
-    is an experiment to opt into rather than a default to ship.
+    `declare_size` is **on**, because a captured print from the vendor's
+    own application declares it: the header reads
+    `5d 00 20 00 00 00 30 00 00 00 00 00 00` - 8KB dictionary, 12288 bytes
+    of image.
+
+    One divergence to know about: liblzma will not read our stream back,
+    because Python always appends an end-of-stream marker and liblzma
+    rejects a declared size alongside one. The captured stream has no such
+    marker and reads back fine. The consumer here is the printer's
+    decoder, not liblzma, and embedded decoders stop at the declared size
+    and ignore what follows - but it does mean this is checked against the
+    device rather than on this machine.
 
     Both are inferences about this firmware rather than documented facts,
     which is why both are arguments."""
