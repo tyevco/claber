@@ -800,18 +800,51 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
         return announced, (len(compressed) if buffer_len == "compressed"
                            else raw_len)
 
-    def check(dev, label):
-        status = dev.status()
-        lit = [n for n, _o, _m in STATUS_FLAGS if status[n]]
-        say(label, status, lit)
-        if status["errors"]:
-            raise SupvanError(
-                f"device reports {', '.join(status['errors'])} at step "
-                f"'{label}' - stopping rather than sending more")
-        return status
+    def check(dev, label, patience=3):
+        # A poll that comes back empty is not the same as a poll that
+        # comes back bad. Observed after the last buffer of a four-buffer
+        # job: the device simply stopped answering, and treating the first
+        # silence as fatal both hid whether it was temporary and left the
+        # device sitting in its printing state. So silence is retried, and
+        # only then reported as silence - with the stop-print that a
+        # half-started job needs.
+        for attempt in range(patience):
+            # Read the report here rather than calling dev.status(), so
+            # silence is detected by *being* empty rather than by matching
+            # the text of an exception. There are two such messages in
+            # this module and the deployed Pi may carry an older one.
+            dev.command(OP_INQUIRY_STATUS)
+            report = dev.read_report()
+            if report:
+                status = decode_status(report)
+            else:
+                if attempt + 1 < patience:
+                    say(f"no answer at '{label}', asking again "
+                         f"({attempt + 2} of {patience})", None, [])
+                    _time.sleep(settle * 4)
+                    continue
+                try:
+                    dev.command(OP_STOP_PRINT)
+                except SupvanError:
+                    pass
+                raise SupvanError(
+                    f"the device stopped answering at step '{label}' after "
+                    f"{patience} tries. Sent stop-print (0x14); if the next "
+                    f"`mplabel supvan-probe` is also silent it needs a power "
+                    f"cycle")
+            lit = [n for n, _o, _m in STATUS_FLAGS if status[n]]
+            say(label, status, lit)
+            if status["errors"]:
+                raise SupvanError(
+                    f"device reports {', '.join(status['errors'])} at step "
+                    f"'{label}' - stopping rather than sending more")
+            return status
 
     with SupvanDevice(path, timeout) as dev:
-        check(dev, "before anything")
+        # Fail fast on the opening poll only: silence there means the
+        # device is not there, and retrying just delays saying so.
+        # Once a job has started, silence is worth waiting out.
+        check(dev, "before anything", patience=1)
 
         dev.command(OP_CHECK_DEVICE)
         dev.read_report()
@@ -861,7 +894,11 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
             dev.command(OP_BUFFER_FULL, buffered, speed)
             _time.sleep(settle)
 
-            status = final = check(dev, f"after buffer full{of}")
+            # Patience here, not elsewhere: the last buffer is where
+            # the device has the most reason to be busy, and where it
+            # was seen to go quiet.
+            status = final = check(dev, f"after buffer full{of}",
+                                   patience=5)
 
         # Wait for the job to finish, then clean up after ourselves if it
         # does not. Observed on the hardware: a job the device accepts but

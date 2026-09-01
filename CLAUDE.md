@@ -204,7 +204,7 @@ hardware or a real Facebook account.
 | Parcel code placement | **Verified.** The 3-character code renders upright in the header strip above the label's border, top right, clear of the postage indicia, the addresses and the tracking barcode. Checked by rendering for the widest code the alphabet allows (`WWW`) as well as an all-digit one, and both right-align on the same margin. Confirmed on the label output; **not yet** confirmed on a thermal print, where edge margins are tighter, nor scanner-tested. |
 | The T50M Pro is a HID device, not a printer | **Verified on the hardware.** USB `1820:207f`, enumerating as a vendor-defined HID pipe (usage page 0xFF00) *plus* a fake CD-ROM holding the Windows installer. No usblp binding, so it has **no /dev/usb/lpN** - writes go to `/dev/hidraw0`. Its report descriptor declares 64-byte input and output reports with **no Report ID**, so a hidraw write is 65 bytes: a leading `0x00` then the 64-byte payload. Bidirectional, so it can be asked for status before anything is printed. `udev/99-supvan-t50m.rules` makes the node group-writable; without it the node is root-only. **`/dev/usb/lp0` is the G4** - do not confuse them. |
 | The T50M Pro's command sequence | **Verified on the hardware: a replayed stream printed a label.** `mplabel supvan-test-print --replay <file>` sent 123 bytes captured from the vendor app and the printer produced the label. So the transport, the frames, the `0x5c` announce carrying the compressed length, the `0x10` buffer-full with its second value of 60, and the status polling are all correct - this repo can drive the device. Six frames are pinned byte-for-byte against a USBPcap capture. |
-| Generating the bitmap stream | **Encoder verified on the hardware. The device has a per-buffer size limit, and that is now the open question.** `lzma1.py` (literals-only LZMA1, declared size, no end marker - the shape Python's `lzma` cannot emit) re-encoded a captured image and **printed**, so the encoder, transport, framing and sequence are all settled. Four measurements then isolated what refuses a generated pattern: **123 B/2 reports printed, 419 B/7 printed, 695 B/11 refused, 724 B/12 refused** - and ink ran 0.13%, 0.13%, 0.26%, 7.54% across those, so it spans both outcomes and is **not** the variable. `split_bitmap` therefore cuts the image into row bands, each a complete LZMA stream declaring its own length, sent as its own `0x5c`/data/`0x10` cycle inside one `0x13` job - which is what the vendor app is described as doing. Default `--max-buffer` is **448** (7 reports), the largest seen to print, not the tempting 512. **Untested on hardware.** |
+| Generating the bitmap stream | **Encoder verified on the hardware; what refuses a generated image is still open.** `lzma1.py` (literals-only LZMA1, declared size, no end marker - the shape Python's `lzma` cannot emit) re-encoded a captured image and **printed**, so the encoder, transport, framing and single-buffer sequence are settled. Everything this repo *draws* is still refused, and **two candidates remain perfectly confounded** across every measurement so far - stream size and the number of blank rows. Their image: 419 B, 242/256 blank, prints. `scatter`: 695 B, 0 blank, refused. `blocks`: 724 B, 0 blank, refused. Ink is ruled out (0.13% to 7.54% spans both outcomes); size is not, and neither is blankness. Splitting into four sub-limit buffers did **not** print, which is evidence against size. `--style sparse --max-buffer 0` separates them in one label: 551 B (over the size bound) with 183 blank rows (like the print that works). |
 | The T50M Pro's payload protocol | **Verified on the hardware, except the raster's orientation.** `supvan-probe` settled the 65-byte hidraw write with its leading `0x00`, the 8-byte frame with its big-endian `wValue`, and the byte-0 flags. The status reply carries **one leading byte before the flags** (`STATUS_PREFIX_LEN`), which the analysis missed: decoding from offset 0 reported "media not recognised" on a healthy idle printer, and opening the media cover and re-polling showed the byte that moved was the one the offset predicts. Both captures are pinned as tests, as are six command frames from a USBPcap capture. The bulk data is **bare 64-byte reports after the `0x5c` announce** - no wrapper; the Bluetooth capture's `0xbb`/`10 02 aa` framing is RFCOMM's and belongs to that transport only. **The `0x5d` label authentication is not required to print** - the replay never sends it. **Bit polarity is settled without a label**: the captured image is 99.87% zero and printed near-blank, so a set bit is a black dot - the ZPL sense, opposite to TSPL on the G4, and `--invert` is wrong here (it asks for a 92.5% black label, which is what made the media pull back). Still unknown: row order and origin. See `docs/supvan-t50m-protocol.md`. |
 | The raw data path works | **Verified on the hardware:** bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. If a label comes out wrong from here, suspect the raster or the geometry, not the transport. |
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
@@ -306,6 +306,14 @@ label on a box in the loft naming something else. Same alphabet, different
 rules; `ensure_inventory_codes` deliberately does not scope its `taken` set
 by state, where `allocate_code` deliberately does.
 
+**The device can stop answering entirely, mid-job.** After the last
+buffer of a four-buffer job it went silent - no error flag, no reply at
+all. `experimental_print` now retries a silent poll rather than treating
+it as failure, and sends stop-print on the way out if it stays silent, so
+the device is not left half-started. The opening poll still fails fast:
+silence there means the device is not there. If `supvan-probe` is silent
+too, it needs a power cycle.
+
 **`pages printed` reads 0 on a label that printed.** The counter at `0x30` did not move on a confirmed successful print, so it cannot be used to decide whether a job worked. The reliable signal is the status flags clearing: `busy`/`printing` go away and nothing is left but `usb_connected`.
 
 **`media_seating_error` is this device's only way of saying no.**
@@ -316,16 +324,23 @@ labels went on reseating media that was never the problem. Do not read it
 as a diagnosis - it is the same answer for every rejection, which is
 exactly why isolating one variable per label is the only way through.
 
-**The device takes about 448 compressed bytes per buffer.** Measured, not
-guessed: 419 bytes in 7 reports printed and 695 in 11 did not, with ink
-running 0.13% to 7.54% across both outcomes so it cannot be the cause.
-Bigger images go as several buffers - `split_bitmap` cuts row bands, each
-a complete LZMA stream with its own declared length, each sent as its own
-`0x5c`/data/`0x10` cycle inside a single `0x13` job. The bands must be
-whole rows and must tile the image exactly: a dropped band loses a strip
-of the picture silently. **Do not raise `--max-buffer` to 512 because it
-is a rounder number** - nothing above 419 has ever printed, and finding
-the real ceiling costs a label per attempt.
+**Check every property that moved, not just the one you meant to move.**
+`--style scatter` was built to hold ink still and vary stream size, and it
+did - but it also took blank rows from 242 to 0, which went unnoticed, and
+the conclusion "size is the blocker" was drawn from a comparison that had
+two free variables in it. Splitting into four sub-limit buffers then did
+not print, which is what a wrong conclusion looks like from the outside.
+Before spending a label, tabulate size, ink, blank rows and longest inked
+run for the new image against the one known to print, and confirm exactly
+one differs.
+
+**`split_bitmap` is built on an unproven premise.** It cuts row bands,
+each a complete LZMA stream with its own declared length, sent as its own
+`0x5c`/data/`0x10` cycle inside a single `0x13` job. The bands tile the
+image exactly - a dropped band loses a strip silently - and the mechanics
+are tested. What is not established is that a per-buffer size limit is
+what the device is enforcing. `--max-buffer 0` sends one buffer, which is
+the path that has actually printed.
 
 **One variable per label, and say which one before printing.** This
 printer has cost more labels to guessing than to testing. The pattern

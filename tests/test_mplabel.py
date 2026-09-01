@@ -2645,6 +2645,57 @@ def test_supvan_cli_splits_by_default(monkeypatch, capsys):
     cli.main()
     assert "724 bytes in 1 buffer(s)" in capsys.readouterr().out
 
+class _GoesQuiet(_FakeDevice):
+    """Answers normally, then ignores `silences` reads, then answers again.
+
+    `quiet_after` is a read count rather than a step name because the
+    device has no idea which step we think it is on - it went quiet after
+    the last buffer of a four-buffer job, which is simply late."""
+
+    def __init__(self, quiet_after, silences, reply):
+        super().__init__(reply)
+        self.reads = 0
+        self.quiet_after = quiet_after
+        self.silences = silences
+
+    def read_report(self, timeout=None):
+        self.reads += 1
+        if self.quiet_after < self.reads <= self.quiet_after + self.silences:
+            return b""
+        return self.reply
+
+
+def test_supvan_a_silent_poll_is_retried_not_treated_as_failure(monkeypatch):
+    """Observed on the hardware: after the last buffer of a four-buffer
+    job the device simply stopped answering. Treating the first silence as
+    fatal both hid whether it was temporary and abandoned the job.
+
+    Failing fast on the *first* poll is still right - silence there means
+    the device is not there - so the patience is spent where the silence
+    actually was."""
+    dev = _GoesQuiet(4, 2, _status_report((0, 0)))
+    monkeypatch.setattr(supvan, "SupvanDevice", lambda *a, **k: dev)
+
+    raw, stride, _rows = supvan.render_test_pattern(384, 64)
+    bands = supvan.split_bitmap(raw, stride)
+    final = supvan.experimental_print(
+        {"buffers": [(c, n) for c, _r, n in bands]}, settle=0)
+    assert final["errors"] == []
+    assert dev.reads > 4 + 2, "the silences must actually have been reached"
+
+
+def test_supvan_a_device_that_never_answers_is_stopped_and_named(monkeypatch):
+    """Give up eventually, but send stop-print on the way out and say what
+    to do. A job left half-started is what makes the *next* attempt report
+    a seating error before it can begin."""
+    dev = _FakeDevice(b"")
+    monkeypatch.setattr(supvan, "SupvanDevice", lambda *a, **k: dev)
+
+    with pytest.raises(supvan.SupvanError, match="stopped answering") as exc:
+        supvan.experimental_print(
+            {"compressed": b"\x00" * 8, "raw_len": 64}, settle=0)
+    assert "power cycle" in str(exc.value)
+
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
 

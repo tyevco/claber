@@ -428,6 +428,57 @@ seven reports, the largest size seen to print - is what `split_bitmap`
 uses. **512 is the tempting guess** and buffers usually are powers of two,
 but nothing above 419 bytes has ever printed here, so it stays a guess.
 
+### Correction: size was not isolated
+
+`--style scatter` was refused, and that was read as "size is the blocker".
+It was not a sound reading. `scatter` held ink still and varied size, but
+it also took blank rows from 242 to 0, and blank rows track the outcome
+just as perfectly as size does:
+
+| | size | ink | blank rows | longest inked run | result |
+|---|---|---|---|---|---|
+| their image | 419 B | 0.13% | 242/256 | 11 | prints |
+| `blocks` | 724 B | 7.54% | 0/256 | 256 | refused |
+| `scatter` | 695 B | 0.26% | 0/256 | 256 | refused |
+| `sparse` | 551 B | 0.66% | 183/256 | 64 | untested |
+
+Ink is genuinely ruled out - it spans both outcomes. Size and blankness
+are not distinguished by anything measured so far.
+
+Splitting the image into four buffers of 305/248/186/186 bytes, all under
+the supposed limit, **did not print** - which is what a wrong premise
+looks like from the outside. Every buffer was accepted with no error, so
+whatever the device objects to, it is not the size of a single transfer.
+
+`--style sparse --max-buffer 0` separates them in one label: 551 bytes,
+over the supposed size bound, with 183 blank rows and a longest inked run
+of 64, like the print that works.
+
+- Prints -> blankness or ink distribution matters; the size limit is not
+  real and `split_bitmap` is solving the wrong problem.
+- Refused -> size stands, and the multi-buffer sequence below is what
+  needs work.
+
+### The device can go silent mid-job
+
+After the last buffer of the four-buffer job the device stopped answering
+`0x11` altogether - not an error flag, no reply at all. Three readings, in
+descending order of how well they fit:
+
+1. The multi-buffer sequence is wrong and the device is waiting for
+   something that never came. It accepted all four buffers without
+   complaint, so it was not refusing them.
+2. It began printing and stopped servicing the interrupt endpoint. Argues
+   against itself: nothing came out.
+3. `0x13`'s `wValue` of 1 means "one buffer", not "start", and a job of
+   four confused it. The capture cannot distinguish the two readings - it
+   is a single-buffer job either way.
+
+`experimental_print` now retries a silent poll instead of treating it as
+failure, and sends `0x14` on the way out so the device is not left
+half-started. The opening poll still fails fast, because silence there
+means the device is not there.
+
 ### Sending several buffers
 
 `split_bitmap` cuts the image into bands of whole rows, halving the band
@@ -454,9 +505,11 @@ print each strip on its own label. The `buffer_full` flag is doing real
 work here for the first time: with a single buffer it passed straight
 through, and between bands it is what says the device is ready for more.
 
-**This is not yet confirmed on hardware.** It is the shape the four
-measurements imply and the vendor's described behaviour matches, which is
-not the same as having printed.
+**Tried on hardware and it did not print.** All four buffers were
+accepted - no error flag at any point, which is itself a result: the
+device does not object to a buffer of this size. It then went silent, as
+above. So either the sequence is incomplete, or the premise it was built
+on is wrong. See the correction above.
 
 ### `pages printed` is not a completion signal
 
