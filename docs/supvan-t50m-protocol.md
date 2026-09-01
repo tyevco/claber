@@ -128,7 +128,19 @@ The device replies to a status poll with a 64-byte input report.
 payload; the rest of the 64-byte report is padding and means nothing.
 Confirmed across commands that answer with different lengths — status and
 firmware revision give 8, read-revision gives 4, media info gives 59 — so
-it is a length, not a marker. The offsets in the table below are relative
+it is a length, not a marker.
+
+**The device does not clear the report buffer between replies.** Anything a
+command does not refresh is left over from the previous one. Two probe runs
+made this unambiguous: every reply in the second carried
+`bf 83 71 a2 63 36 f6` on the end, byte-for-byte the tail of the *first*
+run's media-info reply.
+
+This reaches inside the declared length as well. Read-firmware-revision
+sets payload byte 6 to `0x01`, and that byte then persisted into later
+status replies that had nothing to do with it. So the rule is stricter than
+"trust the length": **interpret only the bytes a command is documented to
+refresh.** For status that is six, even though the length byte says eight. The offsets in the table below are relative
 to **the payload**, i.e. one byte further into the report than they appear
 on the wire.
 

@@ -2205,6 +2205,32 @@ def test_supvan_every_reply_is_length_prefixed(name, captured, length):
     assert len(supvan.reply_payload(report)) == length
 
 
+@pytest.mark.parametrize("first,second", [
+    # 0x11 status, then 0x12 check device, each from two probe runs. The
+    # second run's tails are literally the previous run's media reply.
+    ("08 00 00 10 00 00 00 00 00 00 00 00 00 00 00 00",
+     "08 00 00 10 00 00 00 01 00 bf 83 71 a2 63 36 f6"),
+    ("08 00 04 10 00 00 00 00 00 00 00 00 00 00 00 00",
+     "08 00 04 10 00 00 00 01 00 bf 83 71 a2 63 36 f6"),
+])
+def test_supvan_stale_tail_bytes_do_not_change_the_decode(first, second):
+    """The device does not clear its report buffer between replies.
+
+    Two real runs: the second carries `bf 83 71 a2 63 36 f6` on the end of
+    every reply, which is byte-for-byte the tail of the *previous* run's
+    media-info reply, and a `01` at payload byte 6 left by a firmware
+    revision command. Only the bytes a command actually refreshes mean
+    anything - which is why the status decode reads six and stops, even
+    though the length byte says eight."""
+    def decode(hexs):
+        report = bytes.fromhex(hexs.replace(" ", ""))
+        report += bytes(supvan.REPORT_SIZE - len(report))
+        status = supvan.decode_status(report)
+        return {k: v for k, v in status.items() if k != "raw"}
+
+    assert decode(first) == decode(second)
+
+
 def test_supvan_check_device_reports_busy():
     """Captured while the device rescanned itself. Byte 1 bit 0x04 is
     'busy', and it lighting exactly there - and nowhere else - is
