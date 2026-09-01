@@ -17,6 +17,12 @@ Derived by static analysis of the vendor's Electron desktop application,
 which ships JavaScript source maps. Nothing was executed and no traffic was
 captured.
 
+**The command and status path has since been confirmed on the device.**
+A status poll over `/dev/hidraw0` returned a decodable report, which
+settles the 65-byte write with its leading `0x00`, the 8-byte frame
+including the big-endian `wValue`, and the byte-0 flag layout. The
+bitmap path remains untested and largely unknown.
+
 What follows is a description of **observable device behaviour** — frame
 layouts, opcode values, bit meanings, command ordering. It contains no
 vendor source code, and none should ever be added: their code is theirs.
@@ -139,6 +145,16 @@ six bytes are meaningful:
 
 Bytes 4 and 5 are a 16-bit **little-endian** count of pages printed —
 byte 5 is the high byte.
+
+Two corrections from a real reading (`08 00 00 10 00 00`, idle, no
+usable media):
+
+- **Byte 3 bit `0x10` is set and is not in the table above.** Meaning
+  unknown; it appears on an otherwise idle device.
+- **Byte 2 bit `0x10` was clear while the device was plugged in over
+  USB and answering**, so reading it as "USB connected" is doubtful.
+  It may mean USB power specifically, or something else entirely.
+  Treat that one bit as unverified.
 
 This is the most useful part of the protocol to implement first: a status
 poll is a safe, read-only round trip that proves the transport works
