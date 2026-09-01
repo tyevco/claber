@@ -2408,12 +2408,23 @@ def test_supvan_cli_defaults_to_the_device_encoder(monkeypatch, capsys):
 
     monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
     monkeypatch.setattr(sys, "argv",
-                        ["mplabel", "supvan-test-print", "--dry-run"])
+                        ["mplabel", "supvan-test-print", "--dry-run",
+                         "--max-buffer", "0"])
     cli.main()
     out = capsys.readouterr().out
     assert "device container" in out
     assert "size declared" in out
     assert "head 5d 00 20 00 00" in out
+
+    # And the split path, which has no such flag to get wrong: every band
+    # carries the device header with its own length declared.
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run"])
+    cli.main()
+    split = capsys.readouterr().out
+    heads = [l for l in split.splitlines() if "head 5d 00 20 00 00" in l]
+    assert len(heads) > 1
+    assert "ff ff ff ff" not in split
 
 def test_supvan_sparse_pattern_is_smaller_as_well_as_lighter():
     """Both, or the experiment it exists for proves nothing.
@@ -2519,6 +2530,121 @@ def test_supvan_every_style_declares_the_same_image_size():
              for style in ("blocks", "sparse", "scatter")}
     assert set(sizes.values()) == {12288}, sizes
 
+# --- splitting the image into buffers -----------------------------------
+#
+# Measured on the hardware, and the reason this exists at all:
+#
+#     123 B,  2 reports, 0.13% ink   printed
+#     419 B,  7 reports, 0.13% ink   printed
+#     695 B, 11 reports, 0.26% ink   REFUSED
+#     724 B, 12 reports, 7.54% ink   REFUSED
+#
+# Ink spans both outcomes and size does not, so the device has a per-buffer
+# limit. `scatter` was built to force exactly that comparison.
+
+def test_supvan_split_keeps_every_buffer_under_the_limit():
+    """The whole point. A buffer over the limit is one the device refuses,
+    and it refuses the job, not the buffer."""
+    for style in ("blocks", "sparse", "scatter"):
+        raw, stride, _rows = supvan.render_test_pattern(384, 256, style=style)
+        bands = supvan.split_bitmap(raw, stride)
+        assert bands, style
+        for compressed, _band_rows, _raw_len in bands:
+            assert len(compressed) <= supvan.MAX_BUFFER_BYTES, style
+
+
+def test_supvan_split_covers_the_image_exactly_once():
+    """Bands are strips of the label. Dropping one loses a band of the
+    picture silently; overlapping one prints it twice."""
+    raw, stride, rows = supvan.render_test_pattern(384, 256)
+    bands = supvan.split_bitmap(raw, stride)
+
+    assert sum(band_rows for _c, band_rows, _n in bands) == rows
+    assert sum(raw_len for _c, _r, raw_len in bands) == len(raw)
+
+
+def test_supvan_each_buffer_is_a_complete_lzma_stream():
+    """Not slices of one long stream - each carries its own 13-byte header
+    declaring *that band's* length, and decodes standing alone.
+
+    A slice would be undecodable by itself, which is the obvious way to
+    write this and would fail on the device rather than here."""
+    import lzma
+
+    raw, stride, _rows = supvan.render_test_pattern(384, 256)
+    bands = supvan.split_bitmap(raw, stride)
+    assert len(bands) > 1, "the test pattern must actually need splitting"
+
+    rebuilt = b""
+    for compressed, band_rows, raw_len in bands:
+        assert compressed[0] == 0x5D
+        assert int.from_bytes(compressed[5:13], "little") == raw_len
+        chunk = lzma.decompress(compressed, format=lzma.FORMAT_ALONE)
+        assert len(chunk) == raw_len == band_rows * stride
+        rebuilt += chunk
+    assert rebuilt == raw
+
+
+def test_supvan_split_refuses_a_limit_it_cannot_meet():
+    """Better than returning buffers that are over it anyway, which would
+    look like it worked and fail on the device."""
+    raw, stride, _rows = supvan.render_test_pattern(384, 256)
+    with pytest.raises(ValueError, match="too low"):
+        supvan.split_bitmap(raw, stride, max_bytes=8)
+
+
+def test_supvan_split_rejects_a_partial_row():
+    """A bitmap that is not a whole number of rows means the stride is
+    wrong, and silently truncating it prints a sheared label."""
+    with pytest.raises(ValueError, match="whole number of rows"):
+        supvan.split_bitmap(b"\x00" * 100, 48)
+
+
+def test_supvan_multi_buffer_print_repeats_the_cycle_per_buffer(monkeypatch):
+    """One 0x13 for the job, then 0x5c / data / 0x10 for each buffer.
+
+    The alternative reading - a fresh job per band - would print each
+    strip on its own label."""
+    dev = _FakeDevice(_status_report((0, 0)))
+    monkeypatch.setattr(supvan, "SupvanDevice", lambda *a, **k: dev)
+
+    raw, stride, _rows = supvan.render_test_pattern(384, 256)
+    bands = supvan.split_bitmap(raw, stride)
+    supvan.experimental_print(
+        {"buffers": [(c, n) for c, _r, n in bands]}, settle=0)
+
+    def opcodes(op):
+        return [s for s in dev.sent
+                if len(s) >= 5 and s[0] == 0xC0 and s[4] == op]
+
+    assert len(opcodes(supvan.OP_START_PRINT)) == 1
+    assert len(opcodes(supvan.OP_NEXT_FRAME_IS_BULK)) == len(bands)
+    assert len(opcodes(supvan.OP_BUFFER_FULL)) == len(bands)
+
+    for (compressed, _r, _n), frame in zip(
+            bands, opcodes(supvan.OP_NEXT_FRAME_IS_BULK)):
+        assert int.from_bytes(frame[2:4], "big") == len(compressed)
+
+
+def test_supvan_cli_splits_by_default(monkeypatch, capsys):
+    """A whole-label stream is 724 bytes and the device refuses it, so
+    sending one buffer must not be what happens when nobody asks."""
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "1 buffer(s)" not in out
+    assert "split at 448 bytes" in out
+
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run",
+                         "--max-buffer", "0"])
+    cli.main()
+    assert "724 bytes in 1 buffer(s)" in capsys.readouterr().out
+
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
 
@@ -2554,8 +2680,12 @@ def test_supvan_cli_declares_the_size_by_default(monkeypatch, capsys,
     from mplabel import cli
 
     monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    # --max-buffer 0 because these two flags belong to the single-buffer
+    # path. Splitting always uses lzma1 and always declares the size, and
+    # the header printed per band is the proof of it.
     monkeypatch.setattr(sys, "argv",
-                        ["mplabel", "supvan-test-print", "--dry-run"] + argv)
+                        ["mplabel", "supvan-test-print", "--dry-run",
+                         "--max-buffer", "0"] + argv)
     cli.main()
     out = capsys.readouterr().out
     assert expected in out

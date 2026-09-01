@@ -924,9 +924,18 @@ def cmd_supvan_test_print(cfg, args):
 
     raw, stride, rows = supvan_mod.render_test_pattern(
         args.width, args.height, invert=args.invert, style=args.style)
-    compressed = supvan_mod.compress_bitmap(
-        raw, args.lzma, dict_size=args.dict_size,
-        declare_size=args.declare_size)
+    if args.max_buffer:
+        bands = supvan_mod.split_bitmap(raw, stride, args.max_buffer,
+                                        dict_size=args.dict_size)
+        payload = {"buffers": [(c, n) for c, _r, n in bands]}
+        total = sum(len(c) for c, _r, _n in bands)
+    else:
+        compressed = supvan_mod.compress_bitmap(
+            raw, args.lzma, dict_size=args.dict_size,
+            declare_size=args.declare_size)
+        bands = [(compressed, rows, len(raw))]
+        payload = {"compressed": compressed, "raw_len": len(raw)}
+        total = len(compressed)
 
     print(f"device : {device}")
     ink = sum(bin(b).count("1") for b in raw)
@@ -939,10 +948,17 @@ def cmd_supvan_test_print(cfg, args):
     print(f"         {100 * ink / (len(raw) * 8):.2f}% ink, "
           f"{blank}/{rows} rows blank")
     print(f"raw    : {len(raw)} bytes")
-    print(f"lzma   : {len(compressed)} bytes, {args.lzma} container, "
-          f"dict {args.dict_size}, "
-          f"size {'declared' if args.declare_size else 'unknown'}")
-    print(f"         head {compressed[:13].hex(' ')}")
+    print(f"lzma   : {total} bytes in {len(bands)} buffer(s), "
+          f"{args.lzma if args.max_buffer == 0 else 'device'} container, "
+          f"dict {args.dict_size}"
+          + ("" if args.max_buffer else
+             f", size {'declared' if args.declare_size else 'unknown'}"))
+    for i, (c, band_rows, _n) in enumerate(bands, 1):
+        print(f"       {i:>2}: {len(c):>4} bytes, {-(-len(c) // 64):>2} "
+              f"reports, {band_rows} rows, head {c[:13].hex(' ')}")
+    if args.max_buffer:
+        print(f"         split at {args.max_buffer} bytes; 419 in 7 reports "
+              f"printed, 695 in 11 did not")
     print(f"announce {args.announce} length, speed {args.speed}")
 
     if args.dry_run:
@@ -958,8 +974,7 @@ def cmd_supvan_test_print(cfg, args):
     print("\nrunning the sequence:")
     try:
         final = supvan_mod.experimental_print(
-            {"compressed": compressed, "raw_len": len(raw)},
-            path=device, speed=args.speed, announce=args.announce,
+            payload, path=device, speed=args.speed, announce=args.announce,
             buffer_len=args.buffer_len, on_step=step)
     except supvan_mod.SupvanError as exc:
         raise SystemExit(f"\nstopped: {exc}")
@@ -1368,6 +1383,16 @@ def main():
                         "generating one. Replaying bytes known to have "
                         "printed separates a wrong sequence from a stream "
                         "the firmware will not decode")
+    # Splitting is the default because a whole-label stream does not
+    # fit: 419 bytes in 7 reports printed, 695 in 11 was refused with
+    # ink ruled out in between. 0 sends one buffer, which is how the
+    # old single-stream behaviour is reproduced.
+    p.add_argument("--max-buffer", type=int,
+                   default=supvan_mod.MAX_BUFFER_BYTES,
+                   help="split the image into buffers no larger than "
+                        "this many compressed bytes (default %(default)s, "
+                        "7 reports, the largest seen to print). 0 sends "
+                        "one buffer however big it is")
     p.add_argument("--style", choices=["blocks", "sparse", "scatter"],
                    default="blocks",
                    help="test pattern (default %(default)s). 'sparse' draws "
@@ -1395,7 +1420,7 @@ def main():
                    help="flip the bit polarity")
     p.add_argument("--lzma", choices=["device", "alone", "xz", "raw"],
                    default="device",
-                   help="LZMA container (default %(default)s). 'device' is the "
+                   help="LZMA container for --max-buffer 0 only; splitting always uses 'device'. 'device' is the "
                         "in-repo literals-only encoder, the only one that "
                         "emits a declared size with no end marker - which is "
                         "the only shape this firmware accepts")

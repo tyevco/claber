@@ -687,6 +687,59 @@ def compress_bitmap(data, fmt="device", preset=9,
             + struct.pack("<Q", size) + body)
 
 
+# The largest stream measured to print is 419 bytes in 7 reports; 695 in
+# 11 was refused, as was 724 in 12. Ink was ruled out getting there - the
+# 695-byte refusal carried 0.26% ink against the 419-byte success's 0.13%,
+# where the earlier 724-byte refusal carried 7.54%. So the device has a
+# limit on how much it will take in one buffer, and the honest bound is
+# the biggest one seen to work rather than the round number near it.
+#
+# 448 is 7 reports exactly. 512 would be 8 and is the tempting guess -
+# buffers usually are powers of two - but nothing has printed above 419,
+# so guessing upwards here costs labels to find out.
+MAX_BUFFER_BYTES = 448
+
+
+def split_bitmap(data, stride, max_bytes=MAX_BUFFER_BYTES, dict_size=None):
+    """Compress a bitmap as a list of buffers, each within `max_bytes`.
+
+    Each band is a **complete** LZMA stream - its own 13-byte header
+    declaring that band's uncompressed length - not a slice of one long
+    stream. A slice would be undecodable on its own, and the vendor
+    application is described as splitting large images into several
+    compressed buffers, which only makes sense if each stands alone.
+
+    Bands are whole rows, halved until every one fits. Equal row counts
+    rather than a greedy fill: a band is a strip of the label, and strips
+    of the same height are far easier to reason about when the printed
+    result is wrong.
+
+    Returns a list of (compressed, rows_in_band, raw_len)."""
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+    if len(data) % stride:
+        raise ValueError("bitmap is not a whole number of rows")
+    rows = len(data) // stride
+    if not rows:
+        raise ValueError("nothing to compress")
+    kw = {} if dict_size is None else {"dict_size": dict_size}
+
+    band_rows = rows
+    while True:
+        bands = []
+        for start in range(0, rows, band_rows):
+            chunk = data[start * stride:(start + band_rows) * stride]
+            bands.append((lzma1.compress(chunk, **kw), len(chunk) // stride,
+                          len(chunk)))
+        if all(len(c) <= max_bytes for c, _r, _n in bands):
+            return bands
+        if band_rows == 1:
+            raise ValueError(
+                "a single row does not compress under "
+                + str(max_bytes)
+                + " bytes; the limit is too low for this image")
+        band_rows = max(1, band_rows // 2)
+
 def abort_print(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
     """Send stop-print and report the status afterwards.
 
@@ -720,21 +773,32 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
 
     `announce` decides what length goes in the 0x5c command: the
     compressed size or the uncompressed one. The document says "its
-    length" without saying which, so it is a knob."""
+    length" without saying which, so it is a knob.
+
+    `payload` may carry a single `compressed`/`raw_len` pair or a list of
+    them under `buffers`, in which case the 0x5c / data / 0x10 cycle runs
+    once per buffer inside a single 0x13 job. That is not a refactor for
+    its own sake: the device takes 419 bytes in 7 reports and refuses 695
+    in 11, with ink ruled out in between, so anything bigger than a small
+    label has to arrive as several buffers."""
     import time as _time
 
     say = on_step or (lambda *_a: None)
-    compressed = payload["compressed"]
-    raw_len = payload["raw_len"]
-    announced = len(compressed) if announce == "compressed" else raw_len
-    # 0x5c announces the bulk transfer and 0x10 reports the image length.
-    # The document names both "length" without saying whether either means
-    # the compressed byte count or the uncompressed image, so they are
-    # separately settable and default to the same thing.
-    if buffer_len is None:
-        buffered = announced
+    if "buffers" in payload:
+        buffers = [(bytes(c), int(n)) for c, n in payload["buffers"]]
     else:
-        buffered = len(compressed) if buffer_len == "compressed" else raw_len
+        buffers = [(payload["compressed"], payload["raw_len"])]
+
+    def lengths(compressed, raw_len):
+        announced = len(compressed) if announce == "compressed" else raw_len
+        # 0x5c announces the bulk transfer and 0x10 reports the image
+        # length. The document names both "length" without saying whether
+        # either means the compressed byte count or the uncompressed
+        # image, so they are separately settable and default to the same.
+        if buffer_len is None:
+            return announced, announced
+        return announced, (len(compressed) if buffer_len == "compressed"
+                           else raw_len)
 
     def check(dev, label):
         status = dev.status()
@@ -766,29 +830,38 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
         _time.sleep(settle)
         status = check(dev, "after start print")
 
-        # Buffer-full clear is the only backpressure the document names.
-        for _ in range(20):
-            if not status["buffer_full"]:
-                break
+        for index, (compressed, raw_len) in enumerate(buffers, 1):
+            of = f" ({index} of {len(buffers)})" if len(buffers) > 1 else ""
+            announced, buffered = lengths(compressed, raw_len)
+
+            # Buffer-full clear is the only backpressure the document
+            # names, and with several buffers it is doing real work rather
+            # than passing straight through: the device has to finish with
+            # one before it can be handed the next.
+            for _ in range(20):
+                if not status["buffer_full"]:
+                    break
+                _time.sleep(settle)
+                status = check(dev, f"waiting for buffer{of}")
+            else:
+                raise SupvanError("buffer stayed full; the device never "
+                                  "became ready for data")
+
+            say(f"announcing {announced} bytes (0x5c){of}", None, [])
+            dev.command(OP_NEXT_FRAME_IS_BULK, announced)
             _time.sleep(settle)
-            status = check(dev, "waiting for buffer")
-        else:
-            raise SupvanError("buffer stayed full; the device never became "
-                              "ready for data")
 
-        say(f"announcing {announced} bytes (0x5c)", None, [])
-        dev.command(OP_NEXT_FRAME_IS_BULK, announced)
-        _time.sleep(settle)
+            reports = dev.write(compressed)
+            say(f"streamed {len(compressed)} bytes in {reports} reports{of}",
+                None, [])
+            _time.sleep(settle)
 
-        reports = dev.write(compressed)
-        say(f"streamed {len(compressed)} bytes in {reports} reports", None, [])
-        _time.sleep(settle)
+            say(f"buffer full (0x10) len={buffered} speed={speed}{of}",
+                None, [])
+            dev.command(OP_BUFFER_FULL, buffered, speed)
+            _time.sleep(settle)
 
-        say(f"buffer full (0x10) len={buffered} speed={speed}", None, [])
-        dev.command(OP_BUFFER_FULL, buffered, speed)
-        _time.sleep(settle)
-
-        final = check(dev, "after buffer full")
+            status = final = check(dev, f"after buffer full{of}")
 
         # Wait for the job to finish, then clean up after ourselves if it
         # does not. Observed on the hardware: a job the device accepts but

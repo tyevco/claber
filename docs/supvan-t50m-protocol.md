@@ -404,6 +404,60 @@ the shape to expect, and the fix is to split the stream into buffers the
 way the vendor application is described as doing - each announced with
 `0x5c` and closed with `0x10` - rather than sending one long run.
 
+### It is the buffer size
+
+`--style scatter` was refused. That is the answer: it carried **0.26% ink**
+- the working end - in **695 bytes over 11 reports** - the failing end. Four
+measurements, with ink spanning both outcomes and size not:
+
+| stream | reports | ink | result |
+|---|---|---|---|
+| 123 B | 2 | 0.13% | prints |
+| 419 B | 7 | 0.13% | prints |
+| 695 B | 11 | 0.26% | **refused** |
+| 724 B | 12 | 7.54% | **refused** |
+
+So the device takes a limited amount of compressed data in one buffer,
+which is exactly why the vendor application is described as splitting
+large images into several. The captured print never needed it: at 123
+bytes it fits in one.
+
+The ceiling is somewhere in (419, 695]. It has not been bisected, because
+each attempt costs a label and the answer only moves the default. `448` -
+seven reports, the largest size seen to print - is what `split_bitmap`
+uses. **512 is the tempting guess** and buffers usually are powers of two,
+but nothing above 419 bytes has ever printed here, so it stays a guess.
+
+### Sending several buffers
+
+`split_bitmap` cuts the image into bands of whole rows, halving the band
+height until every band compresses under the limit. Each band is a
+**complete** LZMA stream carrying its own 13-byte header with its own
+declared length - not a slice of one long stream, which could not be
+decoded standing alone.
+
+The sequence puts all the bands inside **one** job:
+
+```
+0x12  check device
+0x13  start print
+      for each band:
+0x5c    announce this band's compressed length
+        stream it in 64-byte reports
+0x10    buffer full: length, speed 60
+        poll until buffer_full clears
+      poll until printing clears
+```
+
+One `0x13` for the job rather than one per band - a job per band would
+print each strip on its own label. The `buffer_full` flag is doing real
+work here for the first time: with a single buffer it passed straight
+through, and between bands it is what says the device is ready for more.
+
+**This is not yet confirmed on hardware.** It is the shape the four
+measurements imply and the vendor's described behaviour matches, which is
+not the same as having printed.
+
 ### `pages printed` is not a completion signal
 
 It read **0** immediately after a label came out. The reliable signal is
@@ -427,9 +481,10 @@ than print it. `--invert` is wrong for this device; the default is right.
   confirmed from the captured image, but which end of the row is dot 0
   and which end of the roll is row 0 are not. `--style sparse` is drawn
   asymmetrically so one printed label answers both.
-- **Whether stream size or report count matters.** Settled either way by
-  `--style scatter`; see the table above. 7 reports print, 12 do not, and
-  the boundary has not been found.
+- **The exact per-buffer ceiling.** Somewhere in (419, 695] bytes. Only
+  bisection settles it, at a label per attempt, and it only moves a
+  default - so it has been left alone.
+- **Whether the multi-buffer sequence is right.** Untested on hardware.
 
 ## If implementing
 
