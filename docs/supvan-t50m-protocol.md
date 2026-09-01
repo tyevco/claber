@@ -109,11 +109,11 @@ needs two parameters:
 | `0x12` | check device | asks whether the device can print; issued once per job |
 | `0x13` | start print | sent with wValue 1 |
 | `0x14` | stop print | |
-| `0x17` | read revision | |
-| `0x30` | return media info | |
+| `0x17` | read revision | replies with a length byte and an ASCII string; observed `04 32 2e 34 00` = **"2.4"** |
+| `0x30` | return media info | replies with **59 bytes** of high-entropy data — almost certainly the tag content the media carries, given `0x5d` writes label authentication |
 | `0x5c` | next frame is bulk | announces an LZMA-compressed bitmap; wValue is its length |
 | `0x5d` | set RFID data | label authentication |
-| `0xc5` | read firmware revision | |
+| `0xc5` | read firmware revision | replies status-shaped, 8 bytes, with byte 6 set to `0x01` on the observed unit; meaning undetermined |
 | `0xc6` | next frame is firmware | firmware update path — **do not send** |
 
 Note the vendor application also uses several large pseudo-opcodes (888,
@@ -124,10 +124,13 @@ reach the device.
 
 The device replies to a status poll with a 64-byte input report.
 
-**The report begins with one leading byte before the flags.** Observed as
-`0x08`, matching the `wLength` the command asks for, so it reads as "eight
-bytes follow". The offsets in the table below are relative to **the flags**,
-i.e. one byte further into the report than they appear on the wire.
+**Every reply begins with a length byte**, followed by that many bytes of
+payload; the rest of the 64-byte report is padding and means nothing.
+Confirmed across commands that answer with different lengths — status and
+firmware revision give 8, read-revision gives 4, media info gives 59 — so
+it is a length, not a marker. The offsets in the table below are relative
+to **the payload**, i.e. one byte further into the report than they appear
+on the wire.
 
 This was not in the original analysis and cost a false alarm: decoding from
 offset 0 made an idle, healthy printer report "media not recognised" while
@@ -161,7 +164,12 @@ Confirmed against the device, media cover closed then open:
 ```
 08 00 00 10 00 00     idle, cover closed  -> usb connected
 08 00 00 18 00 00     cover open          -> usb connected + cover open
+08 00 04 10 00 00     during check device -> usb connected + busy
 ```
+
+The third is independent confirmation of the offsets: `0x12` puts the
+device briefly busy while it rescans, and the bit that lights is the one
+the table calls busy — at that offset and nowhere else.
 
 Both decode cleanly once the leading byte is accounted for, and the cover
 bit is the one that moves. Two earlier "anomalies" — an undocumented bit at

@@ -249,17 +249,18 @@ ERROR_FLAGS = (
 # The page counter lives in bytes 4 and 5.
 PAGES_LOW, PAGES_HIGH = 4, 5
 
-# The device prefixes its status reply with one byte before the flags
-# begin. Observed as 0x08, which matches the wLength the command frame
-# asks for, so it reads as "eight bytes follow" - but the value is not
-# relied on, only its presence.
+# Every reply begins with a length byte, then that many bytes of payload.
+# Confirmed across three commands that answer with different lengths -
+# status and firmware revision give 8, read-revision gives 4, media info
+# gives 59 - so it is a length and not a constant marker.
 #
-# This cost a false alarm worth remembering. Decoding from offset 0 made
-# an idle, healthy printer report "media not recognised" while claiming
-# USB was disconnected on a device that was plainly answering over USB.
-# Settled by opening the media cover and polling: the byte that changed
-# was the one this offset predicts, not the one the naive reading did.
-# All flag offsets below are relative to the flags, not to the report.
+# This cost a false alarm worth remembering. Decoding the status flags
+# from offset 0 made an idle, healthy printer report "media not
+# recognised" while claiming USB was disconnected on a device that was
+# plainly answering over USB. Settled by opening the media cover and
+# polling: the byte that changed was the one this offset predicts, not
+# the one the naive reading did. All flag offsets below are relative to
+# the payload, not to the report.
 STATUS_PREFIX_LEN = 1
 STATUS_MIN_LEN = STATUS_PREFIX_LEN + 6
 
@@ -289,7 +290,11 @@ def decode_status(report):
             f"{STATUS_MIN_LEN} carry the leading byte, the flags and the "
             f"page counter")
 
-    flags = data[STATUS_PREFIX_LEN:]
+    flags = reply_payload(data)
+    if len(flags) < 6:
+        raise SupvanError(
+            f"status payload is {len(flags)} bytes; the flags and page "
+            f"counter need 6")
     status = {name: bool(flags[off] & mask)
               for name, off, mask in STATUS_FLAGS}
     # Little-endian: byte 5 is the high byte. Reading it the other way
@@ -443,6 +448,36 @@ def poll_status(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
     """Open, poll once, close. Raises SupvanError with a plain reason."""
     with SupvanDevice(path, timeout) as dev:
         return dev.status()
+
+
+def reply_payload(report):
+    """Strip the leading length byte and return that many bytes.
+
+    A reply shorter than its own length byte claims is a truncated read,
+    not something to decode around."""
+    data = bytes(report)
+    if not data:
+        raise SupvanError("empty reply")
+    length = data[0]
+    if length > len(data) - 1:
+        raise SupvanError(
+            f"reply says {length} bytes follow but only {len(data) - 1} "
+            f"arrived")
+    return data[1:1 + length]
+
+
+def decode_revision(report):
+    """The revision string from a read-revision reply.
+
+    The device answers with a length byte and an ASCII string - observed
+    as 4 bytes holding "2.4" and a NUL. Trailing NULs and padding are
+    dropped; anything unprintable means this is not a revision reply and
+    is worth seeing rather than silently cleaning up."""
+    payload = reply_payload(report).split(b"\x00", 1)[0]
+    text = payload.decode("ascii", "replace").strip()
+    if not text:
+        raise SupvanError("revision reply carried no text")
+    return text
 
 
 def probe_deep(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):

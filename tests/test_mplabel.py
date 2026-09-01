@@ -1965,6 +1965,19 @@ def test_a_cancelled_order_leaves_the_phone_queue(app):
 
 
 
+def _status_report(*values):
+    """A well-formed status reply: the device's length byte, then flags.
+
+    Building one by hand without the length byte is how these tests broke
+    when decode_status started honouring it - the payload came back empty
+    and every flag read false."""
+    report = bytearray(supvan.REPORT_SIZE)
+    report[0] = 8                      # eight bytes of payload follow
+    for offset, value in values:
+        report[supvan.STATUS_PREFIX_LEN + offset] = value
+    return bytes(report)
+
+
 class _FakeDevice(supvan.SupvanDevice):
     """A T50M Pro that records what it was told and answers with a canned
     report. Bypasses os entirely, so it runs anywhere."""
@@ -2087,16 +2100,14 @@ def test_supvan_status_flags_decode_one_bit_at_a_time(name, offset, mask):
     """Each flag, alone, against an otherwise clear report - so a wrong
     byte offset or a mask shared between two names shows up as two flags
     lighting at once rather than as a plausible-looking status line."""
-    report = bytearray(supvan.REPORT_SIZE)
-    report[supvan.STATUS_PREFIX_LEN + offset] = mask
-    status = supvan.decode_status(bytes(report))
+    status = supvan.decode_status(_status_report((offset, mask)))
     assert status[name] is True
     lit = [n for n, _o, _m in supvan.STATUS_FLAGS if status[n]]
     assert lit == [name]
 
 
 def test_supvan_a_clear_report_raises_nothing():
-    status = supvan.decode_status(b"\x00" * supvan.REPORT_SIZE)
+    status = supvan.decode_status(_status_report())
     assert status["pages_printed"] == 0
     assert status["errors"] == []
     assert not any(status[n] for n, _o, _m in supvan.STATUS_FLAGS)
@@ -2106,27 +2117,20 @@ def test_supvan_page_counter_is_little_endian():
     """Bytes 4 and 5, byte 5 the high byte. Read the other way round, one
     printed page reads as 256 and the mistake stays plausible for a long
     time."""
-    lo = supvan.STATUS_PREFIX_LEN + 4
-    hi = supvan.STATUS_PREFIX_LEN + 5
-    report = bytearray(supvan.REPORT_SIZE)
-    report[lo], report[hi] = 0x01, 0x00
-    assert supvan.decode_status(bytes(report))["pages_printed"] == 1
+    def pages(low, high):
+        return supvan.decode_status(
+            _status_report((4, low), (5, high)))["pages_printed"]
 
-    report[lo], report[hi] = 0x00, 0x01
-    assert supvan.decode_status(bytes(report))["pages_printed"] == 256
-
-    report[lo], report[hi] = 0x34, 0x12
-    assert supvan.decode_status(bytes(report))["pages_printed"] == 0x1234
+    assert pages(0x01, 0x00) == 1
+    assert pages(0x00, 0x01) == 256
+    assert pages(0x34, 0x12) == 0x1234
 
 
 def test_supvan_errors_are_separate_from_warnings():
     """Out of media stops a job; a low battery does not. The document says
     to abort on 'any error condition' without listing them, so this split
     is ours - keep it visible rather than folding warnings into errors."""
-    report = bytearray(supvan.REPORT_SIZE)
-    # out of media + battery low, past the device's leading byte
-    report[supvan.STATUS_PREFIX_LEN] = 0x04 | 0x40
-    status = supvan.decode_status(bytes(report))
+    status = supvan.decode_status(_status_report((0, 0x04 | 0x40)))
     assert status["out_of_media"] and status["battery_low"]
     assert status["errors"] == ["out_of_media"]
 
@@ -2134,10 +2138,11 @@ def test_supvan_errors_are_separate_from_warnings():
 def test_supvan_padding_past_byte_six_is_not_interpreted():
     """Only the first six bytes are documented. Whatever the device puts
     in the other 58 must not change the decode."""
-    clear = supvan.decode_status(b"\x00" * supvan.REPORT_SIZE)
-    noisy = supvan.decode_status(
-        b"\x00" * supvan.STATUS_MIN_LEN
-        + b"\xFF" * (supvan.REPORT_SIZE - supvan.STATUS_MIN_LEN))
+    clear = supvan.decode_status(_status_report())
+    padded = bytearray(_status_report())
+    padded[supvan.STATUS_MIN_LEN:] = b"\xFF" * (supvan.REPORT_SIZE
+                                                - supvan.STATUS_MIN_LEN)
+    noisy = supvan.decode_status(bytes(padded))
     assert {k: v for k, v in noisy.items() if k != "raw"} == \
            {k: v for k, v in clear.items() if k != "raw"}
 
@@ -2150,11 +2155,7 @@ def test_supvan_a_truncated_report_raises():
 
 
 def test_supvan_status_poll_sends_the_inquiry_and_decodes_the_reply():
-    reply = bytearray(supvan.REPORT_SIZE)
-    n = supvan.STATUS_PREFIX_LEN
-    reply[n + 2] = 0x10                        # USB connected
-    reply[n + 4], reply[n + 5] = 0x09, 0x00    # nine pages
-    dev = _FakeDevice(bytes(reply))
+    dev = _FakeDevice(_status_report((2, 0x10), (4, 0x09)))
 
     status = dev.status()
 
@@ -2184,6 +2185,47 @@ def test_supvan_decodes_the_real_captures(captured, expected):
     assert status["pages_printed"] == 0
     assert status["prefix"] == 0x08
     assert "media_not_recognised" not in lit, "the phantom error is back"
+
+
+@pytest.mark.parametrize("name,captured,length", [
+    ("status",   "08 00 00 10 00 00 00 00", 8),
+    ("check",    "08 00 04 10 00 00 00 00", 8),
+    ("revision", "04 32 2e 34 00",          4),
+    ("firmware", "08 00 00 10 00 00 00 01 00", 8),
+    ("media",    "3b 1d 4a 96 41 0c 10 80 4a bf 83 71 a2 63 36 f6", 59),
+])
+def test_supvan_every_reply_is_length_prefixed(name, captured, length):
+    """Real replies from the device. The leading byte is a length, not a
+    marker - these three differ (8, 4, 59), which is what settled it.
+
+    Decoding from offset 0 instead reported "media not recognised" on a
+    healthy printer, so this is pinned rather than left to memory."""
+    report = bytes.fromhex(captured.replace(" ", ""))
+    report += bytes(supvan.REPORT_SIZE - len(report))
+    assert len(supvan.reply_payload(report)) == length
+
+
+def test_supvan_check_device_reports_busy():
+    """Captured while the device rescanned itself. Byte 1 bit 0x04 is
+    'busy', and it lighting exactly there - and nowhere else - is
+    independent confirmation that the flag offsets are right."""
+    report = bytes.fromhex("080004100000000000")
+    report += bytes(supvan.REPORT_SIZE - len(report))
+    status = supvan.decode_status(report)
+    lit = {n for n, _o, _m in supvan.STATUS_FLAGS if status[n]}
+    assert lit == {"busy", "usb_connected"}
+    assert status["errors"] == []
+
+
+def test_supvan_revision_decodes_to_text():
+    report = bytes.fromhex("04322e3400") + bytes(supvan.REPORT_SIZE - 5)
+    assert supvan.decode_revision(report) == "2.4"
+
+
+def test_supvan_a_reply_shorter_than_its_length_byte_raises():
+    """A length byte promising more than arrived is a truncated read."""
+    with pytest.raises(supvan.SupvanError, match="arrived"):
+        supvan.reply_payload(b"\x3b\x01\x02")
 
 
 def test_supvan_safe_probe_list_excludes_everything_that_prints():

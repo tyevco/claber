@@ -806,8 +806,26 @@ def cmd_supvan_probe(cfg, args):
         shown = reply[:16]
         text = "".join(chr(b) if 32 <= b < 127 else "." for b in shown)
         print(f"{head} {shown.hex(' ')}  |{text}|")
-    print("\nReply formats for revision and media were never determined, so "
-          "these are raw.\nSend them on if you want them decoded.")
+
+        # Every reply is length-prefixed, so say how much of it is real.
+        # The rest is padding to fill the 64-byte report and means nothing.
+        try:
+            payload = supvan_mod.reply_payload(reply)
+        except supvan_mod.SupvanError as exc:
+            print(f"{' ' * len(head)} unframed: {exc}")
+            continue
+        note = f"{len(payload)} byte payload"
+        if opcode == supvan_mod.OP_READ_REVISION:
+            try:
+                note += f", revision {supvan_mod.decode_revision(reply)}"
+            except supvan_mod.SupvanError:
+                pass
+        elif opcode in (supvan_mod.OP_INQUIRY_STATUS,
+                        supvan_mod.OP_CHECK_DEVICE):
+            flags = supvan_mod.decode_status(reply)
+            lit = [n for n, _o, _m in supvan_mod.STATUS_FLAGS if flags[n]]
+            note += f", flags {', '.join(lit) or 'none'}"
+        print(f"{' ' * len(head)} {note}")
 
 
 def cmd_passwd():
