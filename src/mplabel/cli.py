@@ -853,6 +853,35 @@ def cmd_supvan_test_print(cfg, args):
             print("\nStill reporting 'printing'. Power cycle it.")
         return
 
+    if args.replay:
+        # Send a pre-made LZMA stream instead of generating one. The point
+        # is to separate two failures that look identical from here: a
+        # wrong command sequence, and a stream this firmware will not
+        # decode. Replaying bytes that are known to have printed on this
+        # device settles which one we have.
+        compressed = Path(args.replay).read_bytes()
+        print(f"device : {device}")
+        print(f"replay : {args.replay}, {len(compressed)} bytes")
+        print(f"         head {compressed[:13].hex(' ')}")
+        if args.dry_run:
+            print("\ndry run - nothing sent, no paper moved")
+            return
+        print("\nrunning the sequence:")
+
+        def replay_step(labeltext, status, lit):
+            print(f"  . {labeltext}" + (f": {', '.join(lit) or 'no flags'}"
+                                        if status else ""))
+        try:
+            final = supvan_mod.experimental_print(
+                {"compressed": compressed,
+                 "raw_len": int.from_bytes(compressed[5:13], "little")},
+                path=device, speed=args.speed, announce="compressed",
+                on_step=replay_step)
+        except supvan_mod.SupvanError as exc:
+            raise SystemExit(f"\nstopped: {exc}")
+        print(f"\npages printed now reads {final['pages_printed']}.")
+        return
+
     raw, stride, rows = supvan_mod.render_test_pattern(
         args.width, args.height, invert=args.invert)
     compressed = supvan_mod.compress_bitmap(
@@ -1287,6 +1316,11 @@ def main():
     p.add_argument("--device", help="hidraw node, default supvan_device")
     p.add_argument("--dry-run", action="store_true",
                    help="build everything and show it, send nothing")
+    p.add_argument("--replay", metavar="FILE",
+                   help="send a pre-made LZMA stream from FILE instead of "
+                        "generating one. Replaying bytes known to have "
+                        "printed separates a wrong sequence from a stream "
+                        "the firmware will not decode")
     p.add_argument("--width", type=int,
                    default=supvan_mod.DEFAULT_WIDTH_DOTS,
                    help="dots per row (default %(default)s, 48mm at 203dpi)")
