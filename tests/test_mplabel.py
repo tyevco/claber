@@ -2415,6 +2415,73 @@ def test_supvan_cli_defaults_to_the_device_encoder(monkeypatch, capsys):
     assert "size declared" in out
     assert "head 5d 00 20 00 00" in out
 
+def test_supvan_sparse_pattern_is_smaller_as_well_as_lighter():
+    """Both, or the experiment it exists for proves nothing.
+
+    The sparse pattern is there to test whether the device refuses a job
+    for having too much ink. The first attempt ruled both edges down the
+    full height, which cut the ink but made the *stream* bigger than the
+    blocks it replaced - and stream size is the other open suspect, so it
+    would have varied two things at once for a second time.
+
+    With no match coder a row holding one dot costs nearly what a row of
+    many costs, so keeping rows completely blank is what keeps the stream
+    small. The captured print that worked leaves 242 of 256 rows empty."""
+    from mplabel import lzma1
+
+    blocks, stride, rows = supvan.render_test_pattern(384, 256)
+    sparse, _s, _r = supvan.render_test_pattern(384, 256, style="sparse")
+
+    def ink(buf):
+        return sum(bin(b).count("1") for b in buf)
+
+    def blank_rows(buf):
+        return sum(1 for y in range(rows)
+                   if not any(buf[y * stride:(y + 1) * stride]))
+
+    assert ink(sparse) < ink(blocks) / 5
+    assert blank_rows(sparse) > blank_rows(blocks)
+    assert len(lzma1.compress(sparse)) < len(lzma1.compress(blocks))
+
+
+def test_supvan_sparse_pattern_is_still_asymmetric():
+    """A symmetric pattern reads as correct under a mirrored row order or
+    a flipped axis, which is most of what it is for."""
+    raw, stride, rows = supvan.render_test_pattern(384, 256, style="sparse")
+    top = raw[:stride * (rows // 2)]
+    bottom = raw[stride * (rows // 2):]
+    assert top != bottom[::-1]
+    assert sum(bin(b).count("1") for b in top) != \
+        sum(bin(b).count("1") for b in bottom)
+
+
+def test_supvan_reencode_holds_the_image_still(tmp_path, monkeypatch, capsys):
+    """--reencode varies the encoder and nothing else.
+
+    --replay sends the vendor's exact bytes and a generated pattern
+    changes both the encoder and the picture, so neither can say which of
+    the two a refusal belongs to. This decodes a captured stream and
+    re-encodes the identical image."""
+    import lzma
+    from mplabel import cli, lzma1
+
+    image, _s, _r = supvan.render_test_pattern(384, 256)
+    captured = tmp_path / "captured.lzma"
+    captured.write_bytes(lzma.compress(image, format=lzma.FORMAT_ALONE))
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run",
+                         "--reencode", str(captured)])
+    cli.main()
+    out = capsys.readouterr().out
+
+    assert f"{len(image)} bytes" in out
+    assert str(len(lzma1.compress(image))) in out, \
+        "the stream sent must be ours, not the captured one"
+    assert "head 5d 00 20 00 00" in out
+    assert "nothing sent" in out
+
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
 

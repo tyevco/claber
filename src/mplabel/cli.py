@@ -853,6 +853,46 @@ def cmd_supvan_test_print(cfg, args):
             print("\nStill reporting 'printing'. Power cycle it.")
         return
 
+    if args.reencode:
+        # Their image, our encoder. The one experiment that changes a
+        # single variable.
+        #
+        # The replay proved the sequence by sending the vendor's exact
+        # bytes. Generating our own changed two things at once: the
+        # encoder AND the picture - and their captured print is 99.9%
+        # blank where the test pattern is blocky. Re-encoding their image
+        # holds the picture still and asks only whether a literals-only
+        # stream is acceptable.
+        import lzma as _lzma
+        image = _lzma.decompress(Path(args.reencode).read_bytes(),
+                                 format=_lzma.FORMAT_ALONE)
+        compressed = supvan_mod.compress_bitmap(image)
+        ink = sum(bin(b).count("1") for b in image)
+        print(f"device : {device}")
+        print(f"source : {args.reencode}")
+        print(f"image  : {len(image)} bytes, {ink} set bits "
+              f"({100 * ink / (len(image) * 8):.2f}% ink)")
+        print(f"lzma   : {len(compressed)} bytes by our encoder, "
+              f"{-(-len(compressed) // 64)} reports")
+        print(f"         head {compressed[:13].hex(' ')}")
+        if args.dry_run:
+            print("\ndry run - nothing sent, no paper moved")
+            return
+        print("\nrunning the sequence:")
+
+        def reencode_step(labeltext, status, lit):
+            print(f"  . {labeltext}" + (f": {', '.join(lit) or 'no flags'}"
+                                        if status else ""))
+        try:
+            final = supvan_mod.experimental_print(
+                {"compressed": compressed, "raw_len": len(image)},
+                path=device, speed=args.speed, announce="compressed",
+                on_step=reencode_step)
+        except supvan_mod.SupvanError as exc:
+            raise SystemExit(f"\nstopped: {exc}")
+        print(f"\npages printed now reads {final['pages_printed']}.")
+        return
+
     if args.replay:
         # Send a pre-made LZMA stream instead of generating one. The point
         # is to separate two failures that look identical from here: a
@@ -883,7 +923,7 @@ def cmd_supvan_test_print(cfg, args):
         return
 
     raw, stride, rows = supvan_mod.render_test_pattern(
-        args.width, args.height, invert=args.invert)
+        args.width, args.height, invert=args.invert, style=args.style)
     compressed = supvan_mod.compress_bitmap(
         raw, args.lzma, dict_size=args.dict_size,
         declare_size=args.declare_size)
@@ -1321,6 +1361,17 @@ def main():
                         "generating one. Replaying bytes known to have "
                         "printed separates a wrong sequence from a stream "
                         "the firmware will not decode")
+    p.add_argument("--style", choices=["blocks", "sparse"],
+                   default="blocks",
+                   help="test pattern (default %(default)s). 'sparse' draws "
+                        "the same landmarks in outline: 0.2%% ink against "
+                        "7.6%%, close to the captured print that worked")
+    p.add_argument("--reencode", metavar="FILE",
+                   help="decode a captured LZMA stream and re-encode "
+                        "the same image with our encoder. Holds the "
+                        "picture still and varies only the encoder, "
+                        "which --replay and a generated pattern "
+                        "cannot separate")
     p.add_argument("--width", type=int,
                    default=supvan_mod.DEFAULT_WIDTH_DOTS,
                    help="dots per row (default %(default)s, 48mm at 203dpi)")

@@ -543,7 +543,7 @@ DEFAULT_WIDTH_DOTS = 384
 
 
 def render_test_pattern(width_dots=DEFAULT_WIDTH_DOTS, height_dots=120,
-                        invert=False):
+                        invert=False, style="blocks"):
     """A deliberately asymmetric 1-bit pattern, packed MSB-first.
 
     Asymmetric on purpose: a symmetric pattern comes out looking correct
@@ -565,14 +565,39 @@ def render_test_pattern(width_dots=DEFAULT_WIDTH_DOTS, height_dots=120,
         if 0 <= x < width_dots and 0 <= y < height_dots:
             rows[y * stride + (x >> 3)] |= 0x80 >> (x & 7)
 
-    for y in range(min(8, height_dots)):          # top bar
-        for x in range(width_dots):
-            dot(x, y)
-    for y in range(16, min(80, height_dots)):     # left square
-        for x in range(0, 64):
-            dot(x, y)
-    for y in range(height_dots):                  # right-edge rule
-        dot(width_dots - 1, y)
+    if style == "sparse":
+        # The same asymmetry drawn in outline. The captured print that is
+        # known to have worked is 0.13% ink; the blocks below are 7.6%,
+        # which is 60 times as much and a plausible reason for a refusal
+        # on a battery-powered head. This keeps every landmark - stride,
+        # origin, both edges - and almost none of the ink, so a failure
+        # here cannot be blamed on coverage.
+        # Leave as many rows *completely* blank as possible. That is not
+        # cosmetic: with no match coder a row containing one dot costs
+        # nearly as much as a row of many, so ruling both edges down the
+        # full height made the stream larger than the blocks it replaced -
+        # which would have confounded ink with size all over again. The
+        # captured print that worked leaves 242 of its 256 rows empty.
+        for x in range(width_dots):                # one rule across the top
+            dot(x, 0)
+        for x in range(64):                        # hollow square, left edge
+            dot(x, 16)
+            dot(x, min(79, height_dots - 1))
+        for y in range(17, min(79, height_dots)):
+            dot(0, y)
+            dot(63, y)
+        for y in range(8):                         # a tick on the right, so
+            dot(width_dots - 1, 24 + y)            # a mirrored row order or
+            dot(width_dots - 1, 200 + y)           # flipped axis still shows
+    else:
+        for y in range(min(8, height_dots)):      # top bar
+            for x in range(width_dots):
+                dot(x, y)
+        for y in range(16, min(80, height_dots)):  # left square
+            for x in range(0, 64):
+                dot(x, y)
+        for y in range(height_dots):              # right-edge rule
+            dot(width_dots - 1, y)
 
     if invert:
         rows = bytearray(b ^ 0xFF for b in rows)

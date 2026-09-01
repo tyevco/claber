@@ -359,14 +359,14 @@ retires two theories outright:
   status polling are all **correct**.
 - **The RFID/label authentication at `0x5d` is not required to print.**
   The replay never sends it.
-- **The `media_seating_error` was never about media.** It is what this
-  device reports when it cannot decode the stream. That is worth
-  remembering: a decode failure here is indistinguishable from a physical
-  fault, and chasing the roll costs labels for nothing.
+- **`media_seating_error` does not mean the media.** It is what this
+  device reports when it refuses a job, whatever the reason - the replay
+  printed on the same roll minutes later. It is reported *after* the head
+  positions, which makes it read as a physical fault. It is the same
+  answer for every rejection and therefore diagnoses nothing.
 
-So the only thing separating this repo from the vendor application was the
-compressed stream itself, and that narrowed to one property — the
-end-of-stream marker, above. `lzma1.py` now produces the vendor's shape,
+So the only thing separating this repo from the vendor application is the
+compressed stream itself. `lzma1.py` now produces the vendor's shape,
 header for header:
 
 ```
@@ -374,20 +374,51 @@ header for header:
 5d 00 20 00 00 00 30 00 00 00 00 00 00      mplabel supvan-test-print
 ```
 
+**And that is still refused.** The missing end-of-stream marker was a real
+difference and not the operative one. Decoding the captured image shows
+why the comparison was never as clean as it looked - it is **99.87%
+blank**, 124 set bits in 98304, 242 of its 256 rows completely empty.
+Against that, a generated test pattern differs in three measured ways at
+once:
+
+| | captured print | generated `blocks` |
+|---|---|---|
+| ink | 0.13% | 7.54% |
+| stream | 123 bytes, 2 reports | 724 bytes, 12 reports |
+| body | match-coded | literals only |
+
+Every attempt so far has varied all three together, which is why none of
+the failures could be attributed. The flags that separate them:
+
+- `--replay FILE` - their bytes, unchanged. Prints.
+- `--reencode FILE` - **their image, our encoder.** Varies the encoder
+  alone; the only test that can clear or convict `lzma1.py`.
+- `--style sparse` - our encoder, 0.66% ink and 9 reports. Moves ink and
+  size together towards the capture, once the encoder is cleared.
+
+### Bit polarity, settled without a label
+
+The captured image is **99.87% zero** and the label it printed is
+near-blank with a few lines of text. So **a set bit is a black dot** and
+zero is bare stock - the same sense as ZPL and ESC/POS, and the opposite
+of TSPL on the G4.
+
+That also explains an early experiment: `--invert` on a 7.5% pattern asks
+for a **92.5% black** label, and the device pulled the media back rather
+than print it. `--invert` is wrong for this device; the default is right.
+
 ### Still not determined
 
-The encoder is verified against liblzma but the *image* it encodes is
-still a guess in two respects, and both are cheap to settle now that a
-label can be produced:
-
-- **Bit polarity** — whether a set bit is a black dot or a white one.
-  `--invert` flips it. The test pattern is blocks, so the answer is
-  visible at a glance from one print.
-- **Row order and origin** — 48 bytes per row and 384 dots across are
-  confirmed from the captured image, but which end of the row is dot 0,
-  and which end of the roll is row 0, are not.
-
-Neither can be read off a capture; both need one label each.
+- **Row order and origin.** 48 bytes per row and 384 dots across are
+  confirmed from the captured image, but which end of the row is dot 0
+  and which end of the roll is row 0 are not. `--style sparse` is drawn
+  asymmetrically so one printed label answers both.
+- **Whether the firmware needs a match-coded body.** `lzma1.py` emits
+  literals only. Nothing says a decoder can reject that - it is valid
+  LZMA1 and liblzma reads it - but nothing has confirmed the firmware
+  accepts it either. `--reencode` is the test.
+- **Whether stream size or report count matters.** The one stream that
+  printed was 2 reports; everything refused has been 7 or more.
 
 ## If implementing
 
