@@ -28,3 +28,10 @@ dist/
 *.egg-info/
 venv/
 .venv/
+
+# Vendor material from protocol analysis. Reading it to interoperate is
+# fine; republishing it is not, and an Electron asar is 97MB besides.
+# docs/supvan-t50m-protocol.md is our own description of the behaviour.
+*.asar
+*.js.map
+vendor-extract/
