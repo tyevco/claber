@@ -428,6 +428,55 @@ seven reports, the largest size seen to print - is what `split_bitmap`
 uses. **512 is the tempting guess** and buffers usually are powers of two,
 but nothing above 419 bytes has ever printed here, so it stays a guess.
 
+### It is 512 bytes, and the encoder was too weak
+
+`--style sparse` was refused at 551 bytes, and that completes the picture.
+Every single-buffer measurement falls on one side of **512**:
+
+| stream | vs 512 | ink | blank rows | result |
+|---|---|---|---|---|
+| 123 B | under | 0.13% | 242/256 | prints |
+| 419 B | under | 0.13% | 242/256 | prints |
+| 551 B | over | 0.66% | 183/256 | refused |
+| 695 B | over | 0.26% | 0/256 | refused |
+| 724 B | over | 7.54% | 0/256 | refused |
+
+Ink and blank rows had looked like candidates. They are not, and the
+reason they tracked the outcome so convincingly is worth keeping: with a
+**literals-only** encoder, ink and blankness *determine* the compressed
+size. All three moved together because two of them caused the third.
+
+So there are two constraints, not one:
+
+1. declared size, no end-of-stream marker - which rules out liblzma;
+2. **at most ~512 compressed bytes in a single buffer** - which rules out
+   a literals-only encoder, because it cannot get 12288 bytes of bitmap
+   under 512 once there is any content on the label.
+
+`lzma1.py` now has match coding - a hash-chain finder, rep distances, the
+length and distance coders, and the state machine. The effect:
+
+| | literals only | with matches |
+|---|---|---|
+| captured image | 419 B | 134 B |
+| `blocks` | 724 B | 82 B |
+| `sparse` | 551 B | 95 B |
+| `scatter` | 695 B | 138 B |
+
+All well inside one buffer, so `split_bitmap` never fires on a normal
+label. It is kept for a taller image.
+
+**One bug in that encoder is worth recording**, because its failure mode
+is the kind that survives casual testing. A literal following a match is
+coded against the byte one match distance back; when a bit disagrees with
+that byte the context collapses to the plain literal tree, and the *index*
+must lose the match-bit half along with the offset. Adding it
+unconditionally corrupts a stream only when a literal follows a match and
+the match byte has a set bit after the first disagreement - so every
+uniform test bitmap round-tripped perfectly and the real captured image
+did not. Caught by testing against the captured image and by fuzzing, not
+by the tidy patterns.
+
 ### Correction: size was not isolated
 
 `--style scatter` was refused, and that was read as "size is the blocker".

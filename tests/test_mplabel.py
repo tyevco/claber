@@ -2416,43 +2416,37 @@ def test_supvan_cli_defaults_to_the_device_encoder(monkeypatch, capsys):
     assert "size declared" in out
     assert "head 5d 00 20 00 00" in out
 
-    # And the split path, which has no such flag to get wrong: every band
-    # carries the device header with its own length declared.
+    # And the splitting path, which has no such flag to get wrong: the
+    # band carries the device header with its own length declared, and
+    # never the 0xff...ff that means "size unknown".
     monkeypatch.setattr(sys, "argv",
                         ["mplabel", "supvan-test-print", "--dry-run"])
     cli.main()
     split = capsys.readouterr().out
-    heads = [l for l in split.splitlines() if "head 5d 00 20 00 00" in l]
-    assert len(heads) > 1
+    assert "head 5d 00 20 00 00" in split
     assert "ff ff ff ff" not in split
 
-def test_supvan_sparse_pattern_is_smaller_as_well_as_lighter():
-    """Both, or the experiment it exists for proves nothing.
+def test_supvan_the_diagnostic_patterns_still_bracket_the_ink_range():
+    """`sparse` and `scatter` were built to separate ink from stream size
+    back when the encoder had no matches and the two were coupled. With
+    match coding they are not: `blocks` is the *heaviest* pattern and now
+    compresses smallest of the three.
 
-    The sparse pattern is there to test whether the device refuses a job
-    for having too much ink. The first attempt ruled both edges down the
-    full height, which cut the ink but made the *stream* bigger than the
-    blocks it replaced - and stream size is the other open suspect, so it
-    would have varied two things at once for a second time.
-
-    With no match coder a row holding one dot costs nearly what a row of
-    many costs, so keeping rows completely blank is what keeps the stream
-    small. The captured print that worked leaves 242 of 256 rows empty."""
+    The styles are kept because the ink and blankness spread is still what
+    makes them useful for reading a printed label, but nothing may assume
+    an ordering by stream size any more - that was an artefact of an
+    encoder that could not code a repeat."""
     from mplabel import lzma1
-
-    blocks, stride, rows = supvan.render_test_pattern(384, 256)
-    sparse, _s, _r = supvan.render_test_pattern(384, 256, style="sparse")
 
     def ink(buf):
         return sum(bin(b).count("1") for b in buf)
 
-    def blank_rows(buf):
-        return sum(1 for y in range(rows)
-                   if not any(buf[y * stride:(y + 1) * stride]))
-
-    assert ink(sparse) < ink(blocks) / 5
-    assert blank_rows(sparse) > blank_rows(blocks)
-    assert len(lzma1.compress(sparse)) < len(lzma1.compress(blocks))
+    raws = {style: supvan.render_test_pattern(384, 256, style=style)[0]
+            for style in ("blocks", "sparse", "scatter")}
+    assert ink(raws["scatter"]) < ink(raws["sparse"]) < ink(raws["blocks"])
+    # and every one of them fits the device's single buffer
+    for style, raw in raws.items():
+        assert len(lzma1.compress(raw)) <= 512, style
 
 
 def test_supvan_sparse_pattern_is_still_asymmetric():
@@ -2493,26 +2487,21 @@ def test_supvan_reencode_holds_the_image_still(tmp_path, monkeypatch, capsys):
     assert "head 5d 00 20 00 00" in out
     assert "nothing sent" in out
 
-def test_supvan_scatter_holds_ink_low_and_pushes_the_stream_high():
-    """The diagnostic only works if it varies exactly one thing.
+def test_supvan_scatter_is_the_lightest_pattern():
+    """`scatter` was built to hold ink at the working end while pushing
+    the stream size to the failing end, back when the encoder had no
+    matches and one dot per row defeated compression.
 
-    On hardware the device printed 0.13% ink in 7 reports and refused
-    7.54% in 12. Both moved together, so either could be the cause.
-    `scatter` has to sit at the *working* end for ink and the *failing*
-    end for size, or it answers nothing - so both halves are asserted,
-    against the real measurements rather than against each other."""
+    Match coding took it from 695 bytes to 138, so the size half of that
+    is gone. What survives - and what it is kept for - is that it puts a
+    landmark in every row for almost no ink, which is the useful thing to
+    print when reading row order off a label."""
     from mplabel import lzma1
 
-    raw, stride, rows = supvan.render_test_pattern(384, 256, style="scatter")
+    raw, _stride, _rows = supvan.render_test_pattern(384, 256, style="scatter")
     ink = sum(bin(b).count("1") for b in raw) / (len(raw) * 8)
-    stream = len(lzma1.compress(raw))
-
-    # ink near the print that worked (0.13%), far from the one refused
-    assert ink < 0.005, f"{ink:.4%} is not low enough to clear ink"
-    # stream near the one refused (724 bytes / 12 reports), well past the
-    # one that printed (419 / 7)
-    assert stream > 600, f"{stream} bytes will not exercise size"
-    assert -(-stream // 64) >= 10
+    assert ink < 0.005, f"{ink:.4%} is not light enough to be useful"
+    assert len(lzma1.compress(raw)) <= 512
 
 
 def test_supvan_scatter_leaves_no_row_blank():
@@ -2572,8 +2561,11 @@ def test_supvan_each_buffer_is_a_complete_lzma_stream():
     import lzma
 
     raw, stride, _rows = supvan.render_test_pattern(384, 256)
-    bands = supvan.split_bitmap(raw, stride)
-    assert len(bands) > 1, "the test pattern must actually need splitting"
+    # A real label now compresses to well under one buffer, so the limit
+    # is forced down to make it split at all. The mechanics still have to
+    # be right: the device may yet need this for a taller image.
+    bands = supvan.split_bitmap(raw, stride, max_bytes=40)
+    assert len(bands) > 1, "the limit must actually force a split"
 
     rebuilt = b""
     for compressed, band_rows, raw_len in bands:
@@ -2626,24 +2618,25 @@ def test_supvan_multi_buffer_print_repeats_the_cycle_per_buffer(monkeypatch):
         assert int.from_bytes(frame[2:4], "big") == len(compressed)
 
 
-def test_supvan_cli_splits_by_default(monkeypatch, capsys):
-    """A whole-label stream is 724 bytes and the device refuses it, so
-    sending one buffer must not be what happens when nobody asks."""
+def test_supvan_a_whole_label_fits_one_buffer(monkeypatch, capsys):
+    """The point of the match coder, asserted through the real CLI.
+
+    The device takes at most 512 compressed bytes and printed nothing
+    above 419. Literals-only put a full 48x256 label at 551-724 bytes,
+    which is what those refusals were; with matches it is well under, so
+    the whole label goes in one buffer and `split_bitmap` never fires."""
     from mplabel import cli
 
     monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
-    monkeypatch.setattr(sys, "argv",
-                        ["mplabel", "supvan-test-print", "--dry-run"])
-    cli.main()
-    out = capsys.readouterr().out
-    assert "1 buffer(s)" not in out
-    assert "split at 448 bytes" in out
-
-    monkeypatch.setattr(sys, "argv",
-                        ["mplabel", "supvan-test-print", "--dry-run",
-                         "--max-buffer", "0"])
-    cli.main()
-    assert "724 bytes in 1 buffer(s)" in capsys.readouterr().out
+    for style in ("blocks", "sparse", "scatter"):
+        monkeypatch.setattr(sys, "argv",
+                            ["mplabel", "supvan-test-print", "--dry-run",
+                             "--style", style])
+        cli.main()
+        out = capsys.readouterr().out
+        size = int(re.search(r"lzma   : (\d+) bytes", out).group(1))
+        assert size <= 512, f"{style} is {size} bytes, over the device limit"
+        assert "in 1 buffer(s)" in out, style
 
 class _GoesQuiet(_FakeDevice):
     """Answers normally, then ignores `silences` reads, then answers again.
@@ -2695,6 +2688,75 @@ def test_supvan_a_device_that_never_answers_is_stopped_and_named(monkeypatch):
         supvan.experimental_print(
             {"compressed": b"\x00" * 8, "raw_len": 64}, settle=0)
     assert "power cycle" in str(exc.value)
+
+def test_lzma1_matched_literal_gating(monkeypatch):
+    """The bug that only some inputs could show.
+
+    A literal after a match is coded against the byte one match distance
+    back. Once a bit disagrees with that byte, the context collapses to
+    the plain literal tree - and the *index* has to lose the match-bit
+    half as well, not just the offset. Adding it unconditionally corrupts
+    a stream only when a literal follows a match AND the match byte has a
+    set bit after the first disagreement, so every uniform test bitmap
+    passed and the real captured image did not.
+
+    A pattern of alternating bytes forces exactly that shape."""
+    import lzma
+    from mplabel import lzma1
+
+    data = (b"\xf0\x0f" * 40) + b"\x55" + (b"\xf0\x0f" * 40) + b"\xaa\x33\xcc"
+    assert lzma.decompress(lzma1.compress(data),
+                           format=lzma.FORMAT_ALONE) == data
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_lzma1_round_trips_arbitrary_input(seed):
+    """liblzma is the reference and it is free to run, which is the whole
+    reason this encoder is testable at all. Four shapes: noise, two-tone
+    (a bitmap), a repeating period (rows), and a small alphabet."""
+    import lzma
+    import random
+    from mplabel import lzma1
+
+    rng = random.Random(seed)
+    n = rng.randrange(1, 2000)
+    shape = seed % 4
+    if shape == 0:
+        data = bytes(rng.randrange(256) for _ in range(n))
+    elif shape == 1:
+        data = bytes(rng.choice((0, 255)) for _ in range(n))
+    elif shape == 2:
+        period = bytes(rng.randrange(256) for _ in range(7))
+        data = (period * (n // 7 + 1))[:n]
+    else:
+        data = bytes(rng.randrange(3) for _ in range(n))
+
+    assert lzma.decompress(lzma1.compress(data),
+                           format=lzma.FORMAT_ALONE) == data
+
+
+def test_lzma1_fits_a_whole_label_in_one_device_buffer():
+    """The number that matters. The device takes at most 512 compressed
+    bytes and printed nothing above 419; literals-only put a full label at
+    551-724, which is what three refusals were."""
+    from mplabel import lzma1
+
+    for style in ("blocks", "sparse", "scatter"):
+        raw, _s, _r = supvan.render_test_pattern(384, 256, style=style)
+        assert len(raw) == 12288
+        assert len(lzma1.compress(raw)) <= 419, style
+
+
+def test_lzma1_still_beats_a_literal_only_encoding():
+    """Guards against a regression that would be silent otherwise: an
+    encoder that quietly stopped emitting matches would still round-trip
+    perfectly, and would simply fail on the device."""
+    from mplabel import lzma1
+
+    raw, _s, _r = supvan.render_test_pattern(384, 256)
+    # literals alone cannot do better than about a byte per distinct row
+    # context; 724 was the measured figure for this exact image.
+    assert len(lzma1.compress(raw)) < 300
 
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
