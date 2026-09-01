@@ -228,6 +228,40 @@ several compressed buffers, and chooses between per-buffer and combined
 packaging depending on the total compressed size, with a threshold in the
 low thousands of bytes.
 
+### What the experiment established
+
+`mplabel supvan-test-print` got as far as the device accepting a job and
+acting on it, but never to a printed label. What was learned:
+
+- **`0x5c`'s length is the number of bytes about to be streamed**, not the
+  uncompressed image size. Announcing 5760 and sending 67 made the device
+  stop answering entirely and require a power cycle — it blocks waiting
+  for the count it was promised.
+- **The job is genuinely accepted.** `0x13` sets `busy` and `printing`,
+  and the head performs a positioning move: on one attempt the media
+  audibly pulled back.
+- **It then ends in `media_seating_error`**, with `printing` clearing
+  after roughly a second. That is the device abandoning the job, not
+  hanging on the data — and it happened identically across every LZMA
+  container and dictionary size tried.
+- A stalled attempt leaves the media out of position, so the *next*
+  attempt reports a seating error before it can start. Reseat between
+  runs.
+
+That the failure is a **media** error, is reached after positioning, and
+does not change with the payload, points away from the bitmap encoding
+and towards the one step the experiment skips entirely: the label
+authentication at `0x5d`. The media itself is readable — `0x30` returns
+59 bytes of tag data and no error flags are set at rest — so this looks
+like a validation step the firmware requires before committing a job,
+rather than unreadable media.
+
+**Before more of this is guessed at**, print one label from the vendor's
+own phone application. Nothing here has ever confirmed that this printer
+and this roll can produce a label at all, which makes every negative
+result ambiguous: a protocol gap and a media problem look identical from
+this side.
+
 **Not yet determined**, and needed before anything can print:
 
 - the uncompressed row format — bytes per row, bit order, and whether a set
