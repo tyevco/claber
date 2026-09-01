@@ -523,4 +523,150 @@ def print_bitmap(*_args, **_kwargs):
         "48mm/203dpi, but the real constant is per-model), how media width "
         "and label length are communicated, and the RFID label "
         "authentication exchange (opcode 0x5d) are all undetermined. Use "
-        "`mplabel inventory` and the vendor editor until they are.")
+        "`mplabel inventory` and the vendor editor until they are, or "
+        "`mplabel supvan-test-print` to help settle them.")
+
+
+# ------------------------------------------------------- the experiment
+#
+# Everything below is a deliberate experiment, not a working print path.
+# The command sequence comes from the document; what goes inside the
+# compressed buffer does not, so the parameters that are guesses are
+# arguments rather than constants, and the failure modes are made as
+# legible as possible.
+#
+# 48mm at 203dpi is 383.5 dots, so 384 - 48 bytes a row - is the obvious
+# first guess, and the real constant is per-model.
+DEFAULT_WIDTH_DOTS = 384
+
+
+def render_test_pattern(width_dots=DEFAULT_WIDTH_DOTS, height_dots=120,
+                        invert=False):
+    """A deliberately asymmetric 1-bit pattern, packed MSB-first.
+
+    Asymmetric on purpose: a symmetric pattern comes out looking correct
+    under a mirrored row order or a flipped axis, and this is meant to
+    tell us which of those is happening.
+
+      - a solid bar across the top, which shows the row stride at a glance
+      - a filled square hard against the left edge
+      - a one-dot rule down the right edge
+
+    If the bytes-per-row guess is wrong the bar and the rule shear into
+    diagonals, and the angle says by how much. If the polarity is wrong
+    the label comes out mostly black. If the width is right and the
+    polarity is right, it looks like what it is."""
+    stride = (width_dots + 7) // 8
+    rows = bytearray(stride * height_dots)
+
+    def dot(x, y):
+        if 0 <= x < width_dots and 0 <= y < height_dots:
+            rows[y * stride + (x >> 3)] |= 0x80 >> (x & 7)
+
+    for y in range(min(8, height_dots)):          # top bar
+        for x in range(width_dots):
+            dot(x, y)
+    for y in range(16, min(80, height_dots)):     # left square
+        for x in range(0, 64):
+            dot(x, y)
+    for y in range(height_dots):                  # right-edge rule
+        dot(width_dots - 1, y)
+
+    if invert:
+        rows = bytearray(b ^ 0xFF for b in rows)
+    return bytes(rows), stride, height_dots
+
+
+def compress_bitmap(data, fmt="alone", preset=9):
+    """LZMA-compress a bitmap the way the device is thought to expect it.
+
+    The document establishes that the payload is LZMA. It does not
+    establish the container, and LZMA has several: the 13-byte "alone"
+    header, xz, and raw with no header at all. `alone` is the first guess
+    because it is what the JavaScript LZMA implementations in this class
+    of application emit, but it is a guess - hence the argument."""
+    import lzma
+
+    if fmt == "alone":
+        return lzma.compress(data, format=lzma.FORMAT_ALONE,
+                             filters=[{"id": lzma.FILTER_LZMA1,
+                                       "preset": preset}])
+    if fmt == "xz":
+        return lzma.compress(data, format=lzma.FORMAT_XZ, preset=preset)
+    if fmt == "raw":
+        return lzma.compress(data, format=lzma.FORMAT_RAW,
+                             filters=[{"id": lzma.FILTER_LZMA1,
+                                       "preset": preset}])
+    raise ValueError(f"unknown lzma container {fmt!r}")
+
+
+def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
+                       speed=1, announce="compressed", settle=0.2,
+                       on_step=None):
+    """Walk the documented print sequence with a compressed bitmap.
+
+    An experiment. The sequence is from the document; the guesses are the
+    arguments. Status is polled between every step and reported through
+    `on_step`, so a job that stalls says *where* it stalled - which is the
+    point of running it at all.
+
+    Stops at the first error flag rather than pushing on. A device that
+    has already refused is not going to be persuaded by more data, and
+    leaving it mid-job is how it ends up needing a power cycle.
+
+    `announce` decides what length goes in the 0x5c command: the
+    compressed size or the uncompressed one. The document says "its
+    length" without saying which, so it is a knob."""
+    import time as _time
+
+    say = on_step or (lambda *_a: None)
+    compressed = payload["compressed"]
+    raw_len = payload["raw_len"]
+    announced = len(compressed) if announce == "compressed" else raw_len
+
+    def check(dev, label):
+        status = dev.status()
+        lit = [n for n, _o, _m in STATUS_FLAGS if status[n]]
+        say(label, status, lit)
+        if status["errors"]:
+            raise SupvanError(
+                f"device reports {', '.join(status['errors'])} at step "
+                f"'{label}' - stopping rather than sending more")
+        return status
+
+    with SupvanDevice(path, timeout) as dev:
+        check(dev, "before anything")
+
+        dev.command(OP_CHECK_DEVICE)
+        dev.read_report()
+        _time.sleep(settle)
+        check(dev, "after check device")
+
+        dev.command(OP_START_PRINT, 1)
+        dev.read_report()
+        _time.sleep(settle)
+        status = check(dev, "after start print")
+
+        # Buffer-full clear is the only backpressure the document names.
+        for _ in range(20):
+            if not status["buffer_full"]:
+                break
+            _time.sleep(settle)
+            status = check(dev, "waiting for buffer")
+        else:
+            raise SupvanError("buffer stayed full; the device never became "
+                              "ready for data")
+
+        say(f"announcing {announced} bytes (0x5c)", None, [])
+        dev.command(OP_NEXT_FRAME_IS_BULK, announced)
+        _time.sleep(settle)
+
+        reports = dev.write(compressed)
+        say(f"streamed {len(compressed)} bytes in {reports} reports", None, [])
+        _time.sleep(settle)
+
+        say(f"buffer full (0x10) len={announced} speed={speed}", None, [])
+        dev.command(OP_BUFFER_FULL, announced, speed)
+        _time.sleep(settle)
+
+        return check(dev, "after buffer full")

@@ -2254,6 +2254,57 @@ def test_supvan_a_reply_shorter_than_its_length_byte_raises():
         supvan.reply_payload(b"\x3b\x01\x02")
 
 
+def test_supvan_test_pattern_is_asymmetric():
+    """A symmetric pattern looks correct under a mirrored row order or a
+    flipped axis, which is exactly what this is meant to detect."""
+    raw, stride, rows = supvan.render_test_pattern(384, 120)
+    assert stride == 48 and rows == 120 and len(raw) == 48 * 120
+
+    row = lambda n: raw[n * stride:(n + 1) * stride]
+    assert row(0) == b"\xFF" * stride, "no solid bar across the top"
+    assert row(0) != row(100), "top and bottom are indistinguishable"
+    middle = row(40)
+    assert middle[0] == 0xFF, "left square missing"
+    assert middle[stride - 1] == 0x01, "right edge rule missing"
+    assert middle[stride // 2] == 0x00, "the middle should be blank"
+
+
+def test_supvan_invert_flips_every_bit():
+    plain, _s, _r = supvan.render_test_pattern(384, 16)
+    flipped, _s, _r = supvan.render_test_pattern(384, 16, invert=True)
+    assert all(a ^ 0xFF == b for a, b in zip(plain, flipped))
+
+
+@pytest.mark.parametrize("fmt,magic", [
+    ("alone", b"\x5d\x00\x00"),      # LZMA1 properties byte then dict size
+    ("xz", b"\xfd7zXZ"),
+])
+def test_supvan_lzma_containers_differ(fmt, magic):
+    """Which container the firmware wants is unknown, so it is a flag -
+    and the containers have to actually differ for the flag to mean
+    anything."""
+    raw, _s, _r = supvan.render_test_pattern(384, 32)
+    assert supvan.compress_bitmap(raw, fmt).startswith(magic)
+
+
+def test_supvan_experimental_print_stops_on_an_error_flag(monkeypatch):
+    """A device that has already refused will not be persuaded by more
+    data, and leaving it mid-job is how it needs a power cycle."""
+    # out of media, reported the moment we ask
+    dev = _FakeDevice(_status_report((0, 0x04)))
+    monkeypatch.setattr(supvan, "SupvanDevice", lambda *a, **k: dev)
+
+    with pytest.raises(supvan.SupvanError, match="out_of_media"):
+        supvan.experimental_print({"compressed": b"\x00" * 8, "raw_len": 64},
+                                  path="fake")
+
+    # Polling to find out it refused is fine; anything that commits the
+    # device to a job is not.
+    opcodes = {frame[4] for frame in dev.sent if len(frame) > 4}
+    assert opcodes <= {supvan.OP_INQUIRY_STATUS}, \
+        f"sent {[hex(o) for o in opcodes]} after the device refused"
+
+
 def test_supvan_safe_probe_list_excludes_everything_that_prints():
     """SAFE_PROBE_OPCODES is a safety boundary, not a convenience list.
 

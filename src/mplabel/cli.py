@@ -828,6 +828,57 @@ def cmd_supvan_probe(cfg, args):
         print(f"{' ' * len(head)} {note}")
 
 
+def cmd_supvan_test_print(cfg, args):
+    """Try to print one test pattern on the label maker. An experiment.
+
+    Everything the document settles is fixed; everything it does not is a
+    flag, so a failed attempt is one command away from the next guess
+    rather than an edit. The pattern is deliberately asymmetric - a bar,
+    a square and an edge rule - because the useful information is in
+    *how* it comes out wrong."""
+    device = args.device or cfg.get("supvan_device",
+                                    supvan_mod.DEFAULT_DEVICE)
+    raw, stride, rows = supvan_mod.render_test_pattern(
+        args.width, args.height, invert=args.invert)
+    compressed = supvan_mod.compress_bitmap(raw, args.lzma)
+
+    print(f"device : {device}")
+    print(f"pattern: {args.width} dots wide, {stride} bytes/row, {rows} rows"
+          + (", inverted" if args.invert else ""))
+    print(f"raw    : {len(raw)} bytes")
+    print(f"lzma   : {len(compressed)} bytes, {args.lzma} container, "
+          f"head {compressed[:8].hex(' ')}")
+    print(f"announce {args.announce} length, speed {args.speed}")
+
+    if args.dry_run:
+        print("\ndry run - nothing sent, no paper moved")
+        return
+
+    def step(label, status, lit):
+        if status is None:
+            print(f"  . {label}")
+        else:
+            print(f"  . {label}: {', '.join(lit) or 'no flags'}")
+
+    print("\nrunning the sequence:")
+    try:
+        final = supvan_mod.experimental_print(
+            {"compressed": compressed, "raw_len": len(raw)},
+            path=device, speed=args.speed, announce=args.announce,
+            on_step=step)
+    except supvan_mod.SupvanError as exc:
+        raise SystemExit(f"\nstopped: {exc}")
+
+    print(f"\nfinished. pages printed now reads "
+          f"{final['pages_printed']}.")
+    print("If nothing came out, the page counter says whether the device "
+          "thought it printed.\nIf something came out, what is wrong with "
+          "it is the next clue:\n"
+          "  mostly black        -> try --invert\n"
+          "  sheared diagonally  -> the width is wrong; --width 320/352/384\n"
+          "  nothing at all      -> try --lzma xz|raw, or --announce raw")
+
+
 def cmd_passwd():
     """Print the `web_password_hash` line for mplabel.conf.
 
@@ -1206,6 +1257,26 @@ def main():
     p.add_argument("--deep", action="store_true",
                    help="also send the other read-only commands and show "
                         "their raw replies; still moves no paper")
+    p = sub.add_parser("supvan-test-print",
+                       help="EXPERIMENT: try to print a test pattern on the "
+                            "label maker. This one does move paper")
+    p.add_argument("--device", help="hidraw node, default supvan_device")
+    p.add_argument("--dry-run", action="store_true",
+                   help="build everything and show it, send nothing")
+    p.add_argument("--width", type=int,
+                   default=supvan_mod.DEFAULT_WIDTH_DOTS,
+                   help="dots per row (default %(default)s, 48mm at 203dpi)")
+    p.add_argument("--height", type=int, default=120,
+                   help="rows in the test pattern (default %(default)s)")
+    p.add_argument("--invert", action="store_true",
+                   help="flip the bit polarity")
+    p.add_argument("--lzma", choices=["alone", "xz", "raw"], default="alone",
+                   help="LZMA container (default %(default)s)")
+    p.add_argument("--announce", choices=["compressed", "raw"],
+                   default="compressed",
+                   help="which length 0x5c carries (default %(default)s)")
+    p.add_argument("--speed", type=int, default=1,
+                   help="speed value for 0x10 (default %(default)s)")
     p = sub.add_parser("scan", help="survey Facebook mail, change nothing")
     p.add_argument("--limit", type=int, default=2000)
     p = sub.add_parser("backfill", help="build listing history from old mail")
@@ -1272,6 +1343,9 @@ def main():
         # Same reasoning as selftest: this is a hardware test, and a
         # hardware test must not need the database.
         cmd_supvan_probe(cfg, args)
+        return
+    if args.cmd == "supvan-test-print":
+        cmd_supvan_test_print(cfg, args)
         return
     if args.cmd == "file":
         cmd_file(cfg, args)
