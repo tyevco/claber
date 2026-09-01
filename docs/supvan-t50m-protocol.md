@@ -428,7 +428,57 @@ seven reports, the largest size seen to print - is what `split_bitmap`
 uses. **512 is the tempting guess** and buffers usually are powers of two,
 but nothing above 419 bytes has ever printed here, so it stays a guess.
 
-### It is 512 bytes, and the encoder was too weak
+### The size hypothesis is dead
+
+`blocks` at **82 bytes in 2 reports** was refused - smaller than the
+vendor's own 123-byte capture, in the same two-report shape that has
+printed twice. So it is not 512, not 448, and not report count.
+
+Three conclusions were drawn and retracted here, all the same mistake:
+size was correlated with everything else that varied, so each new
+measurement looked like it confirmed size. With a literals-only encoder,
+ink and blankness *determine* the compressed size; once match coding broke
+that coupling, the correlation vanished and so did the hypothesis.
+
+What survives every measurement is blunt:
+
+> **The only bitmap that has ever printed is the vendor's own** - twice,
+> through two different encoders. Everything this repo draws has been
+> refused, at every size, ink level, blankness, buffer count and encoder
+> tried.
+
+That is what cleared the encoder, and it is also what says the remaining
+difference is in the *picture*.
+
+### The bounding box
+
+| | x range | y range | result |
+|---|---|---|---|
+| captured image | 0..**351** | 0..170 | prints |
+| `blocks` | 0..**383** | 0..255 | refused |
+| `sparse` | 0..**383** | 0..207 | refused |
+| `scatter` | 0..**383** | 0..255 | refused |
+
+Every refused image puts ink at **x=383**. The one that prints stops at
+**351** - and 352 dots is exactly 44 whole bytes, so the last four bytes
+of each of its rows are zero throughout.
+
+48mm at 203dpi is 383.5 dots, which is where 384 came from, but the
+*printable* width can easily be narrower than the head: die-cut stock has
+margins. A device that refuses an image with ink outside the printable
+region, and reports that refusal the only way it can, fits every
+observation here.
+
+`--clip WxH` blanks any dot at or beyond W across or H down and leaves
+the image size, row count and encoder untouched, so a clipped run differs
+from an unclipped one in exactly one thing. `--clip 352x171` reproduces
+the captured print's box.
+
+The `0x30` media-info reply is 59 bytes and has never been decoded. If the
+printable width is really 352, that reply is where the device says so -
+`mplabel supvan-probe --deep` reads it and moves no paper.
+
+### Superseded: "it is 512 bytes"
 
 `--style sparse` was refused at 551 bytes, and that completes the picture.
 Every single-buffer measurement falls on one side of **512**:

@@ -2758,6 +2758,52 @@ def test_lzma1_still_beats_a_literal_only_encoding():
     # context; 724 was the measured figure for this exact image.
     assert len(lzma1.compress(raw)) < 300
 
+def test_supvan_clip_blanks_ink_outside_the_box_and_keeps_the_size():
+    """`--clip` must change which dots are set and nothing else.
+
+    It is there to test one thing: the only bitmap that has ever printed
+    is the vendor's, whose ink stops at x=351 where every pattern here
+    runs to x=383. If clipping also changed the image size or the row
+    count it would vary three things at once, which is the mistake this
+    printer has already extracted twice."""
+    plain, stride, rows = supvan.render_test_pattern(384, 256)
+    clipped, cstride, crows = supvan.render_test_pattern(384, 256,
+                                                         clip=(352, 171))
+    assert (len(plain), stride, rows) == (len(clipped), cstride, crows)
+
+    def bbox(raw):
+        xs = [xb * 8 + k for y in range(rows) for xb in range(stride)
+              for k in range(8) if raw[y * stride + xb] & (0x80 >> k)]
+        ys = [y for y in range(rows) if any(raw[y * stride:(y + 1) * stride])]
+        return max(xs), max(ys)
+
+    assert bbox(plain) == (383, 255)
+    assert bbox(clipped) == (351, 79)
+
+
+def test_supvan_clip_only_removes_ink():
+    """Never sets a dot that was not already set - otherwise a clipped run
+    and an unclipped one differ by more than the clip."""
+    for style in ("blocks", "sparse", "scatter"):
+        plain, _s, _r = supvan.render_test_pattern(384, 256, style=style)
+        clipped, _s, _r = supvan.render_test_pattern(384, 256, style=style,
+                                                     clip=(352, 171))
+        for a, b in zip(plain, clipped):
+            assert b & ~a == 0, style
+
+
+def test_supvan_cli_rejects_a_malformed_clip(monkeypatch):
+    """A typo must not silently print an unclipped label - that would be
+    a wasted label reported as a result."""
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run",
+                         "--clip", "352"])
+    with pytest.raises(SystemExit, match="WxH"):
+        cli.main()
+
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
 

@@ -543,7 +543,7 @@ DEFAULT_WIDTH_DOTS = 384
 
 
 def render_test_pattern(width_dots=DEFAULT_WIDTH_DOTS, height_dots=120,
-                        invert=False, style="blocks"):
+                        invert=False, style="blocks", clip=None):
     """A deliberately asymmetric 1-bit pattern, packed MSB-first.
 
     Asymmetric on purpose: a symmetric pattern comes out looking correct
@@ -617,6 +617,28 @@ def render_test_pattern(width_dots=DEFAULT_WIDTH_DOTS, height_dots=120,
                 dot(x, y)
         for y in range(height_dots):              # right-edge rule
             dot(width_dots - 1, y)
+
+    if clip:
+        # Blank every dot outside a box, leaving the image the same size.
+        #
+        # This exists because of the one pattern that survives every
+        # measurement: the *only* bitmap that has ever printed is the
+        # vendor's own, and its ink stops at x=351 where everything drawn
+        # here runs to x=383. 352 dots is 44 whole bytes, which looks a lot
+        # like a printable width narrower than the 384-dot head. Clipping
+        # changes only which dots are set, so a run of the same pattern
+        # with and without it differs in one thing.
+        max_x, max_y = clip
+        for y in range(height_dots):
+            for xb in range(stride):
+                if y >= max_y:
+                    rows[y * stride + xb] = 0
+                    continue
+                keep = 0
+                for k in range(8):
+                    if xb * 8 + k < max_x:
+                        keep |= 0x80 >> k
+                rows[y * stride + xb] &= keep
 
     if invert:
         rows = bytearray(b ^ 0xFF for b in rows)

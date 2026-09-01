@@ -204,7 +204,7 @@ hardware or a real Facebook account.
 | Parcel code placement | **Verified.** The 3-character code renders upright in the header strip above the label's border, top right, clear of the postage indicia, the addresses and the tracking barcode. Checked by rendering for the widest code the alphabet allows (`WWW`) as well as an all-digit one, and both right-align on the same margin. Confirmed on the label output; **not yet** confirmed on a thermal print, where edge margins are tighter, nor scanner-tested. |
 | The T50M Pro is a HID device, not a printer | **Verified on the hardware.** USB `1820:207f`, enumerating as a vendor-defined HID pipe (usage page 0xFF00) *plus* a fake CD-ROM holding the Windows installer. No usblp binding, so it has **no /dev/usb/lpN** - writes go to `/dev/hidraw0`. Its report descriptor declares 64-byte input and output reports with **no Report ID**, so a hidraw write is 65 bytes: a leading `0x00` then the 64-byte payload. Bidirectional, so it can be asked for status before anything is printed. `udev/99-supvan-t50m.rules` makes the node group-writable; without it the node is root-only. **`/dev/usb/lp0` is the G4** - do not confuse them. |
 | The T50M Pro's command sequence | **Verified on the hardware: a replayed stream printed a label.** `mplabel supvan-test-print --replay <file>` sent 123 bytes captured from the vendor app and the printer produced the label. So the transport, the frames, the `0x5c` announce carrying the compressed length, the `0x10` buffer-full with its second value of 60, and the status polling are all correct - this repo can drive the device. Six frames are pinned byte-for-byte against a USBPcap capture. |
-| Generating the bitmap stream | **Two constraints, both measured, and the encoder now satisfies both.** The device wants a declared size with **no end-of-stream marker** (Python's `lzma` cannot emit that), and **at most ~512 compressed bytes in one buffer** - 123 and 419 printed, 551, 695 and 724 were refused, and 512 is the only boundary that separates all five. `lzma1.py` now has match coding, which takes a full 48x256 label from 551-724 bytes to **82-138**, comfortably inside. Verified against liblzma over 60 generated payloads plus every real pattern; **not yet confirmed on paper.** Note ink and blank rows looked like causes for a while and were not: with a literals-only encoder they *determine* the stream size, so all three moved together. |
+| Generating the bitmap stream | **The encoder is right; the image is not, and the reason is still open.** Two encoder constraints are settled and satisfied - a declared size with **no end-of-stream marker**, and match coding so a label is 82-138 bytes rather than 551-724. Both verified against liblzma (60 generated payloads, 400-case fuzz, zero failures). **The size hypothesis is dead**: 82 bytes in 2 reports was refused, so it is not 512, not 448, not report count. The one pattern that survives every measurement is blunt - **the only bitmap that has ever printed is the vendor's own**, twice, through two different encoders. Its ink stops at **x=351, y=170**; every pattern this repo draws runs to x=383. 352 dots is 44 whole bytes, so a printable width narrower than the 384-dot head is the live candidate. `--clip WxH` blanks ink outside a box and changes nothing else. |
 | The T50M Pro's payload protocol | **Verified on the hardware, except the raster's orientation.** `supvan-probe` settled the 65-byte hidraw write with its leading `0x00`, the 8-byte frame with its big-endian `wValue`, and the byte-0 flags. The status reply carries **one leading byte before the flags** (`STATUS_PREFIX_LEN`), which the analysis missed: decoding from offset 0 reported "media not recognised" on a healthy idle printer, and opening the media cover and re-polling showed the byte that moved was the one the offset predicts. Both captures are pinned as tests, as are six command frames from a USBPcap capture. The bulk data is **bare 64-byte reports after the `0x5c` announce** - no wrapper; the Bluetooth capture's `0xbb`/`10 02 aa` framing is RFCOMM's and belongs to that transport only. **The `0x5d` label authentication is not required to print** - the replay never sends it. **Bit polarity is settled without a label**: the captured image is 99.87% zero and printed near-blank, so a set bit is a black dot - the ZPL sense, opposite to TSPL on the G4, and `--invert` is wrong here (it asks for a 92.5% black label, which is what made the media pull back). Still unknown: row order and origin. See `docs/supvan-t50m-protocol.md`. |
 | The raw data path works | **Verified on the hardware:** bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. If a label comes out wrong from here, suspect the raster or the geometry, not the transport. |
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
@@ -334,11 +334,20 @@ Before spending a label, tabulate size, ink, blank rows and longest inked
 run for the new image against the one known to print, and confirm exactly
 one differs.
 
-**`split_bitmap` no longer fires, and that is the intended state.** With
-match coding a whole label is 82-138 bytes, so it goes in one buffer -
-the only shape the device has ever printed. The splitter is kept for a
-taller image and its mechanics are tested against a forced-low limit, but
-a run that splits is a sign the image got much bigger, not a normal one.
+**Stream size is not what the device objects to.** 82 bytes in two
+reports was refused, having been reached by way of three wrong
+conclusions - 448 bytes, then 512, then report count - each of which
+looked settled because size correlated with everything else that varied.
+`split_bitmap` and `--max-buffer` are kept because their mechanics are
+tested and a taller image may yet need them, but they solve a problem
+that was never demonstrated to exist.
+
+**The only bitmap that has ever printed is the vendor's own.** Twice, once
+through their encoder and once through ours - which is what cleared the
+encoder. Everything this repo *draws* has been refused, at every size, ink
+level, blankness and buffer count tried. When reaching for the next
+hypothesis, start from that sentence rather than from the last number that
+moved.
 
 **A silent encoder regression would look exactly like a device fault.**
 An encoder that stopped emitting matches would still round-trip through

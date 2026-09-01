@@ -922,8 +922,16 @@ def cmd_supvan_test_print(cfg, args):
         print(f"\npages printed now reads {final['pages_printed']}.")
         return
 
+    clip = None
+    if args.clip:
+        try:
+            cw, ch = (int(v) for v in args.clip.lower().split("x"))
+        except ValueError:
+            raise SystemExit(f"--clip wants WxH, not {args.clip!r}")
+        clip = (cw, ch)
     raw, stride, rows = supvan_mod.render_test_pattern(
-        args.width, args.height, invert=args.invert, style=args.style)
+        args.width, args.height, invert=args.invert, style=args.style,
+        clip=clip)
     if args.max_buffer:
         bands = supvan_mod.split_bitmap(raw, stride, args.max_buffer,
                                         dict_size=args.dict_size)
@@ -1393,6 +1401,14 @@ def main():
                         "this many compressed bytes (default %(default)s, "
                         "7 reports, the largest seen to print). 0 sends "
                         "one buffer however big it is")
+    # The only bitmap that has ever printed is the vendor's own, whose
+    # ink stops at x=351 where every pattern here runs to x=383. 352
+    # dots is 44 whole bytes. --clip tests that directly by blanking
+    # everything outside a box, leaving the image size unchanged.
+    p.add_argument("--clip", metavar="WxH",
+                   help="blank any dot at or beyond W across or H "
+                        "down, keeping the image the same size. Their "
+                        "print fits 352x171")
     p.add_argument("--style", choices=["blocks", "sparse", "scatter"],
                    default="blocks",
                    help="test pattern (default %(default)s). 'sparse' draws "
