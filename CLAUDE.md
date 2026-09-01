@@ -57,6 +57,7 @@ run against a real database.
 | `file <pdf> [-o] [--rotate] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
 | `probe` | printers, USB devices, IEEE-1284 id |
 | `selftest` | tiny text-only TSPL label |
+| `supvan-probe [--device]` | status of the 48mm inventory label maker. Reads only - moves no paper |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
 | `pending [--since] [--all] [--dry-run]` | labels recorded but never printed; today only by default |
@@ -70,8 +71,8 @@ run against a real database.
 | `inventory [-o F] [--state S] [--all]` | CSV of inventory labels for the label maker |
 | `sheets [--dry-run]` | push to Google Sheets |
 
-`probe`, `selftest` and `file` run above `connect_db` in `main()` - see
-the note below on why.
+`probe`, `selftest`, `supvan-probe` and `file` run above `connect_db` in
+`main()` - see the note below on why.
 
 ## Deploying to the Pi
 
@@ -200,7 +201,7 @@ hardware or a real Facebook account.
 | **The IEEE-1284 id lies on this unit** | **Verified.** `probe` reads `MANUFACTURER:Clabel-;COMMAND SET:ESC/POS;MODEL:G4;COMMENT:Impact Printer;ACTIVE COMMAND:ESC/POS;` — every word of which points at ESC/POS, and it is wrong. The same string calls this thermal printer an "Impact Printer", so the descriptor is boilerplate the OEM never edited. An ESC/POS text selftest printed *nothing*, which is what a TSPL parser does with commands it does not recognise. Do not switch backends on the strength of the id; print something first. USB `28e9:02ad`, CUPS sees `usb://Clabel-/G4`. |
 | Parcel code placement | **Verified.** The 3-character code renders upright in the header strip above the label's border, top right, clear of the postage indicia, the addresses and the tracking barcode. Checked by rendering for the widest code the alphabet allows (`WWW`) as well as an all-digit one, and both right-align on the same margin. Confirmed on the label output; **not yet** confirmed on a thermal print, where edge margins are tighter, nor scanner-tested. |
 | The T50M Pro is a HID device, not a printer | **Verified on the hardware.** USB `1820:207f`, enumerating as a vendor-defined HID pipe (usage page 0xFF00) *plus* a fake CD-ROM holding the Windows installer. No usblp binding, so it has **no /dev/usb/lpN** - writes go to `/dev/hidraw0`. Its report descriptor declares 64-byte input and output reports with **no Report ID**, so a hidraw write is 65 bytes: a leading `0x00` then the 64-byte payload. Bidirectional, so it can be asked for status before anything is printed. `udev/99-supvan-t50m.rules` makes the node group-writable; without it the node is root-only. **`/dev/usb/lp0` is the G4** - do not confuse them. |
-| The T50M Pro's payload protocol | **Recovered, not yet exercised.** See `docs/supvan-t50m-protocol.md`: 8-byte command frames (`C0 40 <wValue> <opcode> 00 08 00`) padded into 64-byte reports, the opcode table, the status bits, the print sequence, and the fact that the bitmap is **LZMA** compressed - which Python's stdlib covers, so no new dependency. Still unknown: the uncompressed row format and bit polarity, the exact dot width, and the RFID label authentication. Nothing here drives the device yet. |
+| The T50M Pro's payload protocol | **Recovered, not yet exercised.** See `docs/supvan-t50m-protocol.md`: 8-byte command frames (`C0 40 <wValue> <opcode> 00 08 00`) padded into 64-byte reports, the opcode table, the status bits, the print sequence, and the fact that the bitmap is **LZMA** compressed - which Python's stdlib covers, so no new dependency. Still unknown: the uncompressed row format and bit polarity, the exact dot width, and the RFID label authentication. `supvan.py` implements the parts the document does settle - the 65-byte hidraw write, the frame builders, the opcode names, the status decode and `supvan-probe` - **written from that document only and never run against the hardware**, so every line of it is ASSUMED until someone plugs the thing in. Nothing prints. |
 | The raw data path works | **Verified on the hardware:** bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. If a label comes out wrong from here, suspect the raster or the geometry, not the transport. |
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
 | `escpos` backend | **UNUSED and unproven.** Written while the id was believed, kept because the job structure is unit-tested and some sibling models really do speak ESC/POS. Nothing it produces has ever printed. Its banding size and trailing form feed are guesses. |
@@ -276,7 +277,8 @@ must be shared with the service account's `client_email` as Editor: it is
 a separate identity, and until it is shared every write is a 403 no matter
 how good the key is.
 
-**A printer test must not need the database.** `probe`, `selftest` and
+**A printer test must not need the database.** `probe`, `selftest`,
+`supvan-probe` and
 `file` run above `connect_db` in `main()`, because an unwritable home
 directory once stopped a printer test dead - which is the one thing you
 want working when nothing else is. `cmd_file` takes no `conn` at all.
@@ -302,9 +304,13 @@ by state, where `allocate_code` deliberately does.
 
 **Nothing here drives the label maker.** The KATA/SUPVAN T50M Pro is a
 48mm consumer label maker, and it takes work only through SUPVAN's own
-editor over Bluetooth or USB - there is no raw command language to send.
-So `mplabel inventory` writes a CSV and stops; the join is a file, not a
-printer backend. It is written **utf-8-sig**, because her titles carry
+editor over Bluetooth or USB. There *is* a command language - see
+`docs/supvan-t50m-protocol.md` and `supvan.py`, which speaks enough of it
+to poll status - but not enough of it is known to put ink on a label:
+the row format, the bit polarity, the dot width and the RFID label
+authentication are all undetermined, and `supvan.print_bitmap` raises
+saying so. So `mplabel inventory` writes a CSV and stops; the join is a
+file, not a printer backend. It is written **utf-8-sig**, because her titles carry
 accents and curly quotes and Excel on Windows reads a plain utf-8 CSV as
 mojibake - and whatever the editor shows is what gets printed. It cannot
 print 4x6 shipping labels either: 48mm is 384 dots against the 812 the

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from mplabel import label, listings, mailparse, savedpage, sheets
+from mplabel import label, listings, mailparse, savedpage, sheets, supvan
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LABEL_PDF = FIXTURES / "label_sample.pdf"
@@ -1953,3 +1953,257 @@ def test_a_cancelled_order_leaves_the_phone_queue(app):
 
     _, _, body = _http(f"{base}/api/pending", cookie=cookie)
     assert json.loads(body)["pending"] == []
+
+# ------------------------------------------------ the inventory label maker
+#
+# The SUPVAN/KATA T50M Pro is a vendor-defined HID device, not a printer,
+# and none of this has ever run against the hardware - it is written from
+# docs/supvan-t50m-protocol.md alone. So these tests pin the two things a
+# document can settle: the exact bytes on the wire, and the meaning of the
+# bytes coming back. There is no /dev/hidraw0 here and there must never
+# need to be; the "device" is a temp file or a stub.
+
+
+
+class _FakeDevice(supvan.SupvanDevice):
+    """A T50M Pro that records what it was told and answers with a canned
+    report. Bypasses os entirely, so it runs anywhere."""
+
+    def __init__(self, reply=b"\x00" * supvan.REPORT_SIZE):
+        super().__init__(path="fake", timeout=0)
+        self.reply = reply
+        self.sent = []
+
+    def open(self):
+        return self
+
+    def close(self):
+        pass
+
+    def write(self, payload):
+        self.sent.append(bytes(payload))
+        return len(supvan.split_reports(payload))
+
+    def read_report(self, timeout=None):
+        return self.reply
+
+
+def _fake_node(tmp_path):
+    """A file standing in for the hidraw node. It has to exist already:
+    the real one does, and open() deliberately does not pass O_CREAT."""
+    node = tmp_path / "hidraw0"
+    node.write_bytes(b"")
+    return node
+
+
+def test_supvan_write_carries_the_report_id_byte(tmp_path):
+    """65 bytes per report, not 64. The descriptor declares no Report ID,
+    but a Linux hidraw write still needs the leading 0x00 - and without it
+    the device ignores the write silently rather than complaining, so
+    there is nothing to notice at runtime."""
+    node = _fake_node(tmp_path)
+    with supvan.SupvanDevice(node) as dev:
+        assert dev.write(b"\xAA\xBB") == 1
+
+    raw = node.read_bytes()
+    assert len(raw) == supvan.WRITE_SIZE == 65
+    assert raw[0] == 0x00
+    assert raw[1:3] == b"\xAA\xBB"
+    assert raw[3:] == b"\x00" * (supvan.REPORT_SIZE - 2)   # zero-padded
+
+
+def test_supvan_splits_a_long_payload_across_reports(tmp_path):
+    """A payload longer than one report becomes consecutive whole reports,
+    each with its own id byte, and only the last one is padded."""
+    node = _fake_node(tmp_path)
+    payload = bytes(range(100))                 # 64 + 36
+    with supvan.SupvanDevice(node) as dev:
+        assert dev.write(payload) == 2
+
+    raw = node.read_bytes()
+    assert len(raw) == 2 * supvan.WRITE_SIZE
+    first, second = raw[:65], raw[65:]
+    assert first[0] == 0x00 and second[0] == 0x00
+    assert first[1:] == payload[:64]
+    assert second[1:37] == payload[64:]
+    assert second[37:] == b"\x00" * 28
+    # And the framing helper agrees with what actually reached the node.
+    assert supvan.wire_bytes(payload) == raw
+
+
+def test_supvan_empty_payload_is_still_one_report():
+    """Sending nothing must not look like sending something."""
+    assert len(supvan.split_reports(b"")) == 1
+    assert supvan.split_reports(b"")[0] == b"\x00" * 64
+
+
+def test_supvan_command_frame_is_eight_bytes():
+    frame = supvan.build_command(supvan.OP_INQUIRY_STATUS)
+    assert frame == bytes([0xC0, 0x40, 0x00, 0x00, 0x11, 0x00, 0x08, 0x00])
+
+
+def test_supvan_wvalue_goes_out_high_byte_first():
+    """The opposite order to the page counter in the status report. That
+    is what the document records for each; do not make them agree."""
+    frame = supvan.build_command(supvan.OP_NEXT_FRAME_IS_BULK, 0x1234)
+    assert frame[2] == 0x12 and frame[3] == 0x34
+    assert frame[4] == 0x5C
+
+
+def test_supvan_two_value_frame_appends_ten_bytes():
+    """The ten-byte variant appends a second 16-bit value and changes
+    nothing else - wLength stays 8."""
+    frame = supvan.build_command(supvan.OP_BUFFER_FULL, 0x0102, 0x0304)
+    assert len(frame) == 10
+    assert frame[:8] == bytes([0xC0, 0x40, 0x01, 0x02, 0x10, 0x00, 0x08, 0x00])
+    assert frame[8:] == b"\x03\x04"
+
+
+def test_supvan_a_command_pads_to_exactly_one_report(tmp_path):
+    node = _fake_node(tmp_path)
+    with supvan.SupvanDevice(node) as dev:
+        dev.command(supvan.OP_BUFFER_FULL, 1, 2)
+    raw = node.read_bytes()
+    assert len(raw) == supvan.WRITE_SIZE
+    assert raw[11:] == b"\x00" * (supvan.WRITE_SIZE - 11)   # id + 10 bytes
+
+
+def test_supvan_refuses_to_build_the_firmware_opcode():
+    """0xc6 is the firmware update path. The document says do not send it,
+    so it cannot be built by accident either."""
+    with pytest.raises(ValueError, match="firmware"):
+        supvan.build_command(supvan.OP_NEXT_FRAME_IS_FIRMWARE, 1)
+
+
+def test_supvan_rejects_out_of_range_values():
+    with pytest.raises(ValueError):
+        supvan.build_command(supvan.OP_START_PRINT, 0x10000)
+    with pytest.raises(ValueError):
+        supvan.build_command(supvan.OP_BUFFER_FULL, 1, -1)
+
+
+@pytest.mark.parametrize("name,offset,mask", supvan.STATUS_FLAGS)
+def test_supvan_status_flags_decode_one_bit_at_a_time(name, offset, mask):
+    """Each flag, alone, against an otherwise clear report - so a wrong
+    byte offset or a mask shared between two names shows up as two flags
+    lighting at once rather than as a plausible-looking status line."""
+    report = bytearray(supvan.REPORT_SIZE)
+    report[offset] = mask
+    status = supvan.decode_status(bytes(report))
+    assert status[name] is True
+    lit = [n for n, _o, _m in supvan.STATUS_FLAGS if status[n]]
+    assert lit == [name]
+
+
+def test_supvan_a_clear_report_raises_nothing():
+    status = supvan.decode_status(b"\x00" * supvan.REPORT_SIZE)
+    assert status["pages_printed"] == 0
+    assert status["errors"] == []
+    assert not any(status[n] for n, _o, _m in supvan.STATUS_FLAGS)
+
+
+def test_supvan_page_counter_is_little_endian():
+    """Bytes 4 and 5, byte 5 the high byte. Read the other way round, one
+    printed page reads as 256 and the mistake stays plausible for a long
+    time."""
+    report = bytearray(supvan.REPORT_SIZE)
+    report[4], report[5] = 0x01, 0x00
+    assert supvan.decode_status(bytes(report))["pages_printed"] == 1
+
+    report[4], report[5] = 0x00, 0x01
+    assert supvan.decode_status(bytes(report))["pages_printed"] == 256
+
+    report[4], report[5] = 0x34, 0x12
+    assert supvan.decode_status(bytes(report))["pages_printed"] == 0x1234
+
+
+def test_supvan_errors_are_separate_from_warnings():
+    """Out of media stops a job; a low battery does not. The document says
+    to abort on 'any error condition' without listing them, so this split
+    is ours - keep it visible rather than folding warnings into errors."""
+    report = bytearray(supvan.REPORT_SIZE)
+    report[0] = 0x04 | 0x40                    # out of media + battery low
+    status = supvan.decode_status(bytes(report))
+    assert status["out_of_media"] and status["battery_low"]
+    assert status["errors"] == ["out_of_media"]
+
+
+def test_supvan_padding_past_byte_six_is_not_interpreted():
+    """Only the first six bytes are documented. Whatever the device puts
+    in the other 58 must not change the decode."""
+    clear = supvan.decode_status(b"\x00" * supvan.REPORT_SIZE)
+    noisy = supvan.decode_status(b"\x00" * 6 + b"\xFF" * 58)
+    assert {k: v for k, v in noisy.items() if k != "raw"} == \
+           {k: v for k, v in clear.items() if k != "raw"}
+
+
+def test_supvan_a_truncated_report_raises():
+    """A short read is a transport fault. Padding it out would report a
+    healthy device with an empty page count."""
+    with pytest.raises(supvan.SupvanError):
+        supvan.decode_status(b"\x00\x00\x00")
+
+
+def test_supvan_status_poll_sends_the_inquiry_and_decodes_the_reply():
+    reply = bytearray(supvan.REPORT_SIZE)
+    reply[2] = 0x10                            # USB connected
+    reply[4], reply[5] = 0x09, 0x00            # nine pages
+    dev = _FakeDevice(bytes(reply))
+
+    status = dev.status()
+
+    assert dev.sent == [supvan.build_command(supvan.OP_INQUIRY_STATUS)]
+    assert status["usb_connected"] and status["pages_printed"] == 9
+    assert "USB connected" in supvan.format_status(status)
+
+
+def test_supvan_missing_device_says_which_node_and_which_printer(tmp_path):
+    """There is no /dev/hidraw0 on a dev machine and there does not need
+    to be. The message has to name the node and keep the two printers
+    apart: /dev/usb/lp0 is the G4, not this."""
+    missing = tmp_path / "no-such-hidraw"
+    with pytest.raises(supvan.SupvanError) as exc:
+        supvan.poll_status(missing)
+    assert "no-such-hidraw" in str(exc.value)
+    assert "/dev/usb/lp0" in str(exc.value)
+
+
+def test_supvan_reading_before_opening_is_an_error():
+    with pytest.raises(supvan.SupvanError, match="not open"):
+        supvan.SupvanDevice("fake").command(supvan.OP_INQUIRY_STATUS)
+
+
+def test_supvan_read_report_returns_what_the_node_held(tmp_path):
+    """The read side takes no report-id byte: hidraw prepends one only for
+    devices with numbered reports, and this one has none."""
+    node = _fake_node(tmp_path)
+    node.write_bytes(bytes(range(64)))
+    with supvan.SupvanDevice(node, timeout=0) as dev:
+        assert dev.read_report() == bytes(range(64))
+
+
+def test_supvan_print_path_refuses_and_names_what_is_unknown():
+    """No guessing at anything that pulls paper through a hot head. The
+    row format, the bit polarity, the dot width and the RFID exchange are
+    all undetermined, and the message has to say so."""
+    with pytest.raises(NotImplementedError) as exc:
+        supvan.print_bitmap(b"")
+    said = str(exc.value)
+    for unknown in ("row format", "polarity", "dot width", "0x5d"):
+        assert unknown in said
+
+
+def test_supvan_probe_is_wired_above_the_database(tmp_path, capsys):
+    """`supvan-probe` is a hardware test, and a hardware test must not
+    need the database - same reason probe, selftest and file sit above
+    connect_db. It must also fail with one plain line, not a traceback,
+    when the device is absent."""
+    import argparse
+
+    from mplabel import cli
+
+    args = argparse.Namespace(device=str(tmp_path / "absent"))
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_supvan_probe(dict(cli.DEFAULTS), args)
+    assert "absent" in str(exc.value)
+    assert cli.DEFAULTS["supvan_device"] == supvan.DEFAULT_DEVICE

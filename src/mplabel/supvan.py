@@ -1,0 +1,422 @@
+"""supvan.py - USB HID transport and status polling for the SUPVAN /
+KATA Symbol T50M Pro, the 48mm label maker used for inventory tags.
+
+Written entirely from `docs/supvan-t50m-protocol.md`, which describes the
+device's observable behaviour. Nothing here is transcribed from the
+vendor's application, and nothing here should ever be: their code is
+theirs. Where the document is silent this module says so in a comment
+rather than guessing.
+
+**Nothing in this module moves paper.** The transport, the command frame
+and the status decode are implemented; the bitmap path is not, because
+the document lists the row format, the bit polarity, the dot width and
+the label-authentication exchange as undetermined. `print_bitmap` exists
+only to raise and name those gaps.
+
+This is not, and cannot be, a shipping-label printer: 48mm is ~384 dots
+at 203dpi against the 812 the 4x6 pipeline emits. Shipping labels stay
+on the CLABEL G4 at /dev/usb/lp0 - do not confuse the two devices.
+
+Nothing here is platform-specific at import time. The device only exists
+on Linux, but the frame builders and the status decoder are pure byte
+arithmetic and are tested off-target.
+"""
+
+import os
+
+try:
+    import select
+except ImportError:                    # pragma: no cover - select is stdlib
+    select = None
+
+DEFAULT_DEVICE = "/dev/hidraw0"
+
+# The report descriptor declares 64-byte input and output reports with no
+# Report ID. On Linux hidraw a device without numbered reports still needs
+# a leading 0x00 on every *write* - the kernel strips it and sends the
+# remaining 64 bytes - so a write is 65 bytes, not 64. Omitting it is the
+# most likely first mistake and the device does not complain: it simply
+# ignores the write.
+REPORT_SIZE = 64
+REPORT_ID = 0x00
+WRITE_SIZE = REPORT_SIZE + 1
+
+# Reads are the other way round: hidraw prepends the report id only for
+# devices that use numbered reports, and this one does not, so an input
+# report arrives as a bare 64 bytes. The document states the write rule
+# explicitly and is silent on the read; this follows from "no Report ID".
+READ_SIZE = REPORT_SIZE
+
+# USB ids, for error messages and for matching against the udev rule.
+USB_VENDOR = 0x1820
+USB_PRODUCT = 0x207F
+
+DEFAULT_TIMEOUT = 2.0
+
+
+class SupvanError(Exception):
+    """Anything that stops us talking to the label maker."""
+
+
+# ------------------------------------------------------------- opcodes
+
+# Named from the document's table. The value goes in byte 4 of the frame.
+OP_BUFFER_FULL = 0x10           # ends a bitmap transfer; ten-byte form
+OP_INQUIRY_STATUS = 0x11        # poll; reply is a status report
+OP_CHECK_DEVICE = 0x12          # can the device print? once per job
+OP_START_PRINT = 0x13           # sent with wValue 1
+OP_STOP_PRINT = 0x14
+OP_READ_REVISION = 0x17
+OP_RETURN_MEDIA_INFO = 0x30
+OP_NEXT_FRAME_IS_BULK = 0x5C    # announces an LZMA-compressed bitmap
+OP_SET_RFID_DATA = 0x5D         # label authentication
+OP_READ_FIRMWARE_REVISION = 0xC5
+OP_NEXT_FRAME_IS_FIRMWARE = 0xC6
+
+OPCODE_NAMES = {
+    OP_BUFFER_FULL: "buffer full",
+    OP_INQUIRY_STATUS: "inquiry status",
+    OP_CHECK_DEVICE: "check device",
+    OP_START_PRINT: "start print",
+    OP_STOP_PRINT: "stop print",
+    OP_READ_REVISION: "read revision",
+    OP_RETURN_MEDIA_INFO: "return media info",
+    OP_NEXT_FRAME_IS_BULK: "next frame is bulk",
+    OP_SET_RFID_DATA: "set RFID data",
+    OP_READ_FIRMWARE_REVISION: "read firmware revision",
+    OP_NEXT_FRAME_IS_FIRMWARE: "next frame is firmware",
+}
+
+# The firmware-update path. The document says do not send it, so this
+# module will not build it: a mistyped constant that bricks the device is
+# not a bug you get to fix twice.
+FORBIDDEN_OPCODES = {OP_NEXT_FRAME_IS_FIRMWARE}
+
+
+# -------------------------------------------------------- command frames
+
+def build_command(opcode, value=0, value2=None):
+    """Build the 8-byte command frame, or the 10-byte two-value variant.
+
+    The layout is a USB vendor control-request setup packet carried inside
+    a HID report - bmRequestType 0xC0, bRequest 0x40, wValue, wIndex,
+    wLength 8 - presumably so Windows binds its built-in HID driver and
+    the vendor ships none.
+
+    Note that wValue goes out **high byte first** (offset 2 is
+    `wValue >> 8`), which is the opposite order to the page counter in the
+    status report. That reads like a mistake and is not: it is what the
+    document records for each, and they are produced by different firmware
+    paths. Do not "fix" one to match the other.
+
+    Returns the bare frame, unpadded. Padding it out to the 64-byte report
+    is the transport's job - see `pad_report`."""
+    if not 0 <= opcode <= 0xFF:
+        raise ValueError(f"opcode {opcode!r} is not a byte")
+    if opcode in FORBIDDEN_OPCODES:
+        raise ValueError(
+            f"opcode 0x{opcode:02x} ({OPCODE_NAMES.get(opcode, '?')}) is the "
+            f"firmware update path and must not be sent")
+    if not 0 <= value <= 0xFFFF:
+        raise ValueError(f"wValue {value!r} does not fit in 16 bits")
+
+    frame = bytearray(8)
+    frame[0] = 0xC0                     # bmRequestType
+    frame[1] = 0x40                     # bRequest
+    frame[2] = (value >> 8) & 0xFF      # wValue, high byte first
+    frame[3] = value & 0xFF
+    frame[4] = opcode                   # wIndex, low byte
+    frame[5] = 0x00
+    frame[6] = 0x08                     # wLength = 8
+    frame[7] = 0x00
+
+    if value2 is not None:
+        if not 0 <= value2 <= 0xFFFF:
+            raise ValueError(f"wValue2 {value2!r} does not fit in 16 bits")
+        # The ten-byte variant appends a second 16-bit value in the same
+        # high-byte-first order. Bytes 0-7 are unchanged - in particular
+        # wLength stays 8, which is what the document shows.
+        frame.append((value2 >> 8) & 0xFF)
+        frame.append(value2 & 0xFF)
+
+    return bytes(frame)
+
+
+def pad_report(payload):
+    """Zero-pad a payload of at most 64 bytes to one whole report."""
+    if len(payload) > REPORT_SIZE:
+        raise ValueError(f"{len(payload)} bytes is more than one report")
+    return bytes(payload) + b"\x00" * (REPORT_SIZE - len(payload))
+
+
+def split_reports(payload):
+    """Split a payload into whole 64-byte reports, zero-padding the last.
+
+    Everything - commands and bitmap data alike - goes out as a sequence
+    of these. An empty payload becomes one empty report rather than
+    nothing, so a caller cannot send zero bytes and believe it sent
+    something."""
+    payload = bytes(payload)
+    if not payload:
+        return [pad_report(b"")]
+    return [pad_report(payload[i:i + REPORT_SIZE])
+            for i in range(0, len(payload), REPORT_SIZE)]
+
+
+def wire_bytes(payload):
+    """The exact bytes hidraw wants: each report behind its 0x00 id."""
+    return b"".join(bytes([REPORT_ID]) + r for r in split_reports(payload))
+
+
+# --------------------------------------------------------- status decode
+
+# (name, byte offset, mask), from the document's table. Only the first six
+# bytes of the 64-byte input report are meaningful; the rest is padding of
+# unknown content and is deliberately not interpreted.
+STATUS_FLAGS = (
+    ("buffer_full",           0, 0x01),
+    ("media_error",           0, 0x02),   # media read/write error
+    ("out_of_media",          0, 0x04),
+    ("media_not_recognised",  0, 0x08),
+    ("media_seating_error",   0, 0x10),
+    ("check_remaining_media", 0, 0x20),
+    ("battery_low",           0, 0x40),
+    ("busy",                  1, 0x04),
+    ("head_too_hot",          1, 0x08),
+    ("cover_open",            2, 0x08),   # media cover open
+    ("usb_connected",         2, 0x10),
+    ("printing",              2, 0x40),   # printing in progress
+    ("busy_secondary",        2, 0x80),
+    ("media_not_installed",   3, 0x01),
+    ("charging",              3, 0x80),
+)
+
+# Human wording for a probe's output.
+FLAG_LABELS = {
+    "buffer_full": "buffer full",
+    "media_error": "media read/write error",
+    "out_of_media": "out of media",
+    "media_not_recognised": "media not recognised",
+    "media_seating_error": "media seating error",
+    "check_remaining_media": "check remaining media",
+    "battery_low": "battery low",
+    "busy": "device busy",
+    "head_too_hot": "print head too hot",
+    "cover_open": "media cover open",
+    "usb_connected": "USB connected",
+    "printing": "printing in progress",
+    "busy_secondary": "device busy (secondary)",
+    "media_not_installed": "media not installed",
+    "charging": "charging",
+}
+
+# Which flags mean "do not start a job". The document says to abort on
+# "any error condition" without saying which flags those are, so this
+# split is ours, not the document's: these are the states where paper
+# plainly cannot come out right. battery_low and check_remaining_media are
+# warnings and stay out of it, as does busy, which is a wait rather than a
+# failure.
+ERROR_FLAGS = (
+    "media_error",
+    "out_of_media",
+    "media_not_recognised",
+    "media_seating_error",
+    "cover_open",
+    "head_too_hot",
+    "media_not_installed",
+)
+
+# The page counter lives in bytes 4 and 5.
+PAGES_LOW, PAGES_HIGH = 4, 5
+STATUS_MIN_LEN = 6
+
+
+def decode_status(report):
+    """Decode a status report into flags plus the page counter.
+
+    Takes the input report as bytes and returns a dict carrying every
+    named flag as True or False, plus:
+
+      pages_printed  16-bit count from bytes 4 and 5
+      errors         the raised flags that mean a job must not start
+      raw            the six meaningful bytes, for logging
+
+    A short buffer raises rather than being padded out: a truncated read
+    is a transport problem, and quietly decoding it would report a healthy
+    device with an empty counter."""
+    data = bytes(report)
+    if len(data) < STATUS_MIN_LEN:
+        raise SupvanError(
+            f"status report is {len(data)} bytes; the first "
+            f"{STATUS_MIN_LEN} carry the flags and the page counter")
+
+    status = {name: bool(data[off] & mask) for name, off, mask in STATUS_FLAGS}
+    # Little-endian: byte 5 is the high byte. Reading it the other way
+    # round turns 1 page into 256, which looks plausible for a while.
+    status["pages_printed"] = data[PAGES_LOW] | (data[PAGES_HIGH] << 8)
+    status["errors"] = [n for n in ERROR_FLAGS if status[n]]
+    status["raw"] = data[:STATUS_MIN_LEN]
+    return status
+
+
+def format_status(status):
+    """The status as a few plain lines, for `mplabel supvan-probe`."""
+    lines = [f"pages printed: {status['pages_printed']}"]
+    raised = [FLAG_LABELS[n] for n, _off, _mask in STATUS_FLAGS if status[n]]
+    lines.append("flags set: " + (", ".join(raised) if raised else "none"))
+    if status["errors"]:
+        lines.append("errors: "
+                     + ", ".join(FLAG_LABELS[n] for n in status["errors"]))
+    lines.append("raw: " + status["raw"].hex(" "))
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------- transport
+
+class SupvanDevice:
+    """A raw HID pipe to the label maker.
+
+        with SupvanDevice() as dev:
+            print(dev.status())
+
+    The path is a parameter throughout rather than a constant baked into
+    each call, because /dev/hidraw0 is only the usual number: plug in
+    another HID device first and this one becomes hidraw1."""
+
+    def __init__(self, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
+        self.path = str(path)
+        self.timeout = timeout
+        self._fd = None
+
+    # -- open / close
+
+    def open(self):
+        if self._fd is not None:
+            return self
+        # O_BINARY is a no-op everywhere but Windows, where its absence
+        # would translate newlines inside a binary report. It only bites
+        # when a file stands in for the device, but a transport that
+        # corrupts its own test fixture is not worth debugging twice.
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+        try:
+            self._fd = os.open(self.path, flags)
+        except FileNotFoundError:
+            raise SupvanError(
+                f"{self.path} not found. The T50M Pro is a HID device, not a "
+                f"USB printer, so it has no /dev/usb/lpN - look for it with "
+                f"`lsusb | grep {USB_VENDOR:04x}:{USB_PRODUCT:04x}` and "
+                f"`ls /dev/hidraw*`. Note /dev/usb/lp0 is the G4, not this.")
+        except PermissionError:
+            raise SupvanError(
+                f"{self.path} is not writable. The node is root-only by "
+                f"default; install udev/99-supvan-t50m.rules and check the "
+                f"user is in the lp group.")
+        except OSError as exc:
+            raise SupvanError(f"cannot open {self.path}: {exc}")
+        return self
+
+    def close(self):
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def _require_fd(self):
+        if self._fd is None:
+            raise SupvanError("device is not open")
+        return self._fd
+
+    # -- reports
+
+    def write(self, payload):
+        """Send a payload as one or more 64-byte output reports.
+
+        Returns the number of reports written. Each report goes out in a
+        single os.write of 65 bytes: unlike a byte stream a report cannot
+        be resumed halfway, because the remainder would be framed as a
+        fresh report and the device would act on nonsense. So a short
+        write is fatal here rather than something to loop over. (The
+        document settles the report size and the leading id byte; treating
+        a partial write as fatal is our inference from those.)"""
+        fd = self._require_fd()
+        reports = split_reports(payload)
+        for report in reports:
+            buf = bytes([REPORT_ID]) + report
+            written = os.write(fd, buf)
+            if written != len(buf):
+                raise SupvanError(
+                    f"short write to {self.path}: {written} of {len(buf)} "
+                    f"bytes; a partial HID report cannot be resumed")
+        return len(reports)
+
+    def read_report(self, timeout=None):
+        """Read one input report and return the bytes the device sent.
+
+        The document gives no timeout, so this one is a guard against
+        hanging rather than a protocol value."""
+        fd = self._require_fd()
+        wait = self.timeout if timeout is None else timeout
+        # select.poll is Linux and friends; on Windows select handles only
+        # sockets, and there is no device there to read from anyway.
+        # Falling back to a blocking read keeps this module importable and
+        # testable off-target, where the "device" is a file and always
+        # ready.
+        if wait and select is not None and hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            if not poller.poll(wait * 1000):
+                raise SupvanError(
+                    f"no reply from {self.path} within {wait:g}s. A listening "
+                    f"device answers a status poll immediately; silence "
+                    f"usually means the report id byte or the report size is "
+                    f"wrong, and the device is ignoring the write.")
+        data = os.read(fd, READ_SIZE)
+        if not data:
+            raise SupvanError(f"empty read from {self.path}")
+        return data
+
+    # -- commands
+
+    def command(self, opcode, value=0, value2=None):
+        """Send one command frame, padded to a report. Reads nothing."""
+        return self.write(build_command(opcode, value, value2))
+
+    def status(self, timeout=None):
+        """Poll the device and decode the reply.
+
+        The safe entry point: it moves no paper, and one round trip proves
+        the whole transport - report size, the leading id byte,
+        permissions - at once."""
+        self.command(OP_INQUIRY_STATUS)
+        return decode_status(self.read_report(timeout))
+
+
+def poll_status(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
+    """Open, poll once, close. Raises SupvanError with a plain reason."""
+    with SupvanDevice(path, timeout) as dev:
+        return dev.status()
+
+
+# ---------------------------------------------------------- not built yet
+
+def print_bitmap(*_args, **_kwargs):
+    """Deliberately unimplemented - see docs/supvan-t50m-protocol.md.
+
+    The command sequence for a job is known, and the image is LZMA, which
+    the stdlib covers. What is not known is what goes *inside* the
+    compressed buffer, and all of it has to be settled before bytes are
+    sent to a device that then pulls paper through a hot head."""
+    raise NotImplementedError(
+        "the T50M Pro print path is not implemented: the uncompressed row "
+        "format (bytes per row, bit order), the bit polarity (whether a set "
+        "bit is a black dot), this model's exact dot width (~384 at "
+        "48mm/203dpi, but the real constant is per-model), how media width "
+        "and label length are communicated, and the RFID label "
+        "authentication exchange (opcode 0x5d) are all undetermined. Use "
+        "`mplabel inventory` and the vendor editor until they are.")

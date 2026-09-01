@@ -79,6 +79,13 @@ This is the shape of a USB vendor control-request setup packet
 inside a HID report — presumably so that Windows binds its built-in HID
 driver and the vendor ships no driver at all.
 
+**The byte order is genuinely inconsistent, and that is not a mistake in
+this document.** `wValue` here goes out **high byte first**, while the page
+counter in the status report is little-endian. A real USB setup packet is
+little-endian throughout, so the frame looks wrong next to the structure it
+imitates — it was checked twice for exactly that reason and is recorded as
+observed. Do not "fix" one to match the other.
+
 A ten-byte variant appends a second 16-bit value, used where a command
 needs two parameters:
 

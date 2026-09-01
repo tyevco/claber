@@ -51,6 +51,7 @@ from . import mailparse
 from . import printers
 from . import savedpage as savedpage_mod
 from . import sheets as sheets_mod
+from . import supvan as supvan_mod
 
 log = logging.getLogger("mplabel")
 
@@ -75,6 +76,12 @@ DEFAULTS = {
     "media_tracking": "gap",
     "gap_inches": "0.12",
     "escpos_band_rows": "128",
+    # The 48mm inventory label maker (SUPVAN/KATA T50M Pro). It is a HID
+    # device, not a printer: no /dev/usb/lpN, writes go to a hidraw node.
+    # hidraw0 is only the usual number - another HID device plugged in
+    # first takes it and this one becomes hidraw1. Nothing here prints to
+    # it; `mplabel supvan-probe` polls its status and moves no paper.
+    "supvan_device": "/dev/hidraw0",
     # A 3-character code printed small in the top right, so a stack of parcels
     # can be told apart at a glance. Stored on the sale and mirrored to the
     # sheet; the archived PDF is left unstamped.
@@ -763,6 +770,26 @@ def cmd_file(cfg, args):
         print_label(cfg, out)
 
 
+def cmd_supvan_probe(cfg, args):
+    """Ask the 48mm inventory label maker how it is.
+
+    A status poll is read-only: it moves no paper, and it is the one round
+    trip that proves the HID transport end to end - the report size, the
+    leading report-id byte, and the udev permissions - before anything
+    harder is attempted. Nothing in mplabel prints to this device; see
+    supvan.print_bitmap for what is still unknown."""
+    device = args.device or cfg.get("supvan_device",
+                                    supvan_mod.DEFAULT_DEVICE)
+    print(f"device: {device}")
+    try:
+        status = supvan_mod.poll_status(device)
+    except supvan_mod.SupvanError as exc:
+        # Absent or root-only is the ordinary case on a machine that is not
+        # the Pi, so say what is wrong in one line rather than a traceback.
+        raise SystemExit(str(exc))
+    print(supvan_mod.format_status(status))
+
+
 def cmd_passwd():
     """Print the `web_password_hash` line for mplabel.conf.
 
@@ -1133,6 +1160,11 @@ def main():
     sub.add_parser("test-print", help="reprint the newest label")
     sub.add_parser("probe", help="show printers and USB devices")
     sub.add_parser("selftest", help="print a tiny text-only TSPL test label")
+    p = sub.add_parser("supvan-probe",
+                       help="status of the 48mm inventory label maker; "
+                            "prints nothing and moves no paper")
+    p.add_argument("--device", help="hidraw node, default supvan_device "
+                                    "from the config (/dev/hidraw0)")
     p = sub.add_parser("scan", help="survey Facebook mail, change nothing")
     p.add_argument("--limit", type=int, default=2000)
     p = sub.add_parser("backfill", help="build listing history from old mail")
@@ -1194,6 +1226,11 @@ def main():
                                    float(cfg.get("gap_inches", 0.12)))
         print(f"sent text-only {backend} test label to "
               + cfg["printer_device"])
+        return
+    if args.cmd == "supvan-probe":
+        # Same reasoning as selftest: this is a hardware test, and a
+        # hardware test must not need the database.
+        cmd_supvan_probe(cfg, args)
         return
     if args.cmd == "file":
         cmd_file(cfg, args)
