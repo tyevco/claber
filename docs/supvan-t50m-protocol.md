@@ -288,6 +288,32 @@ suggested. Bit order and polarity are still unconfirmed: rendered either
 way the test label is blocks rather than anything recognisable, so it
 tells us the geometry but not the sense of a set bit.
 
+### What is still missing, after the capture
+
+With the dictionary at 8192 and the size declared - both taken from the
+captured print, both verified in the stream we send - the USB attempt
+fails exactly as it did before: accepted, positioned, then
+`media_seating_error` after about a second. **So the LZMA header was not
+the blocker.** That is worth knowing: it removes the whole compression
+question from the list.
+
+The remaining difference from the working print is the **framing of the
+bulk data**. Over RFCOMM it travels under its own opcode `0xbb`, with a
+marker of `10 02 aa` instead of `10 01 aa` and a two-byte per-image
+field; over HID this repo sends bare 64-byte chunks after the `0x5c`
+announce. Whether the HID path needs an equivalent wrapper cannot be
+inferred from a Bluetooth capture - the two transports frame everything
+differently, and only the opcodes are shared.
+
+**That question needs a USB capture** of the vendor application printing:
+Wireshark with USBPcap on an x64 Windows machine, filtered to this device
+alone. The thing to read is narrow - the reports sent between `0x5c` and
+`0x10`. If they carry a header, ours needs the same; if they are bare
+LZMA, the transport was right and something else is wrong.
+
+Until then, further attempts cost labels for an ambiguous signal. The
+supported route is `mplabel inventory` and the vendor editor.
+
 ### What the USB experiment established
 
 
