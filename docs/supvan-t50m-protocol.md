@@ -288,6 +288,43 @@ suggested. Bit order and polarity are still unconfirmed: rendered either
 way the test label is blocks rather than anything recognisable, so it
 tells us the geometry but not the sense of a set bit.
 
+## Confirmed from a USB capture of a working print
+
+A USBPcap capture of the vendor application printing over USB. This is
+the authoritative reference for the USB path - real frames off the wire.
+
+The job runs on the **interrupt endpoints** (`0x01` out, `0x81` in) in
+64-byte reports. The bulk endpoints `0x03`/`0x82` carry only the fake
+CD-ROM being probed by Windows - 31-byte CBW, 13-byte CSW, 4096-byte
+sector reads - and have nothing to do with printing.
+
+```
+OUT c0 40 00 00 12 00 08 00     check device
+OUT c0 40 00 00 11 00 08 00     status
+OUT c0 40 00 01 13 00 08 00     start print, wValue 1
+OUT c0 40 00 00 11 00 08 00     status, until printing is set
+OUT c0 40 00 7b 5c 00 08 00     announce: wValue 0x7b = 123 = compressed length
+OUT 5d 00 20 00 00 00 30 ...    the LZMA stream, bare, in 64-byte reports
+OUT ...                          (123 bytes over two reports)
+OUT c0 40 00 7b 10 00 08 00 00 3c   buffer full: same length, second value 0x3c = 60
+OUT c0 40 00 00 11 00 08 00     status, until it finishes
+```
+
+Three corrections to what came before:
+
+- **The bulk data is bare.** There is no USB equivalent of the `0xbb`
+  wrapper seen over Bluetooth; the stream goes straight into 64-byte
+  reports after the announce. The transport here was right.
+- **The second value in `0x10` is 60** (`0x3c`), not 1. What it means is
+  unknown - speed, or something else entirely - but 60 is what a working
+  print sends.
+- **The image is 12288 bytes**, 48 x 256, matching the media. A shorter
+  image looks like a job the printer is still waiting to finish, which is
+  what every attempt from here produced.
+
+The LZMA header is `5d 00 20 00 00 00 30 00 00 00 00 00 00`, identical to
+the Bluetooth capture: 8KB dictionary, size declared.
+
 ### What is still missing, after the capture
 
 With the dictionary at 8192 and the size declared - both taken from the

@@ -2275,6 +2275,37 @@ def test_supvan_invert_flips_every_bit():
     assert all(a ^ 0xFF == b for a, b in zip(plain, flipped))
 
 
+@pytest.mark.parametrize("opcode,value,value2,captured", [
+    (supvan.OP_CHECK_DEVICE,       0,   None, "c0 40 00 00 12 00 08 00"),
+    (supvan.OP_INQUIRY_STATUS,     0,   None, "c0 40 00 00 11 00 08 00"),
+    (supvan.OP_START_PRINT,        1,   None, "c0 40 00 01 13 00 08 00"),
+    (supvan.OP_NEXT_FRAME_IS_BULK, 123, None, "c0 40 00 7b 5c 00 08 00"),
+    (supvan.OP_RETURN_MEDIA_INFO,  0,   None, "c0 40 00 00 30 00 08 00"),
+    (supvan.OP_BUFFER_FULL,        123, 60,   "c0 40 00 7b 10 00 08 00 00 3c"),
+])
+def test_supvan_frames_match_a_captured_usb_print(opcode, value, value2,
+                                                  captured):
+    """Byte-for-byte against a USBPcap capture of the vendor app printing.
+
+    This is the strongest evidence in the module: real frames off the wire
+    rather than a reading of a document. Note the buffer-full second value
+    is 0x3c - 60 - where this code sent 1 for a long time."""
+    assert supvan.build_command(opcode, value, value2) == \
+        bytes.fromhex(captured.replace(" ", ""))
+
+
+def test_supvan_bulk_goes_bare_over_usb():
+    """No wrapper. The capture sends the LZMA stream straight into 64-byte
+    reports right after the 0x5c announce - the `0xbb` framing seen over
+    Bluetooth has no USB equivalent, and the announce carries the
+    compressed length, which is what those two reports hold."""
+    payload = bytes(123)
+    reports = supvan.split_reports(payload)
+    assert len(reports) == 2 and all(len(r) == 64 for r in reports)
+    assert supvan.build_command(supvan.OP_NEXT_FRAME_IS_BULK,
+                                len(payload))[3] == 123
+
+
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
 

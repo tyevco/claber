@@ -1290,8 +1290,12 @@ def main():
     p.add_argument("--width", type=int,
                    default=supvan_mod.DEFAULT_WIDTH_DOTS,
                    help="dots per row (default %(default)s, 48mm at 203dpi)")
-    p.add_argument("--height", type=int, default=120,
-                   help="rows in the test pattern (default %(default)s)")
+    # 256 rows. A captured USB print sends 12288 bytes = 48 x 256, and the
+    # media is what decides it: a short image looks like a job the printer
+    # is still waiting to finish.
+    p.add_argument("--height", type=int, default=256,
+                   help="rows in the test pattern (default %(default)s, "
+                        "which matches the captured print)")
     p.add_argument("--invert", action="store_true",
                    help="flip the bit polarity")
     p.add_argument("--lzma", choices=["alone", "xz", "raw"], default="alone",
@@ -1299,8 +1303,11 @@ def main():
     p.add_argument("--announce", choices=["compressed", "raw"],
                    default="compressed",
                    help="which length 0x5c carries (default %(default)s)")
-    p.add_argument("--speed", type=int, default=1,
-                   help="speed value for 0x10 (default %(default)s)")
+    # 0x3c, straight off the wire. The captured buffer-full command is
+    # `c0 40 00 7b 10 00 08 00 00 3c` - second value 60, where this sent 1.
+    p.add_argument("--speed", type=int, default=60,
+                   help="second value in 0x10 (default %(default)s, from "
+                        "the captured print)")
     p.add_argument("--buffer-len", choices=["compressed", "raw"],
                    help="which length 0x10 carries; defaults to --announce")
     p.add_argument("--dict-size", type=int,
