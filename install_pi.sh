@@ -64,6 +64,19 @@ sed -e "s|^User=.*|User=$RUN_USER|" \
     -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA_DIR|" \
     -e "s|^ProtectHome=.*|ProtectHome=false|" \
     systemd/mplabel.service > /etc/systemd/system/mplabel.service
+
+# The print service. Installed but deliberately NOT enabled: it is only
+# useful once printer_backend = pi-http, and that switch is gated on the
+# label geometry being validated (see docs/phase2-hardware-checklist.md).
+# Changing the transport while the geometry is unmeasured gives you a bad
+# print you cannot attribute to either change.
+sed -e "s|^User=.*|User=$RUN_USER|" \
+    -e "s|^WorkingDirectory=.*|WorkingDirectory=$DEST|" \
+    -e "s|^ExecStart=.*|ExecStart=$DEST/venv/bin/python -m mplabel printd|" \
+    -e "s|^ProtectHome=.*|ProtectHome=false|" \
+    -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA_DIR /run/lock|" \
+    systemd/mplabel-printd.service > /etc/systemd/system/mplabel-printd.service
+
 systemctl daemon-reload
 
 # The raw backends (escpos, tspl, zpl) need usblp, which CUPS unbinds when

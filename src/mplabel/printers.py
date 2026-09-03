@@ -681,6 +681,85 @@ def _sign_job(secret, job, body):
 REMOTE_BACKENDS = {"pi-http"}
 
 
+def printd_health(cfg, timeout=5.0):
+    """Ask a remote printd how it is. Unauthenticated by design - it
+    reports configuration and liveness, never anything about an order."""
+    import urllib.error
+    import urllib.request
+
+    url = cfg.get("printd_url")
+    if not url:
+        raise PrinterUnavailable("printd_url is not set")
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/healthz",
+                                    timeout=timeout) as res:
+            return json.loads(res.read() or b"{}")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PrinterUnavailable(f"could not reach printd at {url}: {exc}")
+
+
+def printd_printed(cfg, since=None, timeout=10.0):
+    """What printd says actually reached the paper."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = cfg.get("printd_url")
+    if not url:
+        raise PrinterUnavailable("printd_url is not set")
+    q = "?" + urllib.parse.urlencode({"since": since}) if since else ""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/printed" + q,
+                                    timeout=timeout) as res:
+            return json.loads(res.read() or b"{}").get("printed", [])
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PrinterUnavailable(f"could not reach printd at {url}: {exc}")
+
+
+def selftest(cfg):
+    """Print the tiny text-only test label, wherever the printer is.
+
+    Dispatches on the backend like send() does. It used to call
+    tspl_selftest directly, which meant that with printer_backend set to
+    pi-http the one command for "is the printer alive" reached past the
+    service to whatever device node happened to exist on *this* host -
+    testing the wrong printer, or nothing at all."""
+    backend = cfg.get("printer_backend")
+    if backend in REMOTE_BACKENDS:
+        import urllib.error
+        import urllib.request
+
+        url = (cfg.get("printd_url") or "").rstrip("/")
+        if not url:
+            raise PrinterUnavailable("printd_url is not set")
+        job = f"selftest-{os.urandom(8).hex()}"
+        req = urllib.request.Request(
+            url + "/selftest", data=b"", method="POST",
+            headers={"X-MPLabel-Protocol": "1", "X-MPLabel-Job": job,
+                     "X-MPLabel-Sig": _sign_job(cfg.get("printd_secret"),
+                                                job, b""),
+                     "X-MPLabel-Deadline": str(cfg.get("printd_timeout", 45))})
+        try:
+            with urllib.request.urlopen(
+                    req, timeout=float(cfg.get("printd_timeout", 45))) as res:
+                json.loads(res.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            raise PrinterUnavailable(
+                f"printd said {exc.code}: "
+                f"{exc.read().decode(errors='replace')}")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise PrinterUnavailable(f"could not reach printd at {url}: {exc}")
+        return {"backend": backend, "where": url}
+
+    if backend == "escpos":
+        escpos_selftest(cfg["printer_device"])
+    else:
+        tspl_selftest(cfg["printer_device"], cfg.get("media_tracking", "gap"),
+                      float(cfg.get("gap_inches", 0.12)))
+    return {"backend": backend, "where": cfg.get("printer_device")}
+
+
+
 LANGUAGE_BACKENDS = {
     "TSPL": "tspl",
     "ZPL": "zpl",
