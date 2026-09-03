@@ -725,6 +725,53 @@ def cmd_file(cfg, args):
         print_label(cfg, out)
 
 
+def cmd_reconcile(cfg, conn, args):
+    """Ask printd what it actually printed, and make the database agree.
+
+    This is the way out of the one ambiguity a network boundary adds. A
+    timed-out print cannot be retried safely, because "never arrived" and
+    "printed, and the acknowledgement was lost" look identical from here -
+    and the second one retried is a duplicate label on a parcel. So
+    nothing retries; printd keeps a durable journal instead, and this asks
+    it.
+
+    Matching is by the parcel code carried in the job id. That is sound
+    for exactly the reason the code exists: it is unique among parcels
+    that have not shipped."""
+    rows = printers.printd_printed(cfg, since=getattr(args, "since", None))
+    if not rows:
+        print("printd has printed nothing it can still remember")
+        return
+
+    fixed = 0
+    for row in rows:
+        job = row.get("job") or ""
+        code = job.rsplit("-", 1)[0] if "-" in job else job
+        if not code or code == "selftest":
+            continue
+        # Only rows that still claim they never printed, and only by a
+        # code that is still open - a shipped parcel's code goes back in
+        # the pool, so an old job id must not reach a new parcel.
+        sale = conn.execute(
+            "SELECT id, item, message_id, printed_at FROM sales "
+            "WHERE UPPER(code)=? AND printed_at IS NULL "
+            f"AND status NOT IN ({','.join('?' * len(CLOSED_STATUSES))})",
+            (code.upper(),) + CLOSED_STATUSES).fetchone()
+        if not sale:
+            continue
+        if args.dry_run:
+            print(f"  would mark {code} printed: {sale['item']}")
+        else:
+            mark_printed(conn, sale["message_id"])
+            print(f"  marked {code} printed: {sale['item']}")
+        fixed += 1
+
+    if not fixed:
+        print(f"{len(rows)} job(s) in printd's journal, nothing to correct")
+    elif args.dry_run:
+        print(f"\n{fixed} row(s) would change. Drop --dry-run to apply.")
+
+
 def cmd_status(cfg):
     """Ask the printer how it is. Phase 2 of the split plan.
 
@@ -1056,6 +1103,9 @@ def _main():
     p.add_argument("--force", action="store_true",
                    help="print even if the label does not match the sale")
     p = sub.add_parser("probe", help="show printers and USB devices")
+    p.add_argument("--remote", action="store_true",
+                   help="ask the printd named by printd_url instead of "
+                        "globbing this host's /dev")
     p.add_argument("--cups", action="store_true",
                    help="also run `lpinfo -v`. Off by default: CUPS's "
                         "discovery can claim the printer and unbind usblp, "
@@ -1095,6 +1145,11 @@ def _main():
     sub.add_parser("passwd", help="hash a password for web_password_hash")
     sub.add_parser("status", help="ask the printer how it is (does it "
                                   "answer at all?)")
+    p = sub.add_parser("reconcile",
+                       help="ask printd what it printed and correct rows "
+                            "that a timeout left looking unprinted")
+    p.add_argument("--since", metavar="JOB", help="only jobs after this one")
+    p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("printd", help="run the print service")
     p.add_argument("--bind")
     p.add_argument("--port", type=int)
@@ -1106,6 +1161,22 @@ def _main():
         datefmt="%Y-%m-%d %H:%M:%S")
 
     if args.cmd == "probe":
+        if args.remote:
+            cfg = load_config(args.config)
+            info = printers.printd_health(cfg)
+            print(f"printd at {cfg.get('printd_url')}")
+            for key in ("backend", "device", "device_present", "dpi",
+                        "darkness", "speed", "media_tracking",
+                        "gap_inches", "head_dots", "printing"):
+                print(f"  {key:15} {info.get(key)}")
+            print(f"  {'build':15} {info.get('build')}")
+            return
+        # Say whose USB bus this is. probe runs before load_config and
+        # globs the local /dev, so on the order side of a split it would
+        # describe a machine with no printer attached and look like a
+        # fault.
+        print(f"describing {socket.gethostname()} (local devices). "
+              f"Use --remote for the printd host.\n")
         printers.probe(cups=args.cups)
         return
 
@@ -1115,18 +1186,12 @@ def _main():
     # Keep them above connect_db: a missing or unwritable home directory
     # must not stop you testing the printer or converting a PDF by hand.
     if args.cmd == "selftest":
-        # Send the test label in whatever language the printer is set to
-        # speak; a TSPL selftest on an ESC/POS printer just prints the
-        # commands as literal text.
-        backend = cfg["printer_backend"]
-        if backend == "escpos":
-            printers.escpos_selftest(cfg["printer_device"])
-        else:
-            printers.tspl_selftest(cfg["printer_device"],
-                                   cfg.get("media_tracking", "gap"),
-                                   float(cfg.get("gap_inches", 0.12)))
-        print(f"sent text-only {backend} test label to "
-              + cfg["printer_device"])
+        # Dispatches on the backend: with printer_backend = pi-http this
+        # asks printd to print it, rather than reaching past the service
+        # to whatever device node exists on *this* host.
+        info = printers.selftest(cfg)
+        print(f"sent text-only {info['backend']} test label to "
+              f"{info['where']}")
         return
     if args.cmd == "file":
         cmd_file(cfg, args)
@@ -1198,3 +1263,5 @@ def _main():
         cmd_pending(cfg, conn, args)
     elif args.cmd == "stats":
         cmd_stats(cfg, conn, args)
+    elif args.cmd == "reconcile":
+        cmd_reconcile(cfg, conn, args)

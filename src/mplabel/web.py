@@ -36,6 +36,7 @@ import re
 import secrets
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -521,19 +522,53 @@ class Handler(BaseHTTPRequestHandler):
         `web_password_hash`, `imap_password` and `sheets_key` all live in
         the same config dict, so this allow-lists rather than filtering:
         a key added later is invisible here until someone chooses to show
-        it."""
+        it.
+
+        With a remote printd the printer settings are read from *it*, not
+        from this host's config. They describe a roll of stock in a room,
+        and reporting a local copy would show 0.12 on her phone during the
+        exact week she is tuning it to 0.15 on the Pi - with nothing to
+        say the number was stale."""
         cfg = self.cfg
         row = self.db().execute(
             "SELECT MAX(printed_at) AS last FROM sales").fetchone()
-        self.json({
+        out = {
             "backend": cfg.get("printer_backend"),
+            "poll_seconds": cfg.get("poll_seconds"),
+            "last_printed_at": row["last"] if row else None,
+            "printer_source": "local",
+        }
+        keys = ("device", "darkness", "gap_inches", "media_tracking",
+                "head_dots", "dpi")
+
+        if cfg.get("printer_backend") in printers_mod.REMOTE_BACKENDS:
+            out["printer_source"] = cfg.get("printd_url")
+            try:
+                health = printers_mod.printd_health(cfg)
+            except printers_mod.PrinterUnavailable as exc:
+                # Say so rather than silently falling back to local values,
+                # which would look identical to a healthy answer.
+                out["printer_reachable"] = False
+                out["printer_error"] = str(exc)
+                return self.json(out)
+            out["printer_reachable"] = True
+            out["fetched_at"] = datetime.now().isoformat(timespec="seconds")
+            for k in keys:
+                out[k] = health.get(k)
+            out["device_present"] = health.get("device_present")
+            out["printing"] = health.get("printing")
+            out["printd_build"] = health.get("build")
+            return self.json(out)
+
+        out.update({
             "device": cfg.get("printer_device"),
             "darkness": cfg.get("printer_darkness"),
             "gap_inches": cfg.get("gap_inches"),
             "media_tracking": cfg.get("media_tracking"),
-            "poll_seconds": cfg.get("poll_seconds"),
-            "last_printed_at": row["last"] if row else None,
+            "head_dots": cfg.get("printer_head_dots"),
+            "dpi": cfg.get("printer_dpi"),
         })
+        self.json(out)
 
     def _sale(self, sid):
         row = self.db().execute("SELECT * FROM sales WHERE id=?",

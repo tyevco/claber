@@ -198,6 +198,17 @@ Two more of the same shape: `mplabel selftest` is dispatched **above** `printers
 
 ---
 
+## Status (updated as phases land)
+
+| Phase | State |
+|---|---|
+| 0 — hygiene | **Done.** One deliberate omission: `print_zpl` got `settle` but not `media`/`gap_in` — ZPL media commands are unverified on any hardware here and that backend has never printed. |
+| 1 — Group A bug fixes | **Done.** The lock is `0666` in `/run/lock` rather than `0660 root:lp`: same goal, without needing root to create it, which a `pi`-user service does not have. |
+| 2 — validate on hardware | **Blocked — needs the printer.** `mplabel status` and `docs/phase2-hardware-checklist.md` are the tooling. **This is the gate.** |
+| 3 — split over loopback | **Code complete, not deployed.** Tested against a fake device only. |
+| 4 — printd off loopback | **Prerequisites done** (C3, C7, installer). The move itself is a config change, still gated on phase 2. |
+| 5 — order side to k3s | Not started, and not recommended until the phase-5 precondition exists. |
+
 ## 6. Phased migration
 
 No flag day. Every phase leaves a working system, and each is independently reversible.

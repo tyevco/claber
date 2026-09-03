@@ -7,6 +7,7 @@ reproduces the exact page geometry of a real Marketplace label with
 invented names and an unused tracking number.
 """
 
+import argparse
 import email
 import json
 import re
@@ -2294,3 +2295,147 @@ def test_a_local_backend_still_takes_the_lock(tmp_path, monkeypatch):
                 "label_code": "no"})
     cli.print_label(cfg, pdf)
     assert locked == ["held"], "the local path stopped locking the device"
+
+
+# --------------------------------------------- phase 4 prerequisites (C7)
+
+def _web_against(tmp_path, cfg_extra):
+    """A web app with a custom config, for the remote-printd cases."""
+    import threading
+
+    from mplabel import cli, web
+
+    conn = cli.connect_db(tmp_path)
+    conn.execute("INSERT INTO sales (message_id, item, code) "
+                 "VALUES ('<m1>', 'Vase', 'W7X')")
+    conn.commit()
+    cfg = {"home": str(tmp_path),
+           "web_password_hash": web.hash_password("hunter2"),
+           "web_session_days": "30", "web_secure_cookie": "no",
+           "printer_backend": "tspl", "printer_device": "/dev/null",
+           "printer_dpi": "203", "printer_darkness": "8",
+           "gap_inches": "0.12", "media_tracking": "gap",
+           "printer_head_dots": "812", "poll_seconds": "120"}
+    cfg.update(cfg_extra)
+    srv = web.Server(("127.0.0.1", 0), cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}", srv
+
+
+def test_settings_reads_the_printer_from_printd_not_from_here(printd, tmp_path):
+    """Once printd is on another machine the printer settings describe a
+    roll of stock in a different room. Reporting this host's copy would
+    show 0.12 on her phone during the exact week she is tuning it to 0.15
+    on the Pi, with nothing to say the number was stale."""
+    printd_url, _sent, srv = printd
+    srv.cfg["gap_inches"] = "0.15"
+    srv.cfg["printer_darkness"] = "12"
+
+    # This host still holds the old values, exactly as a remote one would.
+    base, web_srv = _web_against(tmp_path / "app",
+                                 {"printer_backend": "pi-http",
+                                  "printd_url": printd_url,
+                                  "gap_inches": "0.12",
+                                  "printer_darkness": "8"})
+    try:
+        _, cookie = _login(base)
+        _, _, body = _http(f"{base}/api/system", cookie=cookie)
+        got = json.loads(body)
+        assert got["printer_source"] == printd_url
+        assert got["printer_reachable"] is True
+        assert got["gap_inches"] == "0.15", "showed the local copy, not the truth"
+        assert got["darkness"] == "12"
+        assert got["fetched_at"], "no way to tell how stale the reading is"
+    finally:
+        web_srv.shutdown()
+        web_srv.server_close()
+
+
+def test_settings_says_so_when_printd_is_unreachable(tmp_path):
+    """Silently falling back to local values would look identical to a
+    healthy answer - and the values would be wrong."""
+    base, web_srv = _web_against(tmp_path / "app2",
+                                 {"printer_backend": "pi-http",
+                                  "printd_url": "http://127.0.0.1:1"})
+    try:
+        _, cookie = _login(base)
+        _, _, body = _http(f"{base}/api/system", cookie=cookie)
+        got = json.loads(body)
+        assert got["printer_reachable"] is False
+        assert "could not reach" in got["printer_error"]
+        assert "gap_inches" not in got, "reported a local value as if live"
+    finally:
+        web_srv.shutdown()
+        web_srv.server_close()
+
+
+def test_selftest_follows_the_backend(printd, monkeypatch):
+    """It called tspl_selftest directly, so with pi-http set the one
+    command for 'is the printer alive' reached past the service to
+    whatever device node existed on *this* host."""
+    from mplabel import printers
+
+    printd_url, _sent, srv = printd
+    used = []
+    monkeypatch.setattr(printers, "tspl_selftest",
+                        lambda device, *a, **k: used.append(device))
+
+    # No printer_device at all on the client side. If selftest reached
+    # past printd it would have to invent one.
+    cfg = {"printer_backend": "pi-http", "printd_url": printd_url,
+           "printd_secret": "s3cret", "printd_timeout": "10"}
+    info = printers.selftest(cfg)
+    assert info["where"] == printd_url
+    # printd ran it, against printd's device - not the client's.
+    assert used == [srv.cfg["printer_device"]]
+
+    cfg = {"printer_backend": "tspl", "printer_device": "/dev/null",
+           "media_tracking": "gap", "gap_inches": "0.12"}
+    printers.selftest(cfg)
+    assert used[-1] == "/dev/null", "the local path stopped working"
+
+
+def test_reconcile_marks_what_printd_actually_printed(db, monkeypatch):
+    """The way out of an ambiguous timeout: ask rather than retry, because
+    a retry of a print that did happen is a duplicate label on a parcel."""
+    from mplabel import cli
+
+    db.execute("INSERT INTO sales (message_id, item, code) "
+               "VALUES ('<a>', 'Vase', 'W7X')")
+    db.execute("INSERT INTO sales (message_id, item, code) "
+               "VALUES ('<b>', 'Lamp', 'J51')")
+    db.commit()
+    monkeypatch.setattr(cli.printers, "printd_printed",
+                        lambda cfg, since=None: [
+                            {"job": "W7X-abc123"}, {"job": "selftest-zz"}])
+
+    args = argparse.Namespace(since=None, dry_run=False)
+    cli.cmd_reconcile({}, db, args)
+
+    assert db.execute("SELECT printed_at FROM sales WHERE code='W7X'"
+                      ).fetchone()[0], "printd said it printed; row disagrees"
+    assert db.execute("SELECT printed_at FROM sales WHERE code='J51'"
+                      ).fetchone()[0] is None, "marked a row printd never printed"
+
+
+def test_reconcile_will_not_reach_a_recycled_code(db, monkeypatch):
+    """A shipped parcel's code goes back in the pool, so an old job id can
+    name a code that now belongs to a different, unprinted parcel."""
+    from mplabel import cli
+
+    db.execute("INSERT INTO sales (message_id, item, code, status, printed_at) "
+               "VALUES ('<old>', 'Old vase', 'W7X', 'shipped', '2026-08-01')")
+    db.commit()
+    monkeypatch.setattr(cli.printers, "printd_printed",
+                        lambda cfg, since=None: [{"job": "W7X-abc123"}])
+    cli.cmd_reconcile({}, db, argparse.Namespace(since=None, dry_run=False))
+    assert db.execute("SELECT status FROM sales WHERE code='W7X'"
+                      ).fetchone()[0] == "shipped"
+
+
+def test_the_installer_installs_the_print_service():
+    text = (Path(__file__).parent.parent / "install_pi.sh").read_text()
+    assert "mplabel-printd.service" in text
+    # Installed, not enabled: the switch to pi-http is gated on the label
+    # geometry being validated first.
+    assert "enable --now mplabel-printd" not in text
