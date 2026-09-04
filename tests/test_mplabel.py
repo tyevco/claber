@@ -2905,9 +2905,10 @@ def test_ruler_draws_nothing_in_the_band_that_is_never_sent():
 
 
 def test_ruler_edge_gauge_brackets_the_sent_area():
-    """The outermost rectangle has to sit on the first and last rows that
-    are actually transmitted, and on the first and last dot across - it
-    is the witness for "did this edge print at all"."""
+    """The frame sits on the first and last rows actually transmitted and
+    on the first and last dot across - the witness for "did this edge
+    print at all" - and every inset in the gauge has a mark on all four
+    sides, so the outermost surviving one is that side's inset."""
     from mplabel import inventory, supvan
 
     margin = supvan.DEFAULT_MARGIN_DOTS
@@ -2918,11 +2919,27 @@ def test_ruler_edge_gauge_brackets_the_sent_area():
     for corner in ((0, top), (383, top), (0, bottom), (383, bottom)):
         assert corner in dots, corner
 
-    # And every inset in the gauge is drawn, so the outermost complete
-    # one can be read off as the printable inset.
     for inset in inventory.RULER_INSETS:
-        assert (inset, top + inset) in dots, inset
-        assert (383 - inset, bottom - inset) in dots, inset
+        # Each comb mark's near edge sits exactly at its own inset, so it
+        # is lost with the row or column it names and not before.
+        assert any((x, top + inset) in dots for x in range(60, 240)),             f"no top mark at inset {inset}"
+        assert any((x, bottom - inset) in dots for x in range(60, 240)),             f"no bottom mark at inset {inset}"
+        assert any((inset, y) in dots for y in range(top, bottom)),             f"no left mark at inset {inset}"
+        assert any((383 - inset, y) in dots for y in range(top, bottom)),             f"no right mark at inset {inset}"
+
+
+def test_ruler_gauge_outranges_the_loss_it_measures():
+    """It stopped at 32 while the reported loss was about 40, so every
+    mark on that side was gone and the gauge could only say "more than
+    32". Same failure as drawing inside the band that is never sent: an
+    instrument has to cover the case it exists for."""
+    from mplabel import inventory
+
+    assert max(inventory.RULER_INSETS) >= 48
+    assert inventory.RULER_INSETS[0] == 0
+    steps = [b - a for a, b in zip(inventory.RULER_INSETS,
+                                   inventory.RULER_INSETS[1:])]
+    assert set(steps) == {8}, "an uneven gauge is misread, not read"
 
 
 def test_ruler_graduations_survive_a_clipped_edge():
@@ -2940,8 +2957,8 @@ def test_ruler_graduations_survive_a_clipped_edge():
     # so counting ink proves nothing. What matters is where the *scales*
     # are: both lines, and every number hung off them, must sit inboard
     # of the deepest inset the gauge can report.
-    sy = margin + deepest + 22
-    sx = 383 - deepest - 22
+    sy = margin + 72
+    sx = 383 - 96
     assert sy > margin + deepest
     assert sx < 383 - deepest
 
@@ -2995,15 +3012,15 @@ def test_ruler_is_asymmetric_in_both_axes():
 
     mirrored = {(383 - x, y) for x, y in dots}
     flipped = {(x, 239 - y) for x, y in dots}
+    turned = {(383 - x, 239 - y) for x, y in dots}
     assert dots != mirrored, "a left-right mirror would look identical"
     assert dots != flipped, "a feed flip would look identical"
+    assert dots != turned, "a 180 turn would look identical"
 
-    # And the origin corner is the heaviest, which is what makes the
-    # right way up readable at a glance rather than by hunting for text.
-    def ink(x0, x1, y0, y1):
-        return sum(1 for x, y in dots if x0 <= x < x1 and y0 <= y < y1)
-
-    assert ink(0, 192, 0, 120) > ink(192, 384, 120, 240)
+    # Not just unequal - unequal by a lot, so it is obvious by looking
+    # rather than by overlaying two photographs.
+    assert len(dots ^ mirrored) > len(dots) // 2
+    assert len(dots ^ flipped) > len(dots) // 2
 
 
 def test_ruler_ticks_land_on_the_dots_they_claim():
@@ -3019,11 +3036,11 @@ def test_ruler_ticks_land_on_the_dots_they_claim():
     raw, stride, rows = inventory.render_ruler(384, 240)
     dots = _ruler_dots(raw, stride, rows)
 
-    sy = margin + max(inventory.RULER_INSETS) + 22
+    sy = margin + 72
     for pos in range(0, 384, inventory.RULER_MINOR):
         assert (pos, sy + 3) in dots, f"no across-head tick at x={pos}"
 
-    sx = 383 - max(inventory.RULER_INSETS) - 22
+    sx = 383 - 96
     for pos in range(margin, rows - margin - 1, inventory.RULER_MINOR):
         assert (sx - 3, pos) in dots, f"no feed tick at y={pos}"
 
