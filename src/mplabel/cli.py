@@ -928,6 +928,12 @@ def _emit_label_job(cfg, args, raster, stride, rows, label_mm):
     print(f"job    : {job['buffers']} x {supvan_mod.PRINT_BUF_SIZE} = "
           f"{job['raw_len']} bytes, {len(job['compressed'])} compressed, "
           f"speed {job['speed']} (derived), density {args.density}")
+    # The feed length in millimetres, because that is the number that has
+    # to match the paper. A tag longer than the die-cut label prints
+    # straight across the gap onto the next one, and the first anybody
+    # knows is a label with a third of the design on it.
+    print(f"feed   : {rows / inventory_mod.DOTS_PER_MM:.1f}mm down the "
+          f"feed - the die-cut label has to be at least this long")
 
     # Round-trip it whatever we do next: if the job will not come back
     # apart, it is not going to the printer either.
@@ -1725,10 +1731,12 @@ def _main():
                    help="add a QR carrying the same code instead")
     p.add_argument("--ecl", choices=["L", "M", "Q", "H"], default="M",
                    help="QR error correction (default %(default)s)")
-    p.add_argument("--size", default="4x1in", metavar="WxH",
+    p.add_argument("--size", default="48x30", metavar="WxH",
                    help="tag size the way you hold it, mm unless suffixed "
-                        "`in` (default %(default)s - a long thin tag, read "
-                        "from across the room)")
+                        "`in` (default %(default)s, the same stock as an "
+                        "item label). A bigger tag reads better across a "
+                        "room, but it must fit the die-cut label or it "
+                        "prints across several of them")
     p.add_argument("--density", type=int,
                    default=supvan_mod.DEFAULT_DENSITY,
                    help="burn energy 0-15 (default %(default)s)")

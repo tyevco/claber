@@ -312,6 +312,15 @@ one. If `v_aging` shows blank prices, the percentages are lying.
 
 **Check a label still matches its sale before printing it.** `label_belongs_to` re-reads the recipient off the PDF and compares it with the `ship_to` recorded from that same page when the sale was filed; `reprint` refuses on a mismatch, and `mplabel verify` sweeps the archive. This is the backstop for anything that leaves a row pointing at the wrong file - the failure is silent and the consequence is a parcel posted to a stranger.
 
+**A label longer than the die-cut stock prints across several of them.**
+`shelf-tag` defaulted to 4x1in, which reads better across a room and is
+101.6mm down the feed; on the 30mm stock in the machine it printed over
+three and a bit labels, and the one that came back had the marker on it
+and nothing else - which reads as a broken layout and is not. Both label
+commands now print the feed length **in millimetres**, because that is
+the number that has to match the paper, and the default is the stock that
+is actually loaded.
+
 **Three characters means a place, four means a thing.** A location code
 is 3 and an inventory code is 4, and that is load bearing: the marker's
 payload already carries a format bit distinguishing 3-char codes from
