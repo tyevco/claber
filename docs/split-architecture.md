@@ -235,7 +235,9 @@ Everything is still on the Pi and the phone app is unchanged, but HMAC, HTTP fra
 
 ### Phase 4 — move `printd` off loopback. Still nothing else moves.
 `printd_bind = 0.0.0.0`, `printd_url = http://<pi-ip>:9101` from the workstation, and confirm a signed print works across the network. Now the boundary is real and the order side could live anywhere. **Stopping here permanently is a good outcome.** You have a print agent you can stop touching, CUPS support intact for a future printer, and every Group A bug fixed.
-Note what this does *not* fix: the label PDF now crosses the LAN in cleartext, carrying a buyer's home address. The HMAC authenticates and integrity-checks; it does not encrypt. If that matters, route `printd` through the existing cloudflared tunnel for TLS end to end — one hostname, no new software.
+Note what this does *not* fix: the label PDF now crosses the LAN in cleartext, carrying a buyer's home address. The HMAC authenticates and integrity-checks; it does not encrypt.
+
+**Decided: a mesh VPN (WireGuard/Tailscale) between the hosts, not the cloudflared tunnel this paragraph used to recommend.** The tunnel is wrong for *this* path: it puts an internet dependency between two machines in one house, so Cloudflare or the WAN going down stops a parcel shipping today. A mesh VPN is encrypted, keeps no third party on the critical path, and keeps working when the internet does not. cloudflared stays for the phone app, where an outage costs a page load rather than a parcel. If the cluster ever lives off-site this flips back, and that is the moment to revisit it.
 
 ### Phase 5 — optional, and only against a named precondition
 **Precondition: an alarm that lives outside the order side.** A cluster outage longer than `lookback_days` drops mail silently, and no in-process warning can detect its own absence. Acceptable answers: a cron on the Pi that curls the order side's `/healthz` and prints a physical warning label if it has been down for hours; or a Cloudflare healthcheck; or a dead-man ping. Until one exists, do not move the poller.
