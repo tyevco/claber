@@ -903,42 +903,78 @@ def cmd_supvan_test_print(cfg, args):
     raw, stride, rows = supvan_mod.render_test_pattern(
         args.width, args.height, invert=args.invert, style=args.style,
         clip=clip)
-    if args.max_buffer:
-        bands = supvan_mod.split_bitmap(raw, stride, args.max_buffer,
-                                        dict_size=args.dict_size)
-        payload = {"buffers": [(c, n) for c, _r, n in bands]}
-        total = sum(len(c) for c, _r, _n in bands)
+
+    if args.bare_raster:
+        # The shape every generated label was refused in, kept so the
+        # change that fixed it can be shown to be the change that fixed
+        # it. A bare raster carries no buffer header and no checksum, and
+        # its length is not a multiple of 4096.
+        if args.max_buffer:
+            bands = supvan_mod.split_bitmap(raw, stride, args.max_buffer,
+                                            dict_size=args.dict_size)
+            payload = {"buffers": [(c, n) for c, _r, n in bands]}
+            total = sum(len(c) for c, _r, _n in bands)
+        else:
+            compressed = supvan_mod.compress_bitmap(
+                raw, args.lzma, dict_size=args.dict_size,
+                declare_size=args.declare_size)
+            bands = [(compressed, rows, len(raw))]
+            payload = {"compressed": compressed, "raw_len": len(raw)}
+            total = len(compressed)
+        buffers = len(bands)
     else:
-        compressed = supvan_mod.compress_bitmap(
-            raw, args.lzma, dict_size=args.dict_size,
-            declare_size=args.declare_size)
-        bands = [(compressed, rows, len(raw))]
-        payload = {"compressed": compressed, "raw_len": len(raw)}
-        total = len(compressed)
+        job = supvan_mod.build_job(
+            raw, stride, rows, density=args.density,
+            margin_top=args.margin, margin_bottom=args.margin,
+            dict_size=args.dict_size)
+        payload = {"compressed": job["compressed"],
+                   "raw_len": job["raw_len"]}
+        bands = [(job["compressed"], rows, job["raw_len"])]
+        total = len(job["compressed"])
+        buffers = job["buffers"]
+
+    # Speed is a function of how well the image compressed, not a
+    # constant - see supvan.calc_speed. --speed still overrides, because
+    # holding it still is how it gets tested on its own.
+    speed = args.speed
+    if speed is None:
+        speed = (supvan_mod.calc_speed(total // max(buffers, 1))
+                 if not args.bare_raster else 60)
 
     print(f"device : {device}")
     ink = sum(bin(b).count("1") for b in raw)
     blank = sum(1 for y in range(rows) if not any(raw[y * stride:(y + 1) * stride]))
     print(f"pattern: {args.style}, {args.width} dots wide, {stride} bytes/row, "
           f"{rows} rows" + (", inverted" if args.invert else ""))
-    # Ink and blank rows are printed because they are live variables, not
-    # decoration: the device took 0.13% ink in 7 reports and refused 7.54%
-    # in 12, and which of those it objects to is the open question.
+    # Ink and blank rows stay on show because CLAUDE.md asks for every
+    # property that moved to be tabulated before a label is spent, not
+    # just the one being varied.
     print(f"         {100 * ink / (len(raw) * 8):.2f}% ink, "
           f"{blank}/{rows} rows blank")
     print(f"raw    : {len(raw)} bytes")
-    print(f"lzma   : {total} bytes in {len(bands)} buffer(s), "
-          f"{args.lzma if args.max_buffer == 0 else 'device'} container, "
+    if args.bare_raster:
+        print("shape  : bare raster - no buffer header, no checksum. "
+              "This is the shape the device refuses.")
+    else:
+        print(f"buffers: {buffers} x {supvan_mod.PRINT_BUF_SIZE} = "
+              f"{job['raw_len']} bytes, {args.margin}-dot margins, "
+              f"density {args.density}")
+        print(f"         column-major LSB-first, "
+              f"{supvan_mod.MAX_BUF_DATA // stride} lines per buffer")
+    single = args.bare_raster and args.max_buffer == 0
+    print(f"lzma   : {total} bytes in {len(bands)} stream(s), "
+          f"{args.lzma if single else 'device'} container, "
           f"dict {args.dict_size}"
-          + ("" if args.max_buffer else
-             f", size {'declared' if args.declare_size else 'unknown'}"))
+          # --declare-size only reaches the single-stream bare-raster
+          # path; everywhere else the size is declared because a stream
+          # with no end marker is undecodable without it.
+          + (f", size {'declared' if args.declare_size else 'unknown'}"
+             if single else ", size declared"))
     for i, (c, band_rows, _n) in enumerate(bands, 1):
         print(f"       {i:>2}: {len(c):>4} bytes, {-(-len(c) // 64):>2} "
-              f"reports, {band_rows} rows, head {c[:13].hex(' ')}")
-    if args.max_buffer:
-        print(f"         split at {args.max_buffer} bytes; 419 in 7 reports "
-              f"printed, 695 in 11 did not")
-    print(f"announce {args.announce} length, speed {args.speed}")
+              f"reports, head {c[:13].hex(' ')}")
+    print(f"announce {args.announce} length, speed {speed}"
+          + ("" if args.speed is not None else " (derived)"))
 
     if args.dry_run:
         print("\ndry run - nothing sent, no paper moved")
@@ -953,7 +989,7 @@ def cmd_supvan_test_print(cfg, args):
     print("\nrunning the sequence:")
     try:
         final = supvan_mod.experimental_print(
-            payload, path=device, speed=args.speed, announce=args.announce,
+            payload, path=device, speed=speed, announce=args.announce,
             buffer_len=args.buffer_len, on_step=step)
     except supvan_mod.SupvanError as exc:
         raise SystemExit(f"\nstopped: {exc}")
@@ -1414,16 +1450,26 @@ def _main():
     # fit: 419 bytes in 7 reports printed, 695 in 11 was refused with
     # ink ruled out in between. 0 sends one buffer, which is how the
     # old single-stream behaviour is reproduced.
-    p.add_argument("--max-buffer", type=int,
-                   default=supvan_mod.MAX_BUFFER_BYTES,
-                   help="split the image into buffers no larger than "
-                        "this many compressed bytes (default %(default)s, "
-                        "7 reports, the largest seen to print). 0 sends "
-                        "one buffer however big it is")
-    # The only bitmap that has ever printed is the vendor's own, whose
-    # ink stops at x=351 where every pattern here runs to x=383. 352
-    # dots is 44 whole bytes. --clip tests that directly by blanking
-    # everything outside a box, leaving the image size unchanged.
+    p.add_argument("--max-buffer", type=int, default=0,
+                   help="--bare-raster only, and superseded: split on "
+                        "compressed size, chasing a per-buffer byte limit "
+                        "that turned out not to exist. The real split is by "
+                        "printhead line into 4096-byte buffers and is now "
+                        "automatic. 0 disables it")
+    p.add_argument("--bare-raster", action="store_true",
+                   help="send a bare raster with no print-buffer header or "
+                        "checksum - the shape every generated label was "
+                        "refused in. Kept so the fix can be shown to be "
+                        "the fix")
+    p.add_argument("--density", type=int,
+                   default=supvan_mod.DEFAULT_DENSITY,
+                   help="burn energy 0-15 (default %(default)s, the "
+                        "vendor's own default)")
+    p.add_argument("--margin", type=int,
+                   default=supvan_mod.DEFAULT_MARGIN_DOTS,
+                   help="blank dots the firmware feeds at each end of the "
+                        "label (default %(default)s). Declared in the "
+                        "buffer header; these columns are not sent")
     p.add_argument("--clip", metavar="WxH",
                    help="blank any dot at or beyond W across or H "
                         "down, keeping the image the same size. Their "
@@ -1464,9 +1510,12 @@ def _main():
                    help="which length 0x5c carries (default %(default)s)")
     # 0x3c, straight off the wire. The captured buffer-full command is
     # `c0 40 00 7b 10 00 08 00 00 3c` - second value 60, where this sent 1.
-    p.add_argument("--speed", type=int, default=60,
-                   help="second value in 0x10 (default %(default)s, from "
-                        "the captured print)")
+    p.add_argument("--speed", type=int, default=None,
+                   help="second value in 0x10. Derived from the compressed "
+                        "size by default (supvan.calc_speed), which is what "
+                        "the vendor does - the captured print's 60 is that "
+                        "function's answer for a nearly blank label, not a "
+                        "constant. Pass a value to hold it still")
     p.add_argument("--buffer-len", choices=["compressed", "raw"],
                    help="which length 0x10 carries; defaults to --announce")
     p.add_argument("--dict-size", type=int,

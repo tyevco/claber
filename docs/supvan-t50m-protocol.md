@@ -627,16 +627,105 @@ That also explains an early experiment: `--invert` on a 7.5% pattern asks
 for a **92.5% black** label, and the device pulled the media back rather
 than print it. `--invert` is wrong for this device; the default is right.
 
+### Answered: it was never the raster, it was the print buffer
+
+Every conclusion in the three sections above is superseded by this one,
+and the reason they kept collapsing is that they were all measuring the
+compressed stream when the firmware objects to what is *inside* it.
+
+The device does not take a raster. It takes a sequence of fixed
+**4096-byte print buffers**, each carrying a 14-byte header and a
+checksum, and the whole sequence is compressed as a single LZMA stream.
+
+```
+[0:2]   checksum, little-endian
+[2:4]   PAGE_REG_BITS   page flags, cut mode, black density, material
+[4:6]   column count, little-endian
+[6]     bytes per printhead line
+[7]     reserved, 0
+[8:10]  margin top, little-endian dots
+[10:12] margin bottom
+[12]    red density
+[13]    0
+[14:]   image data, column-major LSB-first, at most 4074 bytes
+```
+
+The checksum is `sum(buf[2:14])` plus the byte immediately before every
+256-byte boundary within `cols * per_line + 14`. The firmware re-reads its
+running total at each of those boundaries, so leaving them out gives a
+checksum that looks right and is not.
+
+**This is why the only bitmap that ever printed was the vendor's own.**
+The captured stream decompresses to 12288 bytes, which this document read
+as "48 bytes per row x 256 rows". It is not a raster at all: it is
+`3 x 4096`, three print buffers with their headers and checksums. Replaying
+it printed because it was already three valid buffers; re-encoding it
+printed because the encoder round-trips them untouched. Everything this
+repo *drew* was a bare raster of some other length, so the firmware
+refused it - and `media_seating_error` is its only word for "no", which is
+why the shape of the mistake never showed.
+
+So the retracted size hypotheses were all measuring a proxy. 82 bytes in
+two reports was refused not because 82 is too small or two reports too
+few, but because it decompressed to something that was not whole print
+buffers. There is no per-buffer compressed ceiling to bisect.
+
+Three more things fall out, and one of them is a bug this repo had:
+
+- **Bit order.** The printhead reads the leftmost dot from the *least*
+  significant bit. `render_test_pattern` and `printers.render_bitmap` both
+  pack MSB-first, as every other raster here does. A printhead line and a
+  raster row are already the same run of bytes, so the fix is a bit
+  reversal per byte and no transpose - `supvan.raster_to_column_major`.
+- **Speed is derived, not constant.** The captured `BUF_FULL` carried a
+  second value of 60 and this repo sent 60 as a constant. It is
+  `calc_speed(average compressed bytes per buffer)`: 123 bytes over three
+  buffers averages 41, and 41 lands in the bottom band. A real label
+  compresses larger and must print *slower*, so the head has time to
+  heat. Sending 60 for a dense label is a fault waiting to happen.
+- **Margins are declared, not drawn.** The header names how many blank
+  dots to feed at each end and those columns are not sent.
+
+### Where this came from
+
+`github.com/heeen/supvan-cups` (MIT), a CUPS/IPP driver for these
+printers reverse-engineered from the Katasymbol Android app v1.4.20. It
+supports the T50M Pro explicitly, and its reference unit's serial prefix
+(`T0117A`) is the same as ours. The buffer layout, the checksum stride and
+`calc_speed` are transcribed from the vendor's `T50PlusPrint.initLZMAData`
+and `multiCompression` via two independent implementations in that repo -
+its Rust `supvan-proto` crate and the `test_print.py` it ships - which
+agree byte for byte.
+
+Cross-checked against our own hardware capture rather than taken on
+trust: its `calc_speed` reproduces the captured 60, its `0x5c` and `0x10`
+parameters match our six pinned frames, and a 384x256 pattern at the
+vendor's default 8-dot margins assembles to 12288 bytes in three buffers
+with an LZMA header byte-identical to the captured one. The height is not
+independent evidence - 256 was chosen back when 12288 was being read as a
+raster - but the rest is.
+
+One deliberate divergence: that driver keeps liblzma's end-of-stream
+marker and patches the declared size over it. Our capture has a declared
+size and **no marker**, so `lzma1.py` stays the default. Both apparently
+print, which suggests the marker is not load-bearing after all - but the
+capture is the only thing this repo has watched work, so it is what we
+match.
+
 ### Still not determined
 
-- **Row order and origin.** 48 bytes per row and 384 dots across are
-  confirmed from the captured image, but which end of the row is dot 0
-  and which end of the roll is row 0 are not. `--style sparse` is drawn
-  asymmetrically so one printed label answers both.
-- **The exact per-buffer ceiling.** Somewhere in (419, 695] bytes. Only
-  bisection settles it, at a label per attempt, and it only moves a
-  default - so it has been left alone.
-- **Whether the multi-buffer sequence is right.** Untested on hardware.
+- **Whether any of this prints.** The format is settled on paper and the
+  encoder is settled on hardware, but no label built by
+  `supvan.build_job` has come out of the device. That is one label to
+  find out, and it is the next thing to spend one on.
+- **Which end of the roll column 0 is.** Column-major LSB-first settles
+  the bit order across the head; it does not say whether the first
+  printhead line is the leading or trailing edge of the label.
+  `--style sparse` is drawn asymmetrically so one printed label answers
+  it.
+- **Whether the multi-buffer sequence is right.** Untested on hardware. A
+  label longer than 84 printhead lines needs more than one buffer, and
+  84 lines is 10.5mm - so almost every real label does.
 
 ## If implementing
 
