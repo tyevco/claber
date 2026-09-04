@@ -195,7 +195,9 @@ def safe_static_path(rel):
 def asset_stamp():
     """A short hex stamp that moves whenever a served asset does."""
     newest = 0
-    for name in ("app.js", "app.css"):
+    # Every served asset, or a change to one that is missing here
+    # ships to a phone that goes on using its cached copy.
+    for name in ("app.js", "app.css", "marker.js"):
         try:
             newest = max(newest, int((STATIC / name).stat().st_mtime))
         except OSError:
@@ -207,7 +209,9 @@ def shell_html(path):
     """index.html with its asset URLs version-stamped."""
     stamp = asset_stamp()
     html = path.read_text(encoding="utf-8")
-    for name in ("app.js", "app.css"):
+    # Every served asset, or a change to one that is missing here
+    # ships to a phone that goes on using its cached copy.
+    for name in ("app.js", "app.css", "marker.js"):
         html = html.replace(f'"/{name}"', f'"/{name}?v={stamp}"')
     return html
 
@@ -296,6 +300,7 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", r"^/api/orders$", "h_orders", True),
         ("GET", r"^/api/orders/(?P<sid>\d+)$", "h_order", True),
         ("GET", r"^/api/orders/(?P<sid>\d+)/label$", "h_label", True),
+        ("GET", r"^/api/lookup/(?P<code>[0-9A-Za-z]{3,4})$", "h_lookup", True),
         ("GET", r"^/api/pending$", "h_pending", True),
         ("GET", r"^/api/stats$", "h_stats", True),
         ("GET", r"^/api/system$", "h_system", True),
@@ -488,6 +493,35 @@ class Handler(BaseHTTPRequestHandler):
         if path is None:
             return self.fail(404, "no label on file")
         self._send(200, path.read_bytes(), ctype="application/pdf")
+
+    def h_lookup(self, code):
+        """What a scanned code names - a parcel, or a thing on a shelf.
+
+        Two code spaces meet here and they are not the same length by
+        accident: a parcel code is 3 characters and released for reuse
+        once the parcel ships, an inventory code is 4 and never reused.
+        Sales are searched first because a code that is currently on a
+        box waiting to go out is the more urgent of the two readings.
+
+        Case-insensitive: this is read off thermal paper by a camera,
+        and the alphabet has no lowercase in it anyway."""
+        # Imported here, not at module scope, like every other use of
+        # cli in this file: cli imports web for `serve`.
+        from . import cli as cli_mod
+
+        code = (code or "").upper()
+        sale = cli_mod.find_sale(self.db(), code)
+        if sale is not None and (sale["code"] or "").upper() == code:
+            return self.json({"kind": "sale", "id": sale["id"],
+                              "detail": _order_detail(sale)})
+
+        row = self.db().execute(
+            "SELECT listing_id, title, price, state, inventory_code "
+            "FROM listings WHERE UPPER(inventory_code)=?",
+            (code,)).fetchone()
+        if row is not None:
+            return self.json({"kind": "listing", "listing": dict(row)})
+        return self.fail(404, f"nothing here is called {code}")
 
     def h_pending(self):
         """Recorded but never printed - the same query cmd_pending uses,

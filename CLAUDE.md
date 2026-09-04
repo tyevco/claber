@@ -57,7 +57,7 @@ run against a real database.
 | `file <pdf> [-o] [--rotate] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
 | `probe` | printers, USB devices, IEEE-1284 id |
 | `selftest` | tiny text-only TSPL label |
-| `inventory-label --code X [--qr] [--preview PNG]` | draw one 48mm inventory label and show what the label maker would burn. No DB |
+| `inventory-label --code X [--qr\|--marker] [--preview PNG]` | draw one 48mm inventory label and show what the label maker would burn. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -108,8 +108,11 @@ src/mplabel/
   printers.py    TSPL/ZPL raw backends, CUPS backends, rasteriser, probe
   listings.py    listings schema, subject classification, analytics views
   backfill.py    one-off mailbox survey and historical import
+  rs.py          Reed-Solomon over GF(256), encode and decode
   qr.py          a QR encoder, stdlib only, versions 1-10
-  inventory.py   draws the 48mm inventory label, with or without a QR
+  marker.py      the shelf marker: a 12x12 code for our own 3-4 char codes
+  inventory.py   draws the 48mm inventory label; QR or shelf marker
+  static/marker.js  the marker decoder in the browser, a port of marker.py
   savedpage.py   parse a saved Marketplace selling page
   sheets.py      Google Sheets sync via service account
   supvan.py      T50M Pro label maker: HID transport, frames, status
@@ -213,6 +216,8 @@ hardware or a real Facebook account.
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
 | `escpos` backend | **UNUSED and unproven.** Written while the id was believed, kept because the job structure is unit-tested and some sibling models really do speak ESC/POS. Nothing it produces has ever printed. Its banding size and trailing form feed are guesses. |
 | The QR encoder | **Verified against two independent oracles, never printed.** `qr.py` is hand-written to keep the Pi dependency list short. Its codeword stream is identical to `segno`'s for every version, level and mode in range; all 350 symbols in the sweep decoded correctly through `zxing-cpp`; the Reed-Solomon matches the specification's worked example and the format bits match its published table. Neither library is a dependency - they were the oracle, and pinned matrix digests are what is left of them. **Never read off thermal paper**, where the module size and the burn darkness both matter. |
+| The shelf marker | **Round-trips in software, never printed or photographed.** 12x12 modules carrying 4 data bytes and 8 Reed-Solomon parity, so any 4 of the 12 can be wrong. Reads back clean, at all four rotations, under a 2.5px blur, scaled to 35%, with 2% salt-and-pepper noise, and out of the decoded print-buffer payload of a real label at 8 dots per module against the QR's 5. **Never read off thermal paper by a real camera**, which is the only test that counts - bleed closes modules up and a phone adds glare, motion and a lens. 5% salt-and-pepper still defeats it. |
+| The browser decoder | **Agrees with the Python reference; never run against a real camera.** `static/marker.js` matches `marker.py` byte for byte on clean and damaged codewords under node. What is untested is everything a phone does: exposure, focus, rolling shutter, and whether the aiming reticle is a usable way to hold a box. |
 | The inventory label | **Assembles and round-trips; never printed.** `inventory-label --preview` renders it, builds the real print buffers, decodes them back with every checksum checked, and the QR still scans out of that payload at all four correction levels. What is untested is everything physical: whether 5 dots per QR module survives thermal bleed, and whether the text is legible at 48mm. |
 | TSPL gap value 0.12in | **ASSUMED.** Typical for 4x6 die-cut; not measured on their stock. |
 | Facebook subject patterns | **Partly verified** against a real mailbox survey. Seen and handled: `Shipping label for your Marketplace order`, `New Marketplace order for <item>` (the sale itself, arriving before the label), and messages as `<emoji> <name> sent you a message`. The rest of `EVENT_PATTERNS` (listed / renewed / expired / payout / rating) is still **ASSUMED** - none has been seen. |
@@ -423,6 +428,51 @@ mojibake - and whatever the editor shows is what gets printed. It cannot
 print 4x6 shipping labels either: 48mm is 384 dots against the 812 the
 pipeline emits, so that stays with the G4.
 
+**The all-zero codeword is a valid codeword, and it used to read as
+"000".** Reed-Solomon is happy with all zeros - every syndrome is zero -
+and `crc8(b"\0\0\0")` is also zero, so a blank picture satisfied every
+check in `marker.py` and returned a real code, confidently, from a
+photograph of nothing. Marker formats are therefore numbered from **1**,
+which makes format 0 unreachable, and `read_grid` refuses anything whose
+finder scores under `MIN_FINDER_SCORE`. Blank and noise both score about
+22 of 44. Do not renumber the formats back to zero to "tidy" them.
+
+**Reed-Solomon corrects; it does not certify.** A clean return from
+`rs.decode` means *some* valid codeword was reached, not the right one.
+On the marker's dimensions it refused on all 4000 over-capacity trials
+rather than mis-correcting, so this is a guard against something not yet
+seen here - but the consequence is a label naming the wrong object, which
+is silent, so the payload carries its own CRC and it is re-checked after
+correction.
+
+**`marker.read_image` needs a crop, not a label.** The grid is located
+from the bounding box of the ink, so a whole label - code, title, price -
+stretches that box across everything and samples the marker at the wrong
+pitch. `inventory.marker_box()` is where the rectangle comes from, and
+the phone app's aiming reticle is how it happens there. The reticle in
+`app.css` and `SCAN_BOX` in `app.js` are the same fraction on purpose:
+the person lines up the square that `scanTick` actually crops.
+
+**One speck decides the bounding box.** It is a min and a max over every
+dark pixel, so a single dust mote in a corner stretches the grid and
+every module after it is sampled in the wrong place - 44/44 to 11/44 with
+the picture otherwise perfect. `_despeckle` clears dark pixels with fewer
+than two dark neighbours, and `_ink_bounds` needs two dark pixels in a
+line before it counts it.
+
+**`marker.js` is a port and has to stay one.** The printer writes these
+and the phone reads them; a drift between the two ends is a code that
+prints and cannot be scanned. `test_marker_js_port_agrees_with_python`
+runs the browser file under node against vectors generated from the
+Python side, damaged codewords included, because error correction is
+exactly where a port diverges quietly. It has already caught one: the
+format renumbering above landed in Python and not in JavaScript.
+
+**A served asset missing from `asset_stamp` never reaches the phone.**
+It lists the files whose mtime busts the cache. `marker.js` is on that
+list; anything else added to `static/` must be too, or the phone goes on
+running the copy it has.
+
 **The label preview is decoded from the payload, not from the drawing.**
 `inventory-label --preview` assembles the real job, then takes it apart
 again - decompressing, checking every buffer checksum, reading the
@@ -573,11 +623,14 @@ Roughly in priority order.
    is drawn asymmetrically to settle which end of the roll column 0 is.
    One variable per label, as ever.
 
-   Two things to check on the paper that no test here can reach: whether
-   the QR scans off thermal stock at 5 dots per module (it scans out of
-   the wire payload, which is not the same thing - bleed closes up the
-   modules), and whether the wrapped title is legible at 48mm. Both are
-   `--density` knobs before they are layout changes.
+   Three things to check on the paper that no test here can reach:
+   whether the QR scans off thermal stock at 5 dots per module (it scans
+   out of the wire payload, which is not the same thing - bleed closes
+   up the modules), whether the **shelf marker** scans at 8, and whether
+   the wrapped title is legible at 48mm. All are `--density` knobs
+   before they are layout changes. `inventory-label --marker` and
+   `--qr` draw the two candidates on the same label size, so one print
+   run settles which carrier to keep.
 
 2. **Learn the real email subjects.** `python -m mplabel scan` prints
    unrecognised Facebook subject lines with counts. Add them to

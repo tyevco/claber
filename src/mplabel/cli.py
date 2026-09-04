@@ -821,14 +821,19 @@ def cmd_inventory_label(cfg, args):
         except ValueError:
             price = args.price
 
+    if args.qr and args.marker:
+        raise SystemExit("--qr and --marker both want the same square; "
+                         "pick one")
     raster, stride, rows = inventory_mod.render_label(
         args.code, title=args.title, price=price, with_qr=args.qr,
-        height_mm=args.height, ecl=args.ecl)
+        with_marker=args.marker, height_mm=args.height, ecl=args.ecl)
     job = supvan_mod.build_job(raster, stride, rows,
                                density=args.density)
 
-    print(f"code   : {args.code}" + ("  (+ QR carrying the same code)"
-                                     if args.qr else ""))
+    carrier = ("  (+ QR carrying the same code)" if args.qr else
+               "  (+ shelf marker carrying the same code)" if args.marker
+               else "")
+    print(f"code   : {args.code}{carrier}")
     print(f"label  : 48 x {args.height}mm, {stride * 8} x {rows} dots")
     ink = sum(bin(b).count("1") for b in raster)
     print(f"         {100 * ink / (len(raster) * 8):.2f}% ink")
@@ -1508,6 +1513,12 @@ def _main():
                    help="add a QR of the same code, so a phone can read "
                         "the box without anyone squinting at four "
                         "characters on thermal paper")
+    p.add_argument("--marker", action="store_true",
+                   help="add the shelf marker instead of a QR. Same code, "
+                        "far bigger modules - a QR version 1 holds 152 "
+                        "bits where a code needs 20, and the difference "
+                        "is paid for in module size. Read by the phone "
+                        "app's scanner, and by nothing else")
     p.add_argument("--ecl", choices=["L", "M", "Q", "H"], default="M",
                    help="QR error correction (default %(default)s). A "
                         "code this short fits version 1 even at H")
