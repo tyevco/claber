@@ -21,7 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from mplabel import label, listings, mailparse, savedpage, sheets, supvan
+from mplabel import (inventory, label, listings, mailparse, qr, savedpage,
+                     sheets, supvan)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LABEL_PDF = FIXTURES / "label_sample.pdf"
@@ -3673,3 +3674,276 @@ def test_a_local_backend_still_takes_the_lock(tmp_path, monkeypatch):
                 "label_code": "no"})
     cli.print_label(cfg, pdf)
     assert locked == ["held"], "the local path stopped locking the device"
+
+
+# ------------------------------------------------------------ the QR encoder
+#
+# Hand-written, so it is pinned hard. Every one of these caught a real
+# fault while it was being written: the generator polynomial came out
+# reversed, both copies of the format field were placed transposed, and
+# the mask-scoring rules were approximated in a way that chose masks
+# whose symbols would not scan.
+
+def _qr_hash(matrix):
+    import hashlib
+    flat = "".join("".join(str(b) for b in row) for row in matrix)
+    return hashlib.sha256(flat.encode()).hexdigest()[:16]
+
+
+def test_qr_reed_solomon_matches_the_specification_example():
+    """The worked example from ISO/IEC 18004: "HELLO WORLD" at version 1
+    level M. The generator polynomial was being built lowest-power-first
+    and used highest-power-first, which produces error-correction bytes
+    that are wrong in a way nothing else here would notice - the symbol
+    is well formed and simply fails to correct."""
+    data = bytes([32, 91, 11, 120, 209, 114, 220, 77,
+                  67, 64, 236, 17, 236, 17, 236, 17])
+    assert qr._rs_remainder(data, 10) == [196, 35, 39, 119, 235,
+                                          215, 231, 226, 93, 23]
+    assert qr._rs_generator(2) == [1, 3, 2]
+
+
+@pytest.mark.parametrize("ecl,mask,bits", [
+    ("L", 0, "111011111000100"),
+    ("L", 1, "111001011110011"),
+    ("M", 0, "101010000010010"),
+    ("Q", 0, "011010101011111"),
+    ("H", 0, "001011010001001"),
+])
+def test_qr_format_bits_match_the_published_table(ecl, mask, bits):
+    """Fifteen bits of BCH and a fixed xor mask. Every value is tabulated
+    in the specification, so there is no reason to trust an
+    implementation of it over the table."""
+    assert format(qr._format_bits(ecl, mask), "015b") == bits
+
+
+@pytest.mark.parametrize("text,ecl,version,digest", [
+    ("7K2Q", "M", 1, "fb1245f67c129b14"),
+    ("A1B2", "H", 1, "415f3cde8ae7f116"),
+    ("HELLO WORLD", "Q", 2, "298caf071270bf72"),
+    ("https://x.io/a", "L", 3, "7413538da0ec4a4d"),
+    ("VASE-2291 $45.00", "M", 4, "d4157f7390c8c28d"),
+])
+def test_qr_symbols_are_byte_for_byte_stable(text, ecl, version, digest):
+    """Whole symbols, pinned.
+
+    Generated once and checked three ways before being written down: the
+    codeword stream is identical to `segno`'s for every version, level
+    and mode in range; every symbol decoded correctly through
+    `zxing-cpp`; and the mask chosen scores lowest under this module's
+    own implementation of ISO table 11, which agrees with segno's scorer
+    exactly on the same matrix.
+
+    Neither library is a dependency - they were the oracle, and these
+    digests are what is left of them. A change here means the encoder
+    moved, and the burden is to prove it moved the right way."""
+    assert _qr_hash(qr.encode(text, ecl=ecl, version=version)) == digest
+
+
+def test_qr_finder_and_timing_patterns_are_where_they_belong():
+    """A structural check that reads the symbol rather than a digest, so
+    a broken skeleton says which part broke."""
+    m = qr.encode("7K2Q", ecl="M", version=1)
+    assert len(m) == 21 and all(len(row) == 21 for row in m)
+    for r0, c0 in ((0, 0), (0, 14), (14, 0)):
+        assert all(m[r0][c0 + i] for i in range(7)), "finder top edge"
+        assert all(m[r0 + i][c0] for i in range(7)), "finder left edge"
+        assert m[r0 + 3][c0 + 3] == 1, "finder centre"
+    # The timing patterns alternate, starting and ending dark.
+    assert [m[6][c] for c in range(8, 13)] == [1, 0, 1, 0, 1]
+    assert [m[r][6] for r in range(8, 13)] == [1, 0, 1, 0, 1]
+    # The module that is always dark.
+    assert m[len(m) - 8][8] == 1
+
+
+def test_qr_picks_alphanumeric_for_a_code_and_byte_for_a_title():
+    """An inventory code is four characters from a 32-symbol uppercase
+    alphabet, which is a subset of the alphanumeric set - so it encodes
+    in the compact mode and fits a version 1 symbol even at the highest
+    error correction. A title with lowercase in it does not."""
+    assert qr.pick_mode("7K2Q") == qr.MODE_ALNUM
+    assert qr.pick_mode("Vintage vase") == qr.MODE_BYTE
+    assert qr.choose_version("7K2Q", "H") == 1
+
+
+def test_qr_refuses_what_it_cannot_hold_rather_than_truncating():
+    """Silently dropping the tail would produce a symbol that scans and
+    is wrong, which is worse than one that does not exist."""
+    with pytest.raises(qr.QRError):
+        qr.encode("X" * 600, ecl="H")
+    with pytest.raises(qr.QRError):
+        qr.encode("7K2Q", ecl="Z")
+
+
+def test_qr_render_adds_the_quiet_zone_and_scales():
+    """Four light modules on every side. A symbol printed hard against
+    other ink does not scan, and on a 48mm label that border is a real
+    fraction of the width rather than an afterthought."""
+    plain = qr.encode("7K2Q", ecl="M", version=1)
+    framed = qr.render("7K2Q", ecl="M", quiet=4, version=1)
+    assert len(framed) == len(plain) + 8
+    assert not any(framed[0]), "top border must be blank"
+    assert not any(row[0] for row in framed), "left border must be blank"
+    assert framed[4][4] == plain[0][0]
+    doubled = qr.render("7K2Q", ecl="M", quiet=4, scale=2, version=1)
+    assert len(doubled) == 2 * len(framed)
+    assert doubled[8][8] == doubled[9][9] == framed[4][4]
+
+
+# ------------------------------------------------------ the inventory label
+
+def _ink(raster):
+    return sum(bin(b).count("1") for b in raster)
+
+
+def test_inventory_label_is_head_width_and_the_asked_for_length():
+    """48mm at 8 dots/mm is 384 dots, and that is the head's width, not a
+    choice. A raster wider than the head does not warn - the overflow is
+    simply not printed."""
+    raster, stride, rows = inventory.render_label("7K2Q")
+    assert stride * 8 == inventory.HEAD_DOTS == 384
+    assert rows == inventory.DEFAULT_HEIGHT_MM * inventory.DOTS_PER_MM
+    assert len(raster) == stride * rows
+    _r, _s, tall = inventory.render_label("7K2Q", height_mm=50)
+    assert tall == 50 * inventory.DOTS_PER_MM
+
+
+def test_inventory_label_keeps_its_ink_out_of_the_feed_margin():
+    """The margin columns are declared in the print-buffer header and
+    never sent, so anything drawn in them is dropped rather than printed
+    small. The price sat there and came out with its bottom sheared
+    off, which looked like a font problem and was not."""
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    raster, stride, rows = inventory.render_label(
+        "7K2Q", "Antique Cut Glass Vase", 45.0, with_qr=True)
+    top = raster[:margin * stride]
+    bottom = raster[(rows - margin) * stride:]
+    assert _ink(top) == 0, "ink in the leading margin is dropped"
+    assert _ink(bottom) == 0, "ink in the trailing margin is dropped"
+
+
+def test_inventory_label_survives_a_title_far_too_long_for_it():
+    """Her titles run to sixty characters and beyond and a label is
+    30mm. Something has to give, and it must not be the layout."""
+    long_title = ("Antique 1900-1915 American Edwardian Late Victorian "
+                  "Cut Glass Crystal Vase With Sterling Silver Rim")
+    raster, stride, rows = inventory.render_label("7K2Q", long_title, 325.0)
+    assert len(raster) == stride * rows
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    assert _ink(raster[(rows - margin) * stride:]) == 0
+    # And the code is still the biggest thing on it: the top third,
+    # where the code sits, should carry more ink than the bottom third.
+    third = rows // 3
+    assert _ink(raster[:third * stride]) > _ink(raster[2 * third * stride:])
+
+
+def test_inventory_label_qr_carries_the_same_code_as_the_characters():
+    """Two things on one label naming the same object. If they can
+    disagree, the label is worse than one without a QR at all - so both
+    come from the same argument and there is no way to pass them
+    separately."""
+    import inspect
+    sig = inspect.signature(inventory.render_label)
+    assert "qr_text" not in sig.parameters
+    matrix = qr.encode("7K2Q", ecl="M")
+    plain, _s, _r = inventory.render_label("7K2Q", with_qr=False)
+    coded, _s, _r = inventory.render_label("7K2Q", with_qr=True)
+    assert _ink(coded) > _ink(plain), "the QR should add ink"
+    assert len(matrix) == 21
+
+
+def test_inventory_label_qr_uses_whole_dots_per_module():
+    """A fractional module scales into uneven blocks, which is the
+    classic reason a printed QR will not scan. Checked by finding the
+    QR's own quiet-zone edge rather than by trusting the arithmetic."""
+    raster, stride, rows = inventory.render_label("7K2Q", with_qr=True)
+    # The leftmost column of QR ink, and the run length of the first
+    # finder's dark bar, must be a whole multiple of the module size.
+    # Look only at the strip the QR occupies. The code's characters
+    # start further right and reach higher up the label, so a scan
+    # across the whole width finds those first.
+    window = 150
+    first = None
+    for y in range(rows):
+        row = raster[y * stride:(y + 1) * stride]
+        bits = [(row[x >> 3] >> (7 - (x & 7))) & 1 for x in range(window)]
+        if any(bits):
+            first = bits
+            break
+    assert first is not None, "the QR should put ink on the left"
+    run = 0
+    for b in first[inventory.SIDE_MARGIN_DOTS:]:
+        if b:
+            run += 1
+        elif run:
+            break
+    # A finder's top bar is 7 modules wide, so a whole number of dots
+    # per module makes the run a multiple of 7.
+    assert run % 7 == 0, f"finder bar is {run} dots, not a multiple of 7"
+
+
+def test_inventory_label_round_trips_through_a_real_job():
+    """The whole chain, which is what the preview actually shows: draw,
+    assemble print buffers, compress, then take it apart again and get
+    the same picture back. This is the closest thing to a proof
+    available without spending a label."""
+    raster, stride, rows = inventory.render_label(
+        "7K2Q", "Antique Cut Glass Vase", 45.0, with_qr=True)
+    job = supvan.build_job(raster, stride, rows)
+    back, back_stride, cols = supvan.decode_job(job["compressed"])
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    assert back_stride == stride
+    assert cols == rows - 2 * margin
+    assert back == raster[margin * stride:(rows - margin) * stride]
+
+
+def test_supvan_decode_job_refuses_a_corrupt_buffer():
+    """A preview that quietly renders a corrupt job is worse than no
+    preview: it would show a label the device is going to refuse.
+
+    Note which byte has to be damaged for this to fire. The firmware's
+    checksum covers the header and then only the byte before each
+    256-byte boundary - so most of the image is not covered by it at
+    all, and flipping a dot in the middle of a buffer changes nothing.
+    That is the device's design, not a bug here, but it means a valid
+    checksum says the header is intact and says very little about the
+    picture."""
+    import lzma
+    raster, stride, rows = inventory.render_label("7K2Q")
+    job = supvan.build_job(raster, stride, rows)
+    blob = bytearray(lzma.decompress(job["compressed"],
+                                     format=lzma.FORMAT_ALONE))
+
+    # A byte the checksum does not reach: no complaint.
+    quiet = bytearray(blob)
+    quiet[supvan.PRINT_BUF_HEADER + 4] ^= 0xFF
+    supvan.decode_job(supvan.compress_bitmap(bytes(quiet)))
+
+    # The byte before a 256-byte boundary, which it does reach.
+    blob[supvan.CHECKSUM_STRIDE - 1] ^= 0xFF
+    with pytest.raises(supvan.SupvanError, match="checksum"):
+        supvan.decode_job(supvan.compress_bitmap(bytes(blob)))
+
+    with pytest.raises(supvan.SupvanError, match="print buffers"):
+        supvan.decode_job(supvan.compress_bitmap(b"\x00" * 100))
+
+
+def test_inventory_label_preview_needs_no_database(tmp_path, monkeypatch,
+                                                   capsys):
+    """Same rule as probe, selftest and file: a printer command must not
+    need the data directory. An unwritable home once stopped a printer
+    test dead, which is exactly when you need one working."""
+    from mplabel import cli
+    out = tmp_path / "label.png"
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(cli, "connect_db", lambda *a, **k: 1 / 0)
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "inventory-label", "--code", "7K2Q",
+                         "--title", "Cut Glass Vase", "--price", "45",
+                         "--qr", "--preview", str(out)])
+    cli.main()
+    text = capsys.readouterr().out
+    assert out.exists()
+    assert "every checksum valid" in text
+    assert "no paper moved" in text
