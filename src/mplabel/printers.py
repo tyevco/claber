@@ -16,7 +16,6 @@ Pick one with PRINTER_BACKEND in the config. If you do not know which,
 run `python3 printers.py --probe` to see what is attached.
 """
 
-import fcntl
 import hashlib
 import hmac
 import json
@@ -30,6 +29,17 @@ import time
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    # Windows has no fcntl. The Pi is the deployment target and the print
+    # lock matters there, but importing this module has to work anywhere
+    # or the tests cannot run off-target - which is where they are
+    # written. `cli.py` has carried this guard since the last time an
+    # unguarded import took the whole suite down on Windows; this is the
+    # second time, so the note is here too.
+    fcntl = None
 
 log = logging.getLogger("mplabel.printers")
 
@@ -482,6 +492,18 @@ def print_lock(cfg=None, device=None, required=False):
     of interlocking."""
     path = lock_path(cfg, device)
     fh = None
+    if fcntl is None:
+        # No flock off-Linux, and that is a warning even when `required`,
+        # unlike an unobtainable lock. `required` exists so a daemon
+        # notices it has lost interlocking against a device it shares;
+        # a platform with no flock at all also has no /dev/usb/lp0, so
+        # there is nothing to interlock and nothing to lose. Raising here
+        # would only stop the daemon being exercised off-target, which is
+        # where its tests run.
+        log.warning("printing without a lock (%s): no fcntl on this "
+                    "platform", path)
+        yield
+        return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # 0o666 at creation: whoever prints first must not lock everyone

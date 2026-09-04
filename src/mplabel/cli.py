@@ -1031,7 +1031,7 @@ def cmd_supvan_test_print(cfg, args):
         if args.max_buffer:
             bands = supvan_mod.split_bitmap(raw, stride, args.max_buffer,
                                             dict_size=args.dict_size)
-            payload = {"buffers": [(c, n) for c, _r, n in bands]}
+            payload = {"streams": [(c, n) for c, _r, n in bands]}
             total = sum(len(c) for c, _r, _n in bands)
         else:
             compressed = supvan_mod.compress_bitmap(

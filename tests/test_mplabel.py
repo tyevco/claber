@@ -2621,7 +2621,7 @@ def test_supvan_multi_buffer_print_repeats_the_cycle_per_buffer(monkeypatch):
     raw, stride, _rows = supvan.render_test_pattern(384, 256)
     bands = supvan.split_bitmap(raw, stride)
     supvan.experimental_print(
-        {"buffers": [(c, n) for c, _r, n in bands]}, settle=0)
+        {"streams": [(c, n) for c, _r, n in bands]}, settle=0)
 
     def opcodes(op):
         return [s for s in dev.sent
@@ -2701,7 +2701,7 @@ def test_supvan_a_silent_poll_is_retried_not_treated_as_failure(monkeypatch):
     raw, stride, _rows = supvan.render_test_pattern(384, 64)
     bands = supvan.split_bitmap(raw, stride)
     final = supvan.experimental_print(
-        {"buffers": [(c, n) for c, _r, n in bands]}, settle=0)
+        {"streams": [(c, n) for c, _r, n in bands]}, settle=0)
     assert final["errors"] == []
     assert dev.reads > 4 + 2, "the silences must actually have been reached"
 
@@ -2832,6 +2832,49 @@ def test_supvan_cli_rejects_a_malformed_clip(monkeypatch):
                          "--clip", "352"])
     with pytest.raises(SystemExit, match="WxH"):
         cli.main()
+
+def test_supvan_a_job_can_be_sent_without_unpacking_it(monkeypatch):
+    """`build_job`'s dict must go straight to `experimental_print`.
+
+    It could not: the job's "buffers" is a *count* of 4096-byte print
+    buffers inside one LZMA stream, and experimental_print read
+    "buffers" as a *list of separate LZMA streams*. Two different things
+    under one word, so passing a job through died on `for c, n in 3`.
+
+    It only bit `inventory-label --print`, because supvan-test-print
+    happened to unpack the job by hand first - which is exactly the shape
+    of bug that reaches hardware and not the test suite."""
+    dev = _FakeDevice(_status_report((0, 0)))
+    monkeypatch.setattr(supvan, "SupvanDevice", lambda *a, **k: dev)
+
+    raw, stride, rows = supvan.render_test_pattern(384, 240)
+    job = supvan.build_job(raw, stride, rows)
+    assert isinstance(job["buffers"], int)
+
+    final = supvan.experimental_print(job, speed=job["speed"], settle=0)
+    assert final["errors"] == []
+
+    sent = [s for s in dev.sent
+            if len(s) >= 5 and s[0] == 0xC0
+            and s[4] == supvan.OP_NEXT_FRAME_IS_BULK]
+    assert len(sent) == 1, "one LZMA stream, whatever the buffer count"
+
+
+def test_supvan_streams_and_buffers_are_not_the_same_key(monkeypatch):
+    """The multi-stream path still works, under its own name."""
+    dev = _FakeDevice(_status_report((0, 0)))
+    monkeypatch.setattr(supvan, "SupvanDevice", lambda *a, **k: dev)
+
+    raw, stride, _rows = supvan.render_test_pattern(384, 256)
+    bands = supvan.split_bitmap(raw, stride, max_bytes=40)
+    assert len(bands) > 1
+    supvan.experimental_print(
+        {"streams": [(c, n) for c, _r, n in bands]}, settle=0)
+
+    sent = [s for s in dev.sent
+            if len(s) >= 5 and s[0] == 0xC0
+            and s[4] == supvan.OP_NEXT_FRAME_IS_BULK]
+    assert len(sent) == len(bands)
 
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
@@ -3646,6 +3689,7 @@ def test_a_remote_backend_does_not_hold_the_lock_the_daemon_needs(tmp_path,
     assert held == ["pi-http"]
 
 
+@needs_flock
 def test_a_local_backend_still_takes_the_lock(tmp_path, monkeypatch):
     """The counterpart: nothing above was allowed to weaken the local
     path, where two processes on one Pi really do share the device."""
@@ -4148,7 +4192,7 @@ def test_marker_alphabet_matches_the_one_codes_are_minted_from():
     assert marker.ALPHABET == cli.CODE_ALPHABET
 
 
-def test_marker_js_port_agrees_with_python():
+def test_marker_js_port_agrees_with_python(tmp_path):
     """The phone reads these and the printer writes them, so the two
     implementations have to agree exactly. Run under node against
     vectors generated here - including damaged codewords, because the
@@ -4177,8 +4221,8 @@ def test_marker_js_port_agrees_with_python():
                         "grid": marker.encode(code)})
 
     script = """
-      const MK = require(process.argv[1]);
-      const V = JSON.parse(process.argv[2]);
+      const MK = require(process.argv[2]);
+      const V = JSON.parse(process.argv[3]);
       const bad = [];
       for (const v of V) {
         if (MK.decodePayload(v.clean) !== v.code) bad.push(v.code + ' clean');
@@ -4191,8 +4235,15 @@ def test_marker_js_port_agrees_with_python():
       }
       console.log(JSON.stringify(bad));
     """
+    # Via a file, not `node -e`. A multi-line -e argument reaches node
+    # as nothing at all on Windows - it exits 0 having printed neither
+    # stdout nor stderr, so the test failed on an empty JSON parse with
+    # no clue why. A single-line -e works, which is what makes it look
+    # like the port had broken rather than the invocation.
+    runner = tmp_path / "run_marker.js"
+    runner.write_text(script, encoding="utf-8")
     out = subprocess.run(
-        [node, "-e", script, str(static / "marker.js"), json.dumps(vectors)],
+        [node, str(runner), str(static / "marker.js"), json.dumps(vectors)],
         capture_output=True, text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == [], out.stdout

@@ -1103,10 +1103,16 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
     import time as _time
 
     say = on_step or (lambda *_a: None)
-    if "buffers" in payload:
-        buffers = [(bytes(c), int(n)) for c, n in payload["buffers"]]
+    # "streams", not "buffers". `build_job` returns a dict whose
+    # "buffers" is a *count* of 4096-byte print buffers inside a single
+    # LZMA stream, and this reads a *list of separate LZMA streams* - two
+    # different things under one word. Passing a job straight through
+    # crashed on `for c, n in 3`, and only on the one caller that did not
+    # unpack the job by hand first.
+    if "streams" in payload:
+        streams = [(bytes(c), int(n)) for c, n in payload["streams"]]
     else:
-        buffers = [(payload["compressed"], payload["raw_len"])]
+        streams = [(payload["compressed"], payload["raw_len"])]
 
     def lengths(compressed, raw_len):
         announced = len(compressed) if announce == "compressed" else raw_len
@@ -1182,8 +1188,8 @@ def experimental_print(payload, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
         _time.sleep(settle)
         status = check(dev, "after start print")
 
-        for index, (compressed, raw_len) in enumerate(buffers, 1):
-            of = f" ({index} of {len(buffers)})" if len(buffers) > 1 else ""
+        for index, (compressed, raw_len) in enumerate(streams, 1):
+            of = f" ({index} of {len(streams)})" if len(streams) > 1 else ""
             announced, buffered = lengths(compressed, raw_len)
 
             # Buffer-full clear is the only backpressure the document

@@ -392,6 +392,23 @@ the shape of the reasoning is worth remembering - the blunt pattern that
 survives every measurement was pointing straight at the cause, while each
 number that moved was a proxy for it.
 
+**One word, two meanings, and only one caller noticed.** `build_job`
+returns `"buffers"` as a *count* of 4096-byte print buffers inside a
+single LZMA stream; `experimental_print` read `"buffers"` as a *list of
+separate LZMA streams*. Passing a job straight through died on
+`for c, n in 3`. It only bit `inventory-label --print`, because
+`supvan-test-print` happened to unpack the job by hand first - so the
+suite was green and the failure waited for the hardware. The list is
+`"streams"` now, and a test sends a `build_job` dict unmodified.
+
+**`import fcntl` must stay guarded, in every module.** This is the second
+time an unguarded one has taken the whole suite down on Windows, which is
+where these tests are written. `printers.py` and `cli.py` both carry the
+try/except now, `printers.print_lock` warns rather than raises when there
+is no flock (a platform without it has no `/dev/usb/lp0` to interlock
+against either), and `needs_flock` skips the one test that genuinely
+needs it.
+
 **A silent encoder regression would look exactly like a device fault.**
 An encoder that stopped emitting matches would still round-trip through
 liblzma perfectly and simply not print, which is a day of chasing the
