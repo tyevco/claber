@@ -229,7 +229,7 @@ hardware or a real Facebook account.
 | DYI export schema | **ASSUMED.** Undocumented and reshuffled by Meta; importer walks for shape rather than assuming paths. |
 | Saved-page JSON shape | **ASSUMED.** Field names from public GraphQL modules; fixture is synthetic. |
 | `printd` split (`pi-http`) | **Works, but only against a fake device.** A signed job crosses as a ~2KB PDF and is rendered to ~124KB of TSPL on the printd side. Covered: dedup, deadline-refusal, bad signature, surviving a SystemExit from the backend, `/healthz` answering while a print is wedged, `selftest` and `probe --remote` following the backend, Settings reading the printer from printd rather than from a stale local copy, and `reconcile` recovering a print whose acknowledgement was lost. **Never run against the real printer**, and deploying it is gated on the label geometry below. |
-| Printer status readback | **UNKNOWN, and it is the experiment worth running.** `mplabel status` asks; nobody has ever tried reading from this unit. If it answers, a failed print becomes visible instead of silent. |
+| Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 
 When the user reports real-world results, move rows up this table and
@@ -321,6 +321,15 @@ and nothing else - which reads as a broken layout and is not. Both label
 commands now print the feed length **in millimetres**, because that is
 the number that has to match the paper, and the default is the stock that
 is actually loaded.
+
+**The G4 is write-only, so `printd` must never claim a print it cannot
+confirm.** No readback means no paper-out pre-check and no way to tell a
+timed-out request from a printed label. Everything downstream follows
+from that: `printd` records a job in the journal **after** `_write_raw`
+returns and not before, `print_pi_http` deliberately does not retry, and
+its unreachable message says "may or may not have printed - ask it with
+GET /printed" rather than guessing. `mplabel reconcile` is the recovery
+path. Do not add a retry, and do not let a 409 read as a fresh print.
 
 **The phone app's token is a bearer token, and `/api/v1` is the name
 that will not move.** `issue_token`/`valid_token` were always stateless
