@@ -410,6 +410,14 @@ is no flock (a platform without it has no `/dev/usb/lp0` to interlock
 against either), and `needs_flock` skips the one test that genuinely
 needs it.
 
+**A gauge has to outrange what it measures.** The edge gauge stopped at
+32 dots while the reported loss was around 40, so every mark on that side
+was gone and it could only say "more than 32". Nested rectangles were
+what limited it - past about 32 they cut through the middle of the label
+- so the gauge is now four compact combs, one per edge, which reach any
+depth. Same class of mistake as the one below, and the same fix: check
+that the instrument covers the case it exists for before printing it.
+
 **The first eight and last eight rows are never sent.**
 `split_into_buffers` starts the image at `margin_top` and stops
 `margin_bottom` short - the firmware feeds blank for both - so on a

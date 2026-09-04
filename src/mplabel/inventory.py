@@ -378,7 +378,12 @@ RULER_LABEL = 80
 
 # Insets for the edge gauge, in dots out from each edge of the sent
 # area. The outermost complete rectangle is the printable inset.
-RULER_INSETS = (0, 8, 16, 24, 32)
+#
+# It stopped at 32 first, and the reported loss was about 40 - so every
+# rectangle was gone on that side and the gauge could only say "more than
+# 32". A gauge has to outrange the thing it measures, which is the same
+# mistake as drawing one inside the band that is never sent.
+RULER_INSETS = (0, 8, 16, 24, 32, 40, 48)
 
 
 def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
@@ -437,38 +442,52 @@ def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
     small = _font(13)
     last_x = width_dots - 1
 
-    # --- the edge gauge: nested rectangles, each labelled just inside
-    for inset in RULER_INSETS:
-        x0, x1 = inset, last_x - inset
-        y0, y1 = top + inset, bottom - inset
-        if x1 - x0 < 80 or y1 - y0 < 40:
-            continue
-        draw.rectangle((x0, y0, x1, y1), outline=1)
-        # One label per *edge*, not one per rectangle. The first version
-        # put all five along the top, so the five numbers witnessed the
-        # top edge and nothing else - and a print where the left edge
-        # clipped and the top did not was unreadable, which is exactly
-        # the case that came back. Each label sits just inside its own
-        # rectangle on its own side, so it is lost precisely when that
-        # side of that rectangle is lost, and the outermost number still
-        # showing on a side is that side's printable inset.
-        idx = RULER_INSETS.index(inset)
+    # --- the edge gauge: four combs, one per edge
+    #
+    # Nested rectangles read well but do not scale: past about 32 dots
+    # they cut through the middle of the label and collide with
+    # everything. A comb is compact and can reach any depth, which
+    # matters - the gauge stopped at 32, the reported loss was around 40,
+    # and a gauge that cannot outrange what it measures says only "more
+    # than 32".
+    #
+    # Each mark is a small filled square whose near edge sits exactly at
+    # its inset, with its number alongside. Both are lost together when
+    # that column or row is lost, so **the smallest number still fully
+    # printed on a side is that side's printable inset**. One frame at
+    # inset 0 is kept as the overall witness.
+    draw.rectangle((0, top, last_x, bottom), outline=1)
+
+    for idx, inset in enumerate(RULER_INSETS):
         tag = str(inset)
         tw = _text_width(draw, tag, small)
-        along = 46 + idx * 30            # spread, so they do not stack
-        down = top + 100 + idx * 24
-        draw.text((along, y0 + 2), tag, font=small, fill=1)
-        draw.text((along, y1 - 15), tag, font=small, fill=1)
-        draw.text((x0 + 3, down), tag, font=small, fill=1)
-        draw.text((x1 - 3 - tw, down), tag, font=small, fill=1)
+        # top and bottom: stepped along x so the numbers never stack
+        ax = 60 + idx * 20
+        # `top + inset`, not `inset`. Measured from the first row the
+        # device is actually given - an inset-0 mark at row 0 would sit
+        # in the band that is never sent, and would read as the printer
+        # losing an edge it was never shown.
+        ty = top + inset
+        draw.rectangle((ax, ty, ax + 5, ty + 5), fill=1)
+        draw.text((ax + 9, ty), tag, font=small, fill=1)
+        by = bottom - inset
+        draw.rectangle((ax, by - 5, ax + 5, by), fill=1)
+        draw.text((ax + 9, by - 15), tag, font=small, fill=1)
+        # left and right: stepped down y for the same reason
+        ay = top + 80 + idx * 18
+        draw.rectangle((inset, ay, inset + 5, ay + 5), fill=1)
+        draw.text((inset + 9, ay - 4), tag, font=small, fill=1)
+        rx = last_x - inset
+        draw.rectangle((rx - 5, ay, rx, ay + 5), fill=1)
+        draw.text((rx - 9 - tw, ay - 4), tag, font=small, fill=1)
 
     # --- the scales, far enough in to survive whatever the edges do,
     #     and on opposite sides so their numbers never share a corner.
     #     Both were crowded into the top left first and the labels
     #     overprinted each other, which on thermal paper is the same as
     #     not printing them.
-    sy = top + RULER_INSETS[-1] + 22
-    sx = last_x - RULER_INSETS[-1] - 22
+    sy = top + 72
+    sx = last_x - 96
 
     for pos in range(0, width_dots, RULER_MINOR):
         depth = 15 if pos % RULER_LABEL == 0 else (
@@ -479,7 +498,7 @@ def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
             # Not if it would run into the feed scale's line. An
             # overprinted number is not a smaller number, it is an
             # unreadable one.
-            if pos + 2 + _text_width(draw, tag, font) < sx - 6:
+            if pos + 2 + _text_width(draw, tag, font) < sx - 44:
                 draw.text((pos + 2, sy + 17), tag, font=font, fill=1)
     draw.line((0, sy, last_x, sy), fill=1)
 
@@ -494,7 +513,9 @@ def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
     draw.line((sx, top, sx, bottom), fill=1)
 
     # --- origin marker and feed direction, at 0,0 and nowhere else
-    ox, oy = 60, sy + 44
+    # Clear of the bottom comb, which sweeps up from the left corner
+    # through where this used to sit.
+    ox, oy = 200, sy + 40
     if oy + 80 < bottom:
         draw.rectangle((ox, oy, ox + 19, oy + 19), fill=1)
         draw.text((ox + 25, oy + 2), "0,0", font=font, fill=1)
