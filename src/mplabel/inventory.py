@@ -444,11 +444,23 @@ def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
         if x1 - x0 < 80 or y1 - y0 < 40:
             continue
         draw.rectangle((x0, y0, x1, y1), outline=1)
-        # The label rides just under its own rectangle's top line, spread
-        # along it so the five do not stack, and it is lost exactly when
-        # that rectangle is lost.
-        draw.text((46 + RULER_INSETS.index(inset) * 30, y0 + 2),
-                  str(inset), font=small, fill=1)
+        # One label per *edge*, not one per rectangle. The first version
+        # put all five along the top, so the five numbers witnessed the
+        # top edge and nothing else - and a print where the left edge
+        # clipped and the top did not was unreadable, which is exactly
+        # the case that came back. Each label sits just inside its own
+        # rectangle on its own side, so it is lost precisely when that
+        # side of that rectangle is lost, and the outermost number still
+        # showing on a side is that side's printable inset.
+        idx = RULER_INSETS.index(inset)
+        tag = str(inset)
+        tw = _text_width(draw, tag, small)
+        along = 46 + idx * 30            # spread, so they do not stack
+        down = top + 100 + idx * 24
+        draw.text((along, y0 + 2), tag, font=small, fill=1)
+        draw.text((along, y1 - 15), tag, font=small, fill=1)
+        draw.text((x0 + 3, down), tag, font=small, fill=1)
+        draw.text((x1 - 3 - tw, down), tag, font=small, fill=1)
 
     # --- the scales, far enough in to survive whatever the edges do,
     #     and on opposite sides so their numbers never share a corner.

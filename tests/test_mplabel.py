@@ -2959,6 +2959,31 @@ def test_ruler_graduations_survive_a_clipped_edge():
     assert any((sx - 30, y) in dots for y in safe_y), "no feed numbers"
 
 
+def test_ruler_gauges_each_edge_separately():
+    """One inset label per edge, not one per rectangle.
+
+    The first version put all five along the top, so the five numbers
+    witnessed the top edge and nothing else - and the print that came
+    back could not say whether the *left* edge had clipped, which was the
+    only thing still in question. Each side needs its own witness, close
+    enough to that side to be lost with it."""
+    from mplabel import inventory, supvan
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    raw, stride, rows = inventory.render_ruler(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+    top, bottom = margin, rows - margin - 1
+
+    def ink(x0, x1, y0, y1):
+        return sum(1 for x, y in dots if x0 <= x <= x1 and y0 <= y <= y1)
+
+    # A band just inside each edge, past the deepest inset, carries text.
+    deepest = max(inventory.RULER_INSETS)
+    assert ink(40, 200, top, top + deepest + 14) > 40, "no top labels"
+    assert ink(40, 200, bottom - deepest - 14, bottom) > 40, "no bottom"
+    assert ink(0, deepest + 14, top + 90, bottom) > 40, "no left labels"
+    assert ink(383 - deepest - 14, 383, top + 90, bottom) > 40, "no right"
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason

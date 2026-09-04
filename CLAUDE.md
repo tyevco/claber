@@ -707,7 +707,14 @@ Roughly in priority order.
    (that would mean `gap_inches` is wrong for their stock), and do the
    barcodes scan? `printer_darkness` 0-15 and `printer_speed` are the
    knobs. This is the last thing between the pipeline and real parcels.
-1a. **Measure the printable area.** `mplabel supvan-test-print --style
+1a. **Measure the printable area.** The redesigned ruler prints legibly
+   and nothing is grossly clipped: all five inset rectangles, the across
+   scale (80/160/240) and the feed scale (88/168) all came out. `320` is
+   suppressed by design where it would overprint the feed scale's line,
+   and 168 is the last feed number that fits before the final sent row -
+   neither is clipping. What is **not** settled is the printable inset at
+   each edge, so each edge now carries its own gauge.
+   Previously: `mplabel supvan-test-print --style
    ruler` prints scales along both axes, numbered in dots, with the last
    dot's own number at each far end and an inset comb (0/8/16/24/32) at
    the far corner. Read off: the largest visible number on each axis is
