@@ -14,7 +14,10 @@ dependencies = [
     "pypdf>=5.0,<7",
     "pdfplumber>=0.11,<1.0",
     "pypdfium2>=4.0,<6",
-    "Pillow>=10.0,<14",
+    # 10.1 for ImageFont.load_default(size=...), which is what draws the
+    # inventory label. Earlier versions have only the fixed 11px bitmap
+    # face, which is unreadable at 48mm.
+    "Pillow>=10.1,<14",
 ]
 
 [project.optional-dependencies]

@@ -51,6 +51,7 @@ from . import mailparse
 from . import printers
 from . import savedpage as savedpage_mod
 from . import sheets as sheets_mod
+from . import inventory as inventory_mod
 from . import supvan as supvan_mod
 
 log = logging.getLogger("mplabel")
@@ -799,6 +800,75 @@ def cmd_supvan_probe(cfg, args):
         print(f"{' ' * len(head)} {note}")
 
 
+def cmd_inventory_label(cfg, args):
+    """Draw one inventory label, and show what the printer would burn.
+
+    Above `connect_db` with the other printer commands, and for the same
+    reason: this needs no database, and a label preview that stops
+    working because the data directory is unwritable is a preview you
+    cannot use when you most need one.
+
+    `--preview` is the point of it. It renders the label, assembles the
+    real job, then takes that job *back apart* - decompressing it,
+    checking every buffer checksum and reading the geometry out of the
+    headers - and draws what comes out. So the picture is of the payload
+    on the wire, not of what we meant to send, which is the only version
+    worth looking at while nothing built here has printed yet."""
+    price = None
+    if args.price is not None:
+        try:
+            price = float(args.price)
+        except ValueError:
+            price = args.price
+
+    raster, stride, rows = inventory_mod.render_label(
+        args.code, title=args.title, price=price, with_qr=args.qr,
+        height_mm=args.height, ecl=args.ecl)
+    job = supvan_mod.build_job(raster, stride, rows,
+                               density=args.density)
+
+    print(f"code   : {args.code}" + ("  (+ QR carrying the same code)"
+                                     if args.qr else ""))
+    print(f"label  : 48 x {args.height}mm, {stride * 8} x {rows} dots")
+    ink = sum(bin(b).count("1") for b in raster)
+    print(f"         {100 * ink / (len(raster) * 8):.2f}% ink")
+    print(f"job    : {job['buffers']} x {supvan_mod.PRINT_BUF_SIZE} = "
+          f"{job['raw_len']} bytes, {len(job['compressed'])} compressed, "
+          f"speed {job['speed']} (derived), density {args.density}")
+
+    # Round-trip it whatever we do next: if the job will not come back
+    # apart, it is not going to the printer either.
+    try:
+        back, back_stride, cols = supvan_mod.decode_job(job["compressed"])
+    except supvan_mod.SupvanError as exc:
+        raise SystemExit(f"the job does not decode: {exc}")
+    print(f"decoded: {cols} printhead lines, {back_stride} bytes each, "
+          f"every checksum valid")
+
+    if args.preview:
+        inventory_mod.to_image(back, back_stride, cols,
+                               scale=args.scale).save(args.preview)
+        print(f"\nwrote {args.preview} - this is the payload, decoded back")
+
+    if not args.print:
+        print("\nnothing sent, no paper moved. Add --print to try it.")
+        return
+
+    device = args.device or cfg.get("supvan_device",
+                                    supvan_mod.DEFAULT_DEVICE)
+    print(f"\nsending to {device}:")
+
+    def step(label, status, lit):
+        print(f"  . {label}" + (f": {', '.join(lit) or 'no flags'}"
+                                if status else ""))
+    try:
+        final = supvan_mod.experimental_print(
+            job, path=device, speed=job["speed"], on_step=step)
+    except supvan_mod.SupvanError as exc:
+        raise SystemExit(f"\nstopped: {exc}")
+    print(f"\npages printed now reads {final['pages_printed']}.")
+
+
 def cmd_supvan_test_print(cfg, args):
     """Try to print one test pattern on the label maker. An experiment.
 
@@ -1427,6 +1497,36 @@ def _main():
                         "discovery can claim the printer and unbind usblp, "
                         "which is the fault this command exists to find.")
     sub.add_parser("selftest", help="print a tiny text-only TSPL test label")
+    p = sub.add_parser("inventory-label",
+                       help="draw one inventory label and preview what "
+                            "the label maker would burn")
+    p.add_argument("--code", required=True,
+                   help="the inventory code, and what the QR carries")
+    p.add_argument("--title", help="item title, wrapped and ellipsed to fit")
+    p.add_argument("--price", help="shown bottom right")
+    p.add_argument("--qr", action="store_true",
+                   help="add a QR of the same code, so a phone can read "
+                        "the box without anyone squinting at four "
+                        "characters on thermal paper")
+    p.add_argument("--ecl", choices=["L", "M", "Q", "H"], default="M",
+                   help="QR error correction (default %(default)s). A "
+                        "code this short fits version 1 even at H")
+    p.add_argument("--height", type=int,
+                   default=inventory_mod.DEFAULT_HEIGHT_MM,
+                   help="label length in mm (default %(default)s); the "
+                        "48mm width is the print head's")
+    p.add_argument("--density", type=int,
+                   default=supvan_mod.DEFAULT_DENSITY,
+                   help="burn energy 0-15 (default %(default)s)")
+    p.add_argument("--preview", metavar="PNG",
+                   help="write what the payload decodes back to")
+    p.add_argument("--scale", type=int, default=2,
+                   help="preview magnification (default %(default)s)")
+    p.add_argument("--print", action="store_true",
+                   help="actually send it. Nothing built this way has "
+                        "printed yet - see open work 1b")
+    p.add_argument("--device", help="hidraw node, default supvan_device")
+
     p = sub.add_parser("supvan-probe",
                        help="status of the 48mm inventory label maker; "
                             "prints nothing and moves no paper")
@@ -1602,6 +1702,10 @@ def _main():
         print(f"sent text-only {backend} test label to "
               + cfg["printer_device"])
         return
+    if args.cmd == "inventory-label":
+        cmd_inventory_label(cfg, args)
+        return
+
     if args.cmd == "supvan-probe":
         # Same reasoning as selftest: this is a hardware test, and a
         # hardware test must not need the database.

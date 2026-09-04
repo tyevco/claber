@@ -57,6 +57,7 @@ run against a real database.
 | `file <pdf> [-o] [--rotate] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
 | `probe` | printers, USB devices, IEEE-1284 id |
 | `selftest` | tiny text-only TSPL label |
+| `inventory-label --code X [--qr] [--preview PNG]` | draw one 48mm inventory label and show what the label maker would burn. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -107,6 +108,8 @@ src/mplabel/
   printers.py    TSPL/ZPL raw backends, CUPS backends, rasteriser, probe
   listings.py    listings schema, subject classification, analytics views
   backfill.py    one-off mailbox survey and historical import
+  qr.py          a QR encoder, stdlib only, versions 1-10
+  inventory.py   draws the 48mm inventory label, with or without a QR
   savedpage.py   parse a saved Marketplace selling page
   sheets.py      Google Sheets sync via service account
   supvan.py      T50M Pro label maker: HID transport, frames, status
@@ -209,6 +212,8 @@ hardware or a real Facebook account.
 | The raw data path works | **Verified on the hardware:** bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. If a label comes out wrong from here, suspect the raster or the geometry, not the transport. |
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
 | `escpos` backend | **UNUSED and unproven.** Written while the id was believed, kept because the job structure is unit-tested and some sibling models really do speak ESC/POS. Nothing it produces has ever printed. Its banding size and trailing form feed are guesses. |
+| The QR encoder | **Verified against two independent oracles, never printed.** `qr.py` is hand-written to keep the Pi dependency list short. Its codeword stream is identical to `segno`'s for every version, level and mode in range; all 350 symbols in the sweep decoded correctly through `zxing-cpp`; the Reed-Solomon matches the specification's worked example and the format bits match its published table. Neither library is a dependency - they were the oracle, and pinned matrix digests are what is left of them. **Never read off thermal paper**, where the module size and the burn darkness both matter. |
+| The inventory label | **Assembles and round-trips; never printed.** `inventory-label --preview` renders it, builds the real print buffers, decodes them back with every checksum checked, and the QR still scans out of that payload at all four correction levels. What is untested is everything physical: whether 5 dots per QR module survives thermal bleed, and whether the text is legible at 48mm. |
 | TSPL gap value 0.12in | **ASSUMED.** Typical for 4x6 die-cut; not measured on their stock. |
 | Facebook subject patterns | **Partly verified** against a real mailbox survey. Seen and handled: `Shipping label for your Marketplace order`, `New Marketplace order for <item>` (the sale itself, arriving before the label), and messages as `<emoji> <name> sent you a message`. The rest of `EVENT_PATTERNS` (listed / renewed / expired / payout / rating) is still **ASSUMED** - none has been seen. |
 | The mailbox mixes buying and selling | **Verified.** `You placed an order: <item>`, `Offer submitted: <item>` and `Confirm if you received your order: <item>` are *her purchases*. They carry the **seller's** listing id, so they are classified `purchase`, kept out of the listings table by `BUYER_KINDS`, and their listing id is dropped at record time. Counting them would invent listings that were never for sale and drag sell-through down. |
@@ -418,6 +423,32 @@ mojibake - and whatever the editor shows is what gets printed. It cannot
 print 4x6 shipping labels either: 48mm is 384 dots against the 812 the
 pipeline emits, so that stays with the G4.
 
+**The label preview is decoded from the payload, not from the drawing.**
+`inventory-label --preview` assembles the real job, then takes it apart
+again - decompressing, checking every buffer checksum, reading the
+geometry out of the headers - and draws what comes back. Previewing the
+source raster instead would show a perfect label for a job the device
+was about to refuse, which is the whole failure this project has been
+chasing on this printer.
+
+**Ink in the feed margin is dropped, not printed small.** The margin
+columns are declared in the print-buffer header and never sent, so
+anything drawn there vanishes. The price sat in that dead band and came
+out with its bottom sheared off, which reads as a font problem and is
+not. `inventory.render_label` insets by `supvan.DEFAULT_MARGIN_DOTS` for
+exactly this reason, and a test pins that the margin stays empty.
+
+**The device's buffer checksum is weak, and that is its design.** It
+covers the 12 header bytes and then only the byte before each 256-byte
+boundary - so most of the image is not covered at all. A valid checksum
+says the header is intact and says very little about the picture.
+
+**The QR and the printed characters must not be able to disagree.**
+`render_label` derives both from the same `code` argument and there is
+no parameter to pass them separately. A label whose two identifiers name
+different objects is worse than one with no QR on it, and this is the
+kind of thing that only goes wrong once a caller gets convenient.
+
 **The parcel code is a handle, not just a marking.** `reprint` and `ship`
 both accept it (`cli.find_sale`), case-insensitively, alongside listing id
 / order id / tracking - it is the only one of those printed on the box, and
@@ -534,12 +565,19 @@ Roughly in priority order.
 1b. **Spend one label on the print buffers.** The T50M Pro's payload
    format is settled and unit-tested but has never printed:
    `mplabel supvan-test-print` now builds real print buffers instead of a
-   bare raster. Run it once. If a label comes out, move "Generating the
-   bitmap stream" up the table and the inventory path can stop going
-   through the vendor editor. If it does not, `--bare-raster` reproduces
-   the old refused shape for comparison and `--style sparse` is drawn
-   asymmetrically to settle which end of the roll column 0 is. One
-   variable per label, as ever.
+   bare raster, and `mplabel inventory-label --code X --qr` draws a real
+   label through the same path. Run one. If a label comes out, move
+   "Generating the bitmap stream" up the table and the inventory path can
+   stop going through the vendor editor. If it does not, `--bare-raster`
+   reproduces the old refused shape for comparison and `--style sparse`
+   is drawn asymmetrically to settle which end of the roll column 0 is.
+   One variable per label, as ever.
+
+   Two things to check on the paper that no test here can reach: whether
+   the QR scans off thermal stock at 5 dots per module (it scans out of
+   the wire payload, which is not the same thing - bleed closes up the
+   modules), and whether the wrapped title is legible at 48mm. Both are
+   `--density` knobs before they are layout changes.
 
 2. **Learn the real email subjects.** `python -m mplabel scan` prints
    unrecognised Facebook subject lines with counts. Add them to

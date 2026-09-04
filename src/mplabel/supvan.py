@@ -752,6 +752,56 @@ def build_job(raster, per_line_byte, total_cols,
     }
 
 
+def decode_job(compressed):
+    """Take a job apart again: the picture the device would actually burn.
+
+    The inverse of `build_job`, and deliberately written against the
+    *payload* rather than the source raster - it decompresses, splits on
+    the 4096-byte boundary, re-checks every checksum and reads the
+    geometry out of each header. So what it returns is what the firmware
+    would see, not what we meant to send, which is the only version worth
+    looking at before spending a label.
+
+    Returns (raster, stride, columns) with the bits back in the
+    MSB-first order the rest of this codebase uses.
+
+    Raises SupvanError if a buffer is malformed, because a preview that
+    quietly renders a corrupt job is worse than no preview."""
+    import lzma
+    try:
+        blob = lzma.decompress(compressed, format=lzma.FORMAT_ALONE)
+    except lzma.LZMAError as exc:
+        raise SupvanError(f"job does not decompress: {exc}")
+    if len(blob) % PRINT_BUF_SIZE:
+        raise SupvanError(
+            f"{len(blob)} bytes is not a whole number of "
+            f"{PRINT_BUF_SIZE}-byte print buffers")
+
+    data, stride, cols = bytearray(), None, 0
+    for i in range(len(blob) // PRINT_BUF_SIZE):
+        buf = blob[i * PRINT_BUF_SIZE:(i + 1) * PRINT_BUF_SIZE]
+        n = int.from_bytes(buf[4:6], "little")
+        per_line = buf[6]
+        if per_line == 0:
+            raise SupvanError(f"buffer {i} declares no bytes per line")
+        if stride is None:
+            stride = per_line
+        elif per_line != stride:
+            raise SupvanError(
+                f"buffer {i} changes the stride, {stride} -> {per_line}")
+
+        end = n * per_line + PRINT_BUF_HEADER
+        chk = sum(buf[2:PRINT_BUF_HEADER])
+        for k in range(1, end // CHECKSUM_STRIDE + 1):
+            chk += buf[k * CHECKSUM_STRIDE - 1]
+        if int.from_bytes(buf[0:2], "little") != chk & 0xFFFF:
+            raise SupvanError(f"buffer {i} checksum does not validate")
+
+        data += buf[PRINT_BUF_HEADER:PRINT_BUF_HEADER + n * per_line]
+        cols += n
+    return raster_to_column_major(bytes(data)), stride, cols
+
+
 # ------------------------------------------------ not wired in yet
 
 def print_bitmap(raster, per_line_byte, total_cols, path=DEFAULT_DEVICE,
