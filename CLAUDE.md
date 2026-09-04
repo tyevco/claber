@@ -795,84 +795,70 @@ it to the repo.
 
 ## Open work
 
-Roughly in priority order.
+**Tracked as GitHub issues.** This section is the map, not the backlog -
+each line says why the thing matters and points at the issue that holds
+the detail. Add the reasoning here when it is the kind that would
+otherwise be rediscovered; put the steps in the issue.
 
-0. **USPS tracking is probably not available, and that is a finding, not a
-   gap.** The idea was to look up each tracking number and mark the parcel
-   shipped on its first scan. USPS tied tracking access to the **Mailer ID
-   that bought the postage** on 1 April 2026, and on a Marketplace label
-   that MID belongs to Facebook's label provider, not to her - parties
-   without it need a signed IP agreement and a monthly fee. The Web Tools
-   XML API that used to answer on a bare tracking number was shut down on
-   25 January 2026, so there is no legacy fallback. Settle it with one
-   OAuth token and one lookup (`apis.usps.com/oauth2/v3/token`, then
-   `/tracking/v3/tracking/<number>`) before writing a client; a 403 means
-   fall back to deriving status from her mailbox, where every other fact in
-   this system already comes from.
+### The print path
 
-1. **Check the printed label against the stock.** TSPL prints, so what is
-   left is geometry, not language: does one job advance exactly one
-   die-cut label, is the ink centred rather than creeping down the roll
-   (that would mean `gap_inches` is wrong for their stock), and do the
-   barcodes scan? `printer_darkness` 0-15 and `printer_speed` are the
-   knobs. This is the last thing between the pipeline and real parcels.
-1a. **Measure the printable area.** The redesigned ruler prints legibly
-   and nothing is grossly clipped: all five inset rectangles, the across
-   scale (80/160/240) and the feed scale (88/168) all came out. `320` is
-   suppressed by design where it would overprint the feed scale's line,
-   and 168 is the last feed number that fits before the final sent row -
-   neither is clipping. What is **not** settled is the printable inset at
-   each edge, so each edge now carries its own gauge.
-   Previously: `mplabel supvan-test-print --style
-   ruler` prints scales along both axes, numbered in dots, with the last
-   dot's own number at each far end and an inset comb (0/8/16/24/32) at
-   the far corner. Read off: the largest visible number on each axis is
-   the printable width and feed length, and if an edge rule is missing
-   the comb says by how much. The feed arrow and the `0,0` block appear
-   at the origin corner only, which settles the feed-axis origin - the
-   last orientation unknown - and makes a mirror or a flip obvious
-   without measuring anything. `--width` and `--height` ask about a
-   particular label size. `--clip` and `--invert` are refused with it,
-   because a measurement of a quietly altered target is worse than none.
+The G4 has been printing real parcels throughout, so most of what used to
+be open here is answered by use: the barcodes scan, one job advances one
+die-cut label, and `gap_inches = 0.12` is right for that stock. Two
+things came out of settling the rest:
 
-1b. **Spend one label on the print buffers.** The T50M Pro's payload
-   format is settled and unit-tested but has never printed:
-   `mplabel supvan-test-print` now builds real print buffers instead of a
-   bare raster, and `mplabel inventory-label --code X --qr` draws a real
-   label through the same path. Run one. If a label comes out, move
-   "Generating the bitmap stream" up the table and the inventory path can
-   stop going through the vendor editor. If it does not, `--bare-raster`
-   reproduces the old refused shape for comparison and `--style sparse`
-   is drawn asymmetrically to settle which end of the roll column 0 is.
-   One variable per label, as ever.
+- **The G4 is write-only** (recorded in the table above). `mplabel
+  status` got no reply to either query. A failed print cannot be detected
+  in software, so printing is at-least-once and the paper is the only
+  source of truth. Everything about the journal follows from this.
+- **Creep across a batch is the one untested case** (#9). It only shows
+  on three or more in a row, and it gates the printd deployment.
 
-   Three things to check on the paper that no test here can reach:
-   whether the QR scans off thermal stock at 5 dots per module (it scans
-   out of the wire payload, which is not the same thing - bleed closes
-   up the modules), whether the **shelf marker band** scans at the 7-9
-   dots per module it gets, and whether the wrapped title is legible. All are `--density` knobs
-   before they are layout changes. `inventory-label --marker` and
-   `--qr` draw the two candidates on the same label size, so one print
-   run settles which carrier to keep.
+Then the split, in order: #10 loopback, #11 off-loopback over a mesh VPN.
+Both are deployment of code that already exists and is tested against a
+fake device. Hardening that wants doing alongside: #12 (`GET /printed`
+enumerates live parcel codes), #13 (the journal trim is not atomic),
+#14 (no unit for `mplabel serve`), #15 (the installer assumes one host).
 
-2. **Learn the real email subjects.** `python -m mplabel scan` prints
-   unrecognised Facebook subject lines with counts. Add them to
-   `listings.EVENT_PATTERNS` — a name and a regex each. Until this is
-   done, backfill will find almost nothing beyond shipping labels.
-3. **Test the Sheets path against the live API.** Everything up to the
-   `gspread` call is covered; the call itself is not.
-4. **Validate the saved-page parser on a real save.** The fixture is
-   synthetic. Run `python -m mplabel.savedpage <file>` to see raw
-   extraction and block counts before trusting it.
-5. Multi-page label PDFs are not handled — page 0 only.
-6. Only USPS labels are parsed. UPS/FedEx tracking formats differ.
-7. `mplabel pending` is the way back for a label that was recorded but
-   never printed - a `check` run, or a print that failed at the
-   printer. `run` cannot do it: once a message is in `sales` the
-   poller skips it on sight, which is what stops a re-poll reprinting
-   everything. It defaults to **today only**, because the poll window
-   is days wide and older labels may already have been printed and
-   posted by hand.
+### The label maker
+
+It prints correctly. The encoder, the line order, the printable window
+and the bit polarity are all settled on hardware - see the table above.
+What is left is physical and needs a camera, not a test:
+
+- #16 does the QR scan off thermal at 5 dots per module, and #17 does the
+  shelf marker. **These two decide the shape of the iPhone app** (#20):
+  VisionKit reads QR for free, where the marker would be a third
+  decoder implementation with no parity harness.
+- #18 row order and feed origin. Low priority - labels come out right
+  today - but it is the difference between knowing and having been lucky.
+
+### What the tags are for
+
+#19. Shelf tags print but record nothing: no location on a listing, no
+table of places. Needs a schema decision first, and the honest advice is
+to use the printed tags with pencil for a week - how the binning actually
+goes decides whether it wants one location per item or a move history,
+and that is the expensive thing to get wrong.
+
+### Moving the order side off the Pi
+
+The destination is k8s (#24). Three prerequisites, each of which is a
+silent failure if skipped: #21 label paths are absolute and
+`label_belongs_to` is what stands between a reprint and a parcel posted
+to a stranger; #22 the Pi's stale copy will reprint shipped parcels with
+recycled codes if anyone runs the documented recovery command on it; #23
+nothing detects the order side being absent, and a warning inside the
+poller cannot detect its own absence.
+
+### Older, still true
+
+#25 USPS tracking is probably not available and one lookup settles it.
+#26 learn the real Facebook subjects, without which `backfill` finds
+almost nothing. #27 the Sheets call itself has never run. #28 the
+saved-page parser has only ever seen a synthetic fixture. #29 multi-page
+label PDFs, #30 non-USPS carriers - both filed as known limitations
+rather than surprises.
 
 ## Style
 
