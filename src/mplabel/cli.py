@@ -1019,9 +1019,23 @@ def cmd_supvan_test_print(cfg, args):
         except ValueError:
             raise SystemExit(f"--clip wants WxH, not {args.clip!r}")
         clip = (cw, ch)
-    raw, stride, rows = supvan_mod.render_test_pattern(
-        args.width, args.height, invert=args.invert, style=args.style,
-        clip=clip)
+    if args.style == "ruler":
+        # The calibration target, which is drawn rather than plotted and
+        # so lives with the other drawing in inventory.py. --clip and
+        # --invert are refused rather than ignored: this label exists to
+        # be measured, and measuring one that has been quietly altered is
+        # worse than not measuring at all.
+        if clip or args.invert:
+            raise SystemExit(
+                "--style ruler is a measurement, so --clip and --invert "
+                "are not allowed with it")
+        from . import inventory as inventory_mod
+        raw, stride, rows = inventory_mod.render_ruler(args.width,
+                                                       args.height)
+    else:
+        raw, stride, rows = supvan_mod.render_test_pattern(
+            args.width, args.height, invert=args.invert, style=args.style,
+            clip=clip)
 
     if args.bare_raster:
         # The shape every generated label was refused in, kept so the
@@ -1078,7 +1092,7 @@ def cmd_supvan_test_print(cfg, args):
         print(f"buffers: {buffers} x {supvan_mod.PRINT_BUF_SIZE} = "
               f"{job['raw_len']} bytes, {args.margin}-dot margins, "
               f"density {args.density}")
-        print(f"         column-major LSB-first, "
+        print(f"         column-major, line bytes last-first, "
               f"{supvan_mod.MAX_BUF_DATA // stride} lines per buffer")
     single = args.bare_raster and args.max_buffer == 0
     print(f"lzma   : {total} bytes in {len(bands)} stream(s), "
@@ -1681,14 +1695,18 @@ def _main():
                    help="blank any dot at or beyond W across or H "
                         "down, keeping the image the same size. Their "
                         "print fits 352x171")
-    p.add_argument("--style", choices=["blocks", "sparse", "scatter"],
+    p.add_argument("--style", choices=["blocks", "sparse", "scatter", "ruler"],
                    default="blocks",
                    help="test pattern (default %(default)s). 'sparse' draws "
                         "the same landmarks in outline, 0.66%% ink "
                         "against 7.54%%. 'scatter' is a diagnostic, "
                         "not a picture: working-print ink at "
                         "failing-print size, to say which of the two "
-                        "the device objects to")
+                        "the device objects to. 'ruler' is the "
+                        "calibration target - scales on both axes, the "
+                        "last dot's number at each far end, and an inset "
+                        "comb to measure a clipped edge. Use --width and "
+                        "--height to ask about a particular label")
     p.add_argument("--reencode", metavar="FILE",
                    help="decode a captured LZMA stream and re-encode "
                         "the same image with our encoder. Holds the "

@@ -58,6 +58,7 @@ run against a real database.
 | `probe` | printers, USB devices, IEEE-1284 id |
 | `selftest` | tiny text-only TSPL label |
 | `inventory-label --code X [--qr\|--marker] [--size WxH[in]] [--preview PNG]` | draw one inventory label and show what the label maker would burn. `--size 4x1in` for a shelf label. No DB |
+| `supvan-test-print --style ruler [--width W] [--height H]` | the calibration target: scales on both axes in dots, the last dot's number at each far end, an inset comb to measure a clipped edge, and a feed arrow. Moves paper |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -696,6 +697,18 @@ Roughly in priority order.
    (that would mean `gap_inches` is wrong for their stock), and do the
    barcodes scan? `printer_darkness` 0-15 and `printer_speed` are the
    knobs. This is the last thing between the pipeline and real parcels.
+1a. **Measure the printable area.** `mplabel supvan-test-print --style
+   ruler` prints scales along both axes, numbered in dots, with the last
+   dot's own number at each far end and an inset comb (0/8/16/24/32) at
+   the far corner. Read off: the largest visible number on each axis is
+   the printable width and feed length, and if an edge rule is missing
+   the comb says by how much. The feed arrow and the `0,0` block appear
+   at the origin corner only, which settles the feed-axis origin - the
+   last orientation unknown - and makes a mirror or a flip obvious
+   without measuring anything. `--width` and `--height` ask about a
+   particular label size. `--clip` and `--invert` are refused with it,
+   because a measurement of a quietly altered target is worse than none.
+
 1b. **Spend one label on the print buffers.** The T50M Pro's payload
    format is settled and unit-tested but has never printed:
    `mplabel supvan-test-print` now builds real print buffers instead of a

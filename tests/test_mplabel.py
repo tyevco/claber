@@ -2876,6 +2876,115 @@ def test_supvan_streams_and_buffers_are_not_the_same_key(monkeypatch):
             and s[4] == supvan.OP_NEXT_FRAME_IS_BULK]
     assert len(sent) == len(bands)
 
+# --- the calibration target ---------------------------------------------
+
+def _ruler_dots(raw, stride, rows):
+    return {(x, y) for y in range(rows) for x in range(stride * 8)
+            if raw[y * stride + (x >> 3)] & (0x80 >> (x & 7))}
+
+
+def test_ruler_marks_the_very_first_and_last_dot_of_both_axes():
+    """The whole question it exists to answer. If the printer clips an
+    edge, the missing thing has to be a dot that was definitely sent -
+    so the target draws to x=0, x=width-1, y=0 and y=rows-1 exactly."""
+    from mplabel import inventory
+
+    raw, stride, rows = inventory.render_ruler(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+    assert (0, 0) in dots
+    assert (383, 0) in dots
+    assert (0, 239) in dots
+    assert (383, 239) in dots
+
+
+def test_ruler_is_asymmetric_in_both_axes():
+    """A mirror or a feed flip has to be obvious by looking, not by
+    measuring - the first printed label was mirrored and the only reason
+    anyone noticed was that the text read backwards."""
+    from mplabel import inventory
+
+    raw, stride, rows = inventory.render_ruler(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+
+    mirrored = {(383 - x, y) for x, y in dots}
+    flipped = {(x, 239 - y) for x, y in dots}
+    assert dots != mirrored, "a left-right mirror would look identical"
+    assert dots != flipped, "a feed flip would look identical"
+
+    # And the origin corner is the heaviest, which is what makes the
+    # right way up readable at a glance rather than by hunting for text.
+    def ink(x0, x1, y0, y1):
+        return sum(1 for x, y in dots if x0 <= x < x1 and y0 <= y < y1)
+
+    assert ink(0, 192, 0, 120) > ink(192, 384, 120, 240)
+
+
+def test_ruler_ticks_land_on_the_dots_they_claim():
+    """A scale whose ticks are off by one is worse than no scale: it
+    would be read as the printer clipping a dot."""
+    from mplabel import inventory
+
+    raw, stride, rows = inventory.render_ruler(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+    for pos in range(0, 384, inventory.RULER_MINOR):
+        assert (pos, 3) in dots, f"no across-head tick at {pos}"
+    for pos in range(0, 240, inventory.RULER_MINOR):
+        assert (3, pos) in dots, f"no feed tick at {pos}"
+
+
+def test_ruler_fits_the_head_and_says_so_when_it_cannot():
+    from mplabel import inventory
+
+    raw, stride, rows = inventory.render_ruler(384, 240)
+    assert stride == 48 and rows == 240
+    assert len(raw) == stride * rows
+    with pytest.raises(ValueError, match="wider than"):
+        inventory.render_ruler(392, 240)
+    with pytest.raises(ValueError):
+        inventory.render_ruler(384, 0)
+
+
+def test_ruler_survives_a_short_label():
+    """A 48x12mm label is 96 rows, which is shorter than the feed arrow
+    and the corner comb want. They have to be dropped rather than drawn
+    off the end, where they would silently become clipping."""
+    from mplabel import inventory
+
+    raw, stride, rows = inventory.render_ruler(384, 96)
+    assert rows == 96 and len(raw) == stride * rows
+    dots = _ruler_dots(raw, stride, rows)
+    assert max(y for _x, y in dots) <= 95
+
+
+def test_ruler_goes_through_the_real_print_path(monkeypatch, capsys):
+    """It is only worth anything if it reaches the device the same way a
+    real label does - same buffers, same checksums, same encoder."""
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run",
+                         "--style", "ruler", "--height", "240"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "pattern: ruler" in out
+    assert "3 x 4096" in out
+    assert "head 5d 00 20 00 00" in out
+
+
+def test_ruler_refuses_to_be_altered(monkeypatch):
+    """--clip and --invert would change the thing being measured, and a
+    measurement of a quietly altered target is worse than none."""
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    for extra in (["--invert"], ["--clip", "352x171"]):
+        monkeypatch.setattr(sys, "argv",
+                            ["mplabel", "supvan-test-print", "--dry-run",
+                             "--style", "ruler"] + extra)
+        with pytest.raises(SystemExit, match="measurement"):
+            cli.main()
+
 def test_supvan_lzma_header_matches_a_captured_print():
     """Taken from a Bluetooth capture of the vendor app printing a label:
 
