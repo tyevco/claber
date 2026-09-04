@@ -533,6 +533,97 @@ def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
     return img.tobytes(), stride, rows
 
 
+# The edge test's staircase: 8 steps of 8 dots, so it reads a loss of up
+# to 56 dots on any side.
+EDGE_STEPS = 8
+EDGE_PITCH = 8
+EDGE_BAR = 6
+EDGE_UNIT = 12
+
+
+def render_edge_test(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
+                     feed_margin=None):
+    """Draw the edge test and return (raster, stride, rows).
+
+    One question only: **where does each edge actually start printing?**
+
+    The ruler answers it with a 5x5 dot square per inset, which is about
+    0.6mm, and a reading off one came back saying the left 40 dots are
+    lost - flatly contradicted by a QR on another label that printed
+    whole starting at x=22. Both cannot be right, and a mark that small
+    on thermal stock, photographed at an angle, is not the thing to
+    settle it with.
+
+    So: eight bars per edge, marching in at 8 dots each, and each bar is
+    a different **length** - the innermost is longest. That makes every
+    bar self-identifying. Count in from the long end, or measure any
+    single bar you can see, and you know which one it is without needing
+    a number beside it to survive as well. High contrast, no small type,
+    nothing to lose to glare.
+
+    Read it: the shortest bar still fully printed is the printable inset
+    on that side. All eight present means nothing is lost.
+    """
+    from PIL import Image, ImageDraw
+
+    if width_dots <= 0 or rows <= 0:
+        raise ValueError("an edge test needs a positive width and height")
+    if width_dots > HEAD_DOTS:
+        raise ValueError(
+            f"{width_dots} dots is wider than the {HEAD_DOTS}-dot head")
+    if feed_margin is None:
+        from .supvan import DEFAULT_MARGIN_DOTS
+        feed_margin = DEFAULT_MARGIN_DOTS
+
+    top = feed_margin
+    bottom = rows - feed_margin - 1
+    longest = EDGE_STEPS * EDGE_UNIT
+    if bottom - top < longest + 60 or width_dots < 2 * longest + 120:
+        raise ValueError(
+            f"{width_dots}x{rows} is too small for the edge test")
+
+    img = Image.new("1", (width_dots, rows), 0)
+    draw = ImageDraw.Draw(img)
+    font = _font(15)
+    last_x = width_dots - 1
+
+    ay = top + 26                      # where the side staircases hang from
+    ax = 132                           # where the top/bottom ones start
+
+    for i in range(EDGE_STEPS):
+        near = i * EDGE_PITCH
+        length = (i + 1) * EDGE_UNIT
+
+        # left and right: vertical bars, hanging down from a common line
+        draw.rectangle((near, ay, near + EDGE_BAR - 1, ay + length), fill=1)
+        far = last_x - near
+        draw.rectangle((far - EDGE_BAR + 1, ay, far, ay + length), fill=1)
+
+        # top and bottom: horizontal bars, running in from a common line
+        ty = top + near
+        draw.rectangle((ax, ty, ax + length, ty + EDGE_BAR - 1), fill=1)
+        by = bottom - near
+        draw.rectangle((ax, by - EDGE_BAR + 1, ax + length, by), fill=1)
+
+    # A legend where nothing can clip it. No per-bar numbers on purpose:
+    # a number is exactly as losable as the mark it names, which is what
+    # went wrong with the comb.
+    # In the clear band between the top and bottom staircases - the
+    # obvious spot below them is where the bottom one lives.
+    cx, cy = ax + 4, top + EDGE_STEPS * EDGE_PITCH + 20
+    draw.text((cx, cy), "EDGE TEST", font=font, fill=1)
+    draw.text((cx, cy + 18), f"{EDGE_STEPS} bars, {EDGE_PITCH} dots apart",
+              font=font, fill=1)
+    draw.text((cx, cy + 36), "longest = innermost", font=font, fill=1)
+    draw.text((cx, cy + 54), f"{width_dots}x{rows}", font=font, fill=1)
+
+    stride = (width_dots + 7) // 8
+    if width_dots != stride * 8:
+        canvas = Image.new("1", (stride * 8, rows), 0)
+        canvas.paste(img, (0, 0))
+        img = canvas
+    return img.tobytes(), stride, rows
+
 def to_image(raster, stride, rows, scale=1):
     """A viewable image of a raster, black on white.
 
