@@ -2883,18 +2883,80 @@ def _ruler_dots(raw, stride, rows):
             if raw[y * stride + (x >> 3)] & (0x80 >> (x & 7))}
 
 
-def test_ruler_marks_the_very_first_and_last_dot_of_both_axes():
-    """The whole question it exists to answer. If the printer clips an
-    edge, the missing thing has to be a dot that was definitely sent -
-    so the target draws to x=0, x=width-1, y=0 and y=rows-1 exactly."""
-    from mplabel import inventory
+def test_ruler_draws_nothing_in_the_band_that_is_never_sent():
+    """The bug that wasted a label, and the rule the redesign is built on.
 
+    `split_into_buffers` starts the image at row `margin_top` and stops
+    `margin_bottom` short; the firmware feeds blank for both. So on a
+    240-row label with the default 8-dot margins, rows 0-7 and 232-239
+    are not transmitted at all. The first ruler drew its edge rules and
+    every minor tick there, and they could not have appeared however the
+    printer behaved - which read, on paper, as the printer clipping.
+
+    An instrument must not live in the region it is measuring."""
+    from mplabel import inventory, supvan
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
     raw, stride, rows = inventory.render_ruler(384, 240)
     dots = _ruler_dots(raw, stride, rows)
-    assert (0, 0) in dots
-    assert (383, 0) in dots
-    assert (0, 239) in dots
-    assert (383, 239) in dots
+    assert dots, "the ruler drew nothing at all"
+    assert min(y for _x, y in dots) >= margin
+    assert max(y for _x, y in dots) <= rows - margin - 1
+
+
+def test_ruler_edge_gauge_brackets_the_sent_area():
+    """The outermost rectangle has to sit on the first and last rows that
+    are actually transmitted, and on the first and last dot across - it
+    is the witness for "did this edge print at all"."""
+    from mplabel import inventory, supvan
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    raw, stride, rows = inventory.render_ruler(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+    top, bottom = margin, rows - margin - 1
+
+    for corner in ((0, top), (383, top), (0, bottom), (383, bottom)):
+        assert corner in dots, corner
+
+    # And every inset in the gauge is drawn, so the outermost complete
+    # one can be read off as the printable inset.
+    for inset in inventory.RULER_INSETS:
+        assert (inset, top + inset) in dots, inset
+        assert (383 - inset, bottom - inset) in dots, inset
+
+
+def test_ruler_graduations_survive_a_clipped_edge():
+    """The scales are what the numbers are read off, so they must not be
+    in the first place to be lost. Both sit well inboard of the deepest
+    inset the gauge measures."""
+    from mplabel import inventory, supvan
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    raw, stride, rows = inventory.render_ruler(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+    deepest = max(inventory.RULER_INSETS)
+
+    # The edge gauge lives at the edges on purpose - that is its job -
+    # so counting ink proves nothing. What matters is where the *scales*
+    # are: both lines, and every number hung off them, must sit inboard
+    # of the deepest inset the gauge can report.
+    sy = margin + deepest + 22
+    sx = 383 - deepest - 22
+    assert sy > margin + deepest
+    assert sx < 383 - deepest
+
+    safe_x = range(deepest + 1, 383 - deepest)
+    safe_y = range(margin + deepest + 1, rows - margin - 1 - deepest)
+    assert sy in safe_y and sx in safe_x
+
+    # The scale lines are unbroken across the whole span, so a partial
+    # print still reads as a scale rather than as scattered ticks.
+    assert all((x, sy) in dots for x in safe_x)
+    assert all((sx, y) in dots for y in safe_y)
+
+    # And the numbers hang on the inboard side of each line.
+    assert any((x, sy + 20) in dots for x in safe_x), "no across numbers"
+    assert any((sx - 30, y) in dots for y in safe_y), "no feed numbers"
 
 
 def test_ruler_is_asymmetric_in_both_axes():
@@ -2921,15 +2983,24 @@ def test_ruler_is_asymmetric_in_both_axes():
 
 def test_ruler_ticks_land_on_the_dots_they_claim():
     """A scale whose ticks are off by one is worse than no scale: it
-    would be read as the printer clipping a dot."""
-    from mplabel import inventory
+    would be read as the printer clipping a dot.
 
+    The across scale carries absolute image x; the feed scale carries
+    absolute image y, which starts at the margin rather than at 0 -
+    because that is the first row the device is actually given."""
+    from mplabel import inventory, supvan
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
     raw, stride, rows = inventory.render_ruler(384, 240)
     dots = _ruler_dots(raw, stride, rows)
+
+    sy = margin + max(inventory.RULER_INSETS) + 22
     for pos in range(0, 384, inventory.RULER_MINOR):
-        assert (pos, 3) in dots, f"no across-head tick at {pos}"
-    for pos in range(0, 240, inventory.RULER_MINOR):
-        assert (3, pos) in dots, f"no feed tick at {pos}"
+        assert (pos, sy + 3) in dots, f"no across-head tick at x={pos}"
+
+    sx = 383 - max(inventory.RULER_INSETS) - 22
+    for pos in range(margin, rows - margin - 1, inventory.RULER_MINOR):
+        assert (sx - 3, pos) in dots, f"no feed tick at y={pos}"
 
 
 def test_ruler_fits_the_head_and_says_so_when_it_cannot():

@@ -376,29 +376,40 @@ RULER_MINOR = 8
 RULER_MAJOR = 40
 RULER_LABEL = 80
 
+# Insets for the edge gauge, in dots out from each edge of the sent
+# area. The outermost complete rectangle is the printable inset.
+RULER_INSETS = (0, 8, 16, 24, 32)
 
-def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM):
+
+def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
+                 feed_margin=None):
     """Draw a calibration target and return (raster, stride, rows).
 
-    Answers, off one label, the things no amount of unit testing can:
+    Answers, off one label: how wide the print really is, how far down
+    the feed it goes, how much each edge loses, and which end is fed
+    first. Nothing here is symmetric in either axis, so a mirror or a
+    flip shows without being measured for.
 
-      - **how wide the print really is.** The head is 384 dots on paper
-        and the media is not exactly 48mm; the across-head scale runs to
-        the last dot, so whichever tick is the last one visible is the
-        answer.
-      - **how far down the feed it really goes**, the same way.
-      - **which end of the label is fed first.** The feed arrow and the
-        `0,0` block sit at the origin corner and nowhere else, so the
-        origin is wherever they came out.
-      - **whether the line order is still right.** Nothing here is
-        symmetric in either axis, so a mirror or a flip is visible at a
-        glance rather than something you have to measure for.
+    **The first version put its graduations where they could never
+    appear.** `split_into_buffers` starts the image at row `margin_top`
+    and stops `margin_bottom` short, and the firmware feeds blank for
+    both - so on a 240-row label with the default 8-dot margins, rows
+    0-7 and 232-239 are not sent at all. The edge rules and every minor
+    tick (5 dots deep) lived inside that dead band. The scale that did
+    survive was the one whose numbers sat at y=19.
 
-    Deliberately drawn in **device coordinates** - full head width, no
-    side margin, no rotation - unlike `render_label`, which centres a
-    label of a given size under the head. A calibration target that had
-    been centred and rotated first would be measuring this module's
-    arithmetic rather than the printer.
+    So the rule this is built on: **the instrument must not live in the
+    region it is measuring.** The graduations sit well inboard, where
+    they print whatever the edges do, and the edges get a separate gauge
+    - nested rectangles at 0, 8, 16, 24 and 32 dots in, each labelled
+    just inside its own top line. The outermost *complete* rectangle is
+    the printable inset, its label is the number, and a rectangle broken
+    on one side only says which side.
+
+    Drawn in **device coordinates** - full head width, no side margin, no
+    rotation - unlike `render_label`, which centres a label of a given
+    size under the head. A target that had been centred and rotated first
+    would be measuring this module's arithmetic rather than the printer.
     """
     from PIL import Image, ImageDraw
 
@@ -407,88 +418,79 @@ def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM):
     if width_dots > HEAD_DOTS:
         raise ValueError(
             f"{width_dots} dots is wider than the {HEAD_DOTS}-dot head")
+    if feed_margin is None:
+        from .supvan import DEFAULT_MARGIN_DOTS
+        feed_margin = DEFAULT_MARGIN_DOTS
+
+    # The rows that are actually transmitted. Drawing outside these is
+    # drawing into a band the firmware replaces with blank feed.
+    top = feed_margin
+    bottom = rows - feed_margin - 1
+    if bottom - top < 40:
+        raise ValueError(
+            f"{rows} rows less {2 * feed_margin} of margin leaves too "
+            f"little to measure")
 
     img = Image.new("1", (width_dots, rows), 0)
     draw = ImageDraw.Draw(img)
-    font = _font(13)
+    font = _font(15)
+    small = _font(13)
+    last_x = width_dots - 1
 
-    last_x, last_y = width_dots - 1, rows - 1
-
-    # A one-dot rule along all four edges. A missing side is the whole
-    # point: it means that edge is outside what the printer will burn.
-    draw.line((0, 0, last_x, 0), fill=1)
-    draw.line((0, last_y, last_x, last_y), fill=1)
-    draw.line((0, 0, 0, last_y), fill=1)
-    draw.line((last_x, 0, last_x, last_y), fill=1)
-
-    def scale(length, across):
-        """Ticks hanging off one edge. `across` picks the axis."""
-        for pos in range(0, length, RULER_MINOR):
-            if pos % RULER_LABEL == 0:
-                depth, label = 17, str(pos)
-            elif pos % RULER_MAJOR == 0:
-                depth, label = 11, None
-            else:
-                depth, label = 5, None
-            if across:
-                draw.line((pos, 1, pos, depth), fill=1)
-                if label and pos:
-                    draw.text((pos + 2, 19), label, font=font, fill=1)
-            else:
-                draw.line((1, pos, depth, pos), fill=1)
-                if label and pos:
-                    draw.text((19, pos - 6), label, font=font, fill=1)
-        # The far end always gets a tick, whatever the spacing lands on:
-        # the last dot is the number being looked for.
-        if across:
-            draw.line((last_x, 1, last_x, 17), fill=1)
-        else:
-            draw.line((1, last_y, 17, last_y), fill=1)
-
-    scale(width_dots, across=True)
-    scale(rows, across=False)
-
-    # The last dot's own number, at the far end of each scale. "Is 383
-    # there?" is the entire width question, and counting ticks back from
-    # an edge that may itself be missing is exactly the sum nobody wants
-    # to be doing while holding a warm label.
-    w_lab = str(last_x)
-    draw.text((last_x - 4 - _text_width(draw, w_lab, font), 19),
-              w_lab, font=font, fill=1)
-    draw.text((19, last_y - 17), str(last_y), font=font, fill=1)
-
-    # Inset comb at the far corner, so a clipped edge can be *measured*
-    # and not just noticed: the ticks stand 0, 8, 16, 24 and 32 dots in
-    # from the corner, and whichever is the first one showing is how much
-    # was lost.
-    for inset in (0, 8, 16, 24, 32):
-        x, y = last_x - inset, last_y - inset
-        if x < 40 or y < 40:
+    # --- the edge gauge: nested rectangles, each labelled just inside
+    for inset in RULER_INSETS:
+        x0, x1 = inset, last_x - inset
+        y0, y1 = top + inset, bottom - inset
+        if x1 - x0 < 80 or y1 - y0 < 40:
             continue
-        draw.line((x, y - 30, x, y - 6), fill=1)
-        draw.line((x - 30, y, x - 6, y), fill=1)
-        if inset % 16 == 0:
-            tag = str(inset)
-            draw.text((x - 3 - _text_width(draw, tag, font), y - 51),
+        draw.rectangle((x0, y0, x1, y1), outline=1)
+        # The label rides just under its own rectangle's top line, spread
+        # along it so the five do not stack, and it is lost exactly when
+        # that rectangle is lost.
+        draw.text((46 + RULER_INSETS.index(inset) * 30, y0 + 2),
+                  str(inset), font=small, fill=1)
+
+    # --- the scales, far enough in to survive whatever the edges do,
+    #     and on opposite sides so their numbers never share a corner.
+    #     Both were crowded into the top left first and the labels
+    #     overprinted each other, which on thermal paper is the same as
+    #     not printing them.
+    sy = top + RULER_INSETS[-1] + 22
+    sx = last_x - RULER_INSETS[-1] - 22
+
+    for pos in range(0, width_dots, RULER_MINOR):
+        depth = 15 if pos % RULER_LABEL == 0 else (
+            10 if pos % RULER_MAJOR == 0 else 5)
+        draw.line((pos, sy, pos, sy + depth), fill=1)
+        if pos % RULER_LABEL == 0:
+            tag = str(pos)
+            # Not if it would run into the feed scale's line. An
+            # overprinted number is not a smaller number, it is an
+            # unreadable one.
+            if pos + 2 + _text_width(draw, tag, font) < sx - 6:
+                draw.text((pos + 2, sy + 17), tag, font=font, fill=1)
+    draw.line((0, sy, last_x, sy), fill=1)
+
+    for pos in range(top, bottom, RULER_MINOR):
+        depth = 15 if (pos - top) % RULER_LABEL == 0 else (
+            10 if (pos - top) % RULER_MAJOR == 0 else 5)
+        draw.line((sx - depth, pos, sx, pos), fill=1)
+        if (pos - top) % RULER_LABEL == 0:
+            tag = str(pos)
+            draw.text((sx - 19 - _text_width(draw, tag, font), pos + 2),
                       tag, font=font, fill=1)
+    draw.line((sx, top, sx, bottom), fill=1)
 
-    # Origin marker and feed arrow, both only at 0,0. Put well inside the
-    # scales so they cannot be confused with a tick.
-    ox, oy = 46, 44
-    draw.rectangle((ox, oy, ox + 21, oy + 21), fill=1)
-    draw.text((ox + 27, oy + 3), "0,0", font=font, fill=1)
-
-    ax, ay = ox + 4, oy + 34
-    tip = min(ay + 46, last_y - 4)
-    if tip > ay:
-        draw.line((ax, ay, ax, tip), fill=1)
-        draw.polygon((ax - 7, tip - 11, ax + 7, tip - 11, ax, tip), fill=1)
-        draw.text((ax + 11, ay + 12), "FEED", font=font, fill=1)
-
-    # What was asked for, printed on the thing itself, so a label found
-    # loose in a drawer still says what it was measuring.
-    draw.text((ox, min(oy + 92, last_y - 16)),
-              f"{width_dots}x{rows}", font=font, fill=1)
+    # --- origin marker and feed direction, at 0,0 and nowhere else
+    ox, oy = 60, sy + 44
+    if oy + 80 < bottom:
+        draw.rectangle((ox, oy, ox + 19, oy + 19), fill=1)
+        draw.text((ox + 25, oy + 2), "0,0", font=font, fill=1)
+        draw.line((ox + 9, oy + 30, ox + 9, oy + 62), fill=1)
+        draw.polygon((ox + 2, oy + 52, ox + 16, oy + 52, ox + 9, oy + 62),
+                     fill=1)
+        draw.text((ox + 22, oy + 38), "FEED", font=font, fill=1)
+        draw.text((ox, oy + 68), f"{width_dots}x{rows}", font=font, fill=1)
 
     stride = (width_dots + 7) // 8
     if width_dots != stride * 8:
@@ -496,6 +498,7 @@ def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM):
         canvas.paste(img, (0, 0))
         img = canvas
     return img.tobytes(), stride, rows
+
 
 def to_image(raster, stride, rows, scale=1):
     """A viewable image of a raster, black on white.
