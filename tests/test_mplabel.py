@@ -3720,6 +3720,79 @@ def test_print_job_is_the_only_door_to_the_device():
     assert "buffers" not in json.dumps(result)
     assert result["payload"]["buffer_count"] == 3
 
+# --- groundwork for a native client -------------------------------------
+
+def test_a_bearer_token_authenticates_as_well_as_a_cookie(app):
+    """The token was already a stateless bearer credential - the cookie
+    was just how a browser carries one. A native app has no cookie jar
+    worth the name, and Set-Cookie handling outside a browser works right
+    up until it silently does not."""
+    base, _ = app
+
+    status, _headers, body = _http(f"{base}/api/login", "POST",
+                                   {"password": "hunter2"})
+    assert status == 200
+    payload = json.loads(body)
+    token = payload["token"]
+    assert token and payload["expires_in"] > 0
+
+    # No cookie anywhere, just the header.
+    status, _h, body = _http(f"{base}/api/orders",
+                             headers={"Authorization": f"Bearer {token}"})
+    assert status == 200, body
+    assert json.loads(body)["orders"]
+
+    status, _h, _b = _http(f"{base}/api/orders",
+                           headers={"Authorization": "Bearer nonsense"})
+    assert status == 401
+    status, _h, _b = _http(f"{base}/api/orders")
+    assert status == 401
+
+
+def test_the_versioned_prefix_reaches_the_same_handlers(app):
+    """An app on a phone cannot be changed in the same commit as a route.
+    /api/v1 is the name that will not move; the unversioned paths are
+    what get to change the day a v2 is needed."""
+    from mplabel import web as web_mod
+
+    base, _ = app
+    _status, cookie = _login(base)
+
+    _s1, _h1, plain = _http(f"{base}/api/orders", cookie=cookie)
+    _s2, _h2, versioned = _http(f"{base}{web_mod.API_PREFIX}/orders",
+                                cookie=cookie)
+    assert json.loads(plain) == json.loads(versioned)
+
+    # And the version is discoverable rather than guessed at.
+    _s3, _h3, session = _http(f"{base}/api/session")
+    payload = json.loads(session)
+    assert payload["api_version"] == web_mod.API_VERSION
+    assert payload["api_prefix"] == "/api/v1"
+
+
+def test_the_versioned_prefix_still_needs_auth(app):
+    """An alias that skipped the auth check would be a way in, not a
+    contract."""
+    from mplabel import web as web_mod
+
+    base, _ = app
+    for path in ("/orders", "/pending", "/stats"):
+        status, _h, _b = _http(f"{base}{web_mod.API_PREFIX}{path}")
+        assert status == 401, path
+
+
+def test_the_versioned_prefix_keeps_the_csrf_header_rule(app):
+    """A custom header cannot be set cross-origin without a preflight
+    this server never approves, which is what stands in for CSRF
+    protection. The alias must not be a way around it."""
+    from mplabel import web as web_mod
+
+    base, _ = app
+    _status, cookie = _login(base)
+    status, _h, _b = _http(f"{base}{web_mod.API_PREFIX}/orders/1/ship",
+                           "POST", {}, cookie=cookie)
+    assert status == 400
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason

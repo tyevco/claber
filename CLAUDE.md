@@ -322,6 +322,23 @@ commands now print the feed length **in millimetres**, because that is
 the number that has to match the paper, and the default is the stock that
 is actually loaded.
 
+**The phone app's token is a bearer token, and `/api/v1` is the name
+that will not move.** `issue_token`/`valid_token` were always stateless
+and signed - a cookie was just how a browser carries one - so `authed()`
+takes `Authorization: Bearer` as well, and `/api/login` returns the token
+in the body beside the `Set-Cookie`. A native client has no cookie jar
+worth the name. `/api/v1/...` aliases the whole surface in the
+dispatcher, auth and CSRF header rule included; the PWA ships with this
+server and can change in the same commit as a route, an app on a phone
+cannot.
+
+**A Swift marker decoder would be a third implementation.** `marker.py`
+and `marker.js` are pinned byte-for-byte by a node test and 137
+assertions; Swift would get none of that. `VNDetectBarcodesRequest` reads
+QR with Apple's own decoder for free, so if the QR scans off thermal at 5
+dots per module the marker becomes deletable rather than portable. That
+is one scan of a printed label, and it has not been done.
+
 **Both printers are behind `printd`, and the label maker sends a *spec*
 not a raster.** `tag_backend` picks `supvan` (the local hidraw node) or
 `pi-http` (`POST /print-tag`). What crosses is what to put on the label -

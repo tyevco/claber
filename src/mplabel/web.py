@@ -59,6 +59,12 @@ class PrintError(Exception):
 STATIC = Path(__file__).parent / "static"
 COOKIE_NAME = "mplabel_session"
 
+# The versioned alias for every /api route. Bump this and keep the
+# old prefix working when something actually changes shape; today
+# it is one string because nothing has.
+API_VERSION = 1
+API_PREFIX = f"/api/v{API_VERSION}"
+
 # Bodies are small until photos arrive in phase 4; anything larger than
 # this is a mistake or an attack, and reading it into memory on a Pi is
 # how you get the OOM killer to stop the label printer.
@@ -365,6 +371,18 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("CF-Connecting-IP") or self.client_address[0]
 
     def authed(self):
+        """A signed token, from a cookie or an Authorization header.
+
+        The token was already a stateless bearer credential - a cookie
+        was just how a browser carries one. A native app has no cookie
+        jar worth the name, and `Set-Cookie` handling outside a browser
+        is the sort of thing that works until it silently does not, so
+        the header is the first-class form and the cookie stays for the
+        PWA. Same token, same signature, same expiry: nothing new to
+        revoke and no second credential to leak."""
+        auth = self.headers.get("Authorization") or ""
+        if auth[:7].lower() == "bearer ":
+            return valid_token(self.cfg, auth[7:].strip())
         cookie = SimpleCookie(self.headers.get("Cookie") or "")
         morsel = cookie.get(COOKIE_NAME)
         return bool(morsel) and valid_token(self.cfg, morsel.value)
@@ -397,6 +415,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         path = urlparse(self.path).path
+        # `/api/v1/...` is the same surface under a name that will not
+        # move. The PWA ships with this server and can be changed in the
+        # same commit as a route; an app on a phone cannot, and a native
+        # client that has to guess whether /api/orders still means what
+        # it meant last month has no contract at all. One alias, no
+        # duplicated handlers, and the day v2 is needed the unversioned
+        # paths are what get to change.
+        if path.startswith(API_PREFIX + "/"):
+            path = "/api/" + path[len(API_PREFIX) + 1:]
         try:
             for m, pattern, name, needs_auth in self._COMPILED:
                 if m != method:
@@ -456,14 +483,22 @@ class Handler(BaseHTTPRequestHandler):
         self.server.throttle.clear(who)
         days = int(self.cfg.get("web_session_days", 30))
         token = issue_token(self.cfg, days)
-        self.json({"ok": True},
+        # The token is in the body as well as the cookie. The browser
+        # uses the cookie and ignores this; a native client stores the
+        # token and sends it as `Authorization: Bearer`. Handing it over
+        # rather than making the app scrape Set-Cookie is the difference
+        # between a contract and a trick.
+        self.json({"ok": True, "token": token,
+                   "expires_in": days * 86400},
                   extra_headers=[self._cookie_header(token, days * 86400)])
 
     def h_logout(self):
         self.json({"ok": True}, extra_headers=[self._cookie_header("", 0)])
 
     def h_session(self):
-        self.json({"authenticated": self.authed()})
+        self.json({"authenticated": self.authed(),
+                   "api_version": API_VERSION,
+                   "api_prefix": API_PREFIX})
 
     def h_orders(self):
         # CLOSED_STATUSES, not `!= 'shipped'` - a cancelled order is closed
