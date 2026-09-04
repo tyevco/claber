@@ -509,24 +509,271 @@ def probe_deep(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
     return results
 
 
-# ---------------------------------------------------------- not built yet
+# ----------------------------------------------------- the print buffer
+#
+# What goes inside the compressed stream, which is what every refused
+# label was missing. The device does not take a bare raster: it takes a
+# sequence of fixed 4096-byte *print buffers*, each carrying a 14-byte
+# header and a checksum, and the whole sequence is compressed as one
+# LZMA stream.
+#
+# This is why the only bitmap that ever printed here was the vendor's
+# own. Their capture decompresses to 12288 bytes, which this repo read as
+# "48 bytes per row x 256 rows" - a plausible raster, and wrong. 12288 is
+# 3 x 4096: three print buffers, headers and checksums included. Replaying
+# it printed because it was already three valid buffers; re-encoding it
+# printed because the encoder round-trips them unchanged. Everything this
+# repo *drew* was a bare raster of some other length, so the firmware
+# rejected it - and `media_seating_error` is its only word for "no".
+#
+# The layout below is transcribed from two independent implementations of
+# the vendor's `T50PlusPrint.initLZMAData`, which agree byte for byte:
+# heeen/supvan-cups (MIT), both its Rust `supvan-proto` crate and the
+# `test_print.py` reference it ships. Neither is a guess about this
+# device; both were read off the Android app and one of them drives a
+# T50M Pro whose serial prefix (T0117A) is the same as ours.
 
-def print_bitmap(*_args, **_kwargs):
-    """Deliberately unimplemented - see docs/supvan-t50m-protocol.md.
+PRINT_BUF_SIZE = 4096
+PRINT_BUF_HEADER = 14
 
-    The command sequence for a job is known, and the image is LZMA, which
-    the stdlib covers. What is not known is what goes *inside* the
-    compressed buffer, and all of it has to be settled before bytes are
-    sent to a device that then pulls paper through a hot head."""
-    raise NotImplementedError(
-        "the T50M Pro print path is not implemented: the uncompressed row "
-        "format (bytes per row, bit order), the bit polarity (whether a set "
-        "bit is a black dot), this model's exact dot width (~384 at "
-        "48mm/203dpi, but the real constant is per-model), how media width "
-        "and label length are communicated, and the RFID label "
-        "authentication exchange (opcode 0x5d) are all undetermined. Use "
-        "`mplabel inventory` and the vendor editor until they are, or "
-        "`mplabel supvan-test-print` to help settle them.")
+# Image bytes a single buffer will carry. Not 4096-14=4082: the vendor's
+# own constant is 4074, and the eight bytes it leaves spare are theirs to
+# explain, not ours to reclaim.
+MAX_BUF_DATA = 4074
+
+# The firmware re-reads its running checksum every 256 bytes, so the byte
+# just before each boundary is folded in a second time. Omitting those
+# gives a checksum that looks right and is not.
+CHECKSUM_STRIDE = 256
+
+MAX_DENSITY = 15
+MARGIN_MAX_DOTS = 900
+DEFAULT_MARGIN_DOTS = 8
+
+# Burn energy, 0-15. The vendor's default is 4 for both trims; black
+# rides in the header's PAGE_REG_BITS and red in byte 12, and the print
+# dialog exposes them separately, so they are two values and not one.
+DEFAULT_DENSITY = 4
+
+
+def build_page_reg_bits(page_st=False, page_end=False, prt_end=False,
+                        cut=0, savepaper=False, first_cut=0, nodu=0, mat=1):
+    """The two PAGE_REG_BITS bytes at offset 2 of a print buffer.
+
+    `nodu` is the black density; `mat` is the material type, which the
+    vendor sends as 1 throughout. The page flags mark where a buffer sits
+    in the job: the first buffer of a page carries `page_st`, the last
+    carries `page_end`, and the last buffer of the whole job also carries
+    `prt_end`."""
+    b0 = 0
+    if page_st:
+        b0 |= 0x02
+    if page_end:
+        b0 |= 0x04
+    if prt_end:
+        b0 |= 0x08
+    b0 &= 0x0F
+    b0 |= (cut & 0x07) << 4
+    if savepaper:
+        b0 |= 0x80
+
+    b1 = (first_cut & 0x03) | ((nodu & 0x0F) << 2) | ((mat & 0x03) << 6)
+    return bytes([b0, b1])
+
+
+def build_print_buffer(image_data, per_line_byte, cols_in_buf,
+                       page_st=False, page_end=False, prt_end=False,
+                       margin_top=DEFAULT_MARGIN_DOTS,
+                       margin_bottom=DEFAULT_MARGIN_DOTS,
+                       density=DEFAULT_DENSITY, red_density=None):
+    """One 4096-byte print buffer, header and checksum included.
+
+        [0:2]   checksum, little-endian
+        [2:4]   PAGE_REG_BITS (black density lives in here)
+        [4:6]   column count, little-endian
+        [6]     bytes per printhead line
+        [7]     reserved, 0
+        [8:10]  margin top, little-endian dots
+        [10:12] margin bottom
+        [12]    red density
+        [13]    0
+        [14:]   image data, column-major LSB-first
+
+    A "column" is one printhead line - one firing of the 384-dot bar -
+    so the column count runs along the feed direction and `per_line_byte`
+    runs across the head. That is the opposite of how a raster is usually
+    described, and getting it the usual way round is what made the
+    captured image look like 256 rows of 48 bytes."""
+    if red_density is None:
+        red_density = density
+    buf = bytearray(PRINT_BUF_SIZE)
+
+    buf[2:4] = build_page_reg_bits(page_st=page_st, page_end=page_end,
+                                   prt_end=prt_end, nodu=density, mat=1)
+    buf[4:6] = int(cols_in_buf).to_bytes(2, "little")
+    buf[6] = per_line_byte & 0xFF
+
+    mt = max(1, min(int(margin_top), MARGIN_MAX_DOTS))
+    mb = max(1, min(int(margin_bottom), MARGIN_MAX_DOTS))
+    buf[8:10] = mt.to_bytes(2, "little")
+    buf[10:12] = mb.to_bytes(2, "little")
+    buf[12] = min(red_density, MAX_DENSITY)
+    buf[13] = 0
+
+    data_len = min(len(image_data), PRINT_BUF_SIZE - PRINT_BUF_HEADER)
+    buf[PRINT_BUF_HEADER:PRINT_BUF_HEADER + data_len] = image_data[:data_len]
+
+    # Checksum over the header, plus the byte before every 256-byte
+    # boundary within the declared extent of the image data.
+    data_end = cols_in_buf * per_line_byte + PRINT_BUF_HEADER
+    chk = sum(buf[2:PRINT_BUF_HEADER])
+    for i in range(1, data_end // CHECKSUM_STRIDE + 1):
+        idx = i * CHECKSUM_STRIDE - 1
+        if idx < len(buf):
+            chk += buf[idx]
+    buf[0:2] = (chk & 0xFFFF).to_bytes(2, "little")
+    return bytes(buf)
+
+
+def raster_to_column_major(data):
+    """Repack a standard MSB-first raster the way the printhead reads it.
+
+    The device wants the leftmost dot of a printhead line in the *least*
+    significant bit, where every other raster in this codebase - and
+    `render_test_pattern`, and `printers.render_bitmap` - puts it in the
+    most significant. The byte stride is unchanged, so this is a bit
+    reversal within each byte and nothing more; no transpose is involved,
+    because a raster row and a printhead line are already the same run of
+    bytes. Naming it after the vendor's term for the layout rather than
+    after the mechanic, because that is what a reader will be looking
+    for."""
+    return bytes(_REVERSED_BITS[b] for b in data)
+
+
+_REVERSED_BITS = bytes(
+    int(f"{b:08b}"[::-1], 2) for b in range(256)
+)
+
+
+def split_into_buffers(image_data, per_line_byte, total_cols,
+                       margin_top=DEFAULT_MARGIN_DOTS,
+                       margin_bottom=DEFAULT_MARGIN_DOTS,
+                       density=DEFAULT_DENSITY, red_density=None):
+    """Tile a column-major image into print buffers along the feed axis.
+
+    The margins are declared in the header and their columns are *not*
+    sent - the firmware feeds blank for them - so the image data walks
+    from `margin_top` and stops `margin_bottom` short of the end.
+
+    This is the split the device actually imposes, and it is on the
+    uncompressed side: 4074 image bytes per buffer, so 84 printhead lines
+    at 48 bytes each. `split_bitmap` below splits on *compressed* size
+    instead, chasing a limit that never existed."""
+    if per_line_byte <= 0:
+        raise ValueError("per_line_byte must be positive")
+    max_cols = MAX_BUF_DATA // per_line_byte
+    if max_cols <= 0:
+        raise ValueError("a single printhead line does not fit in a buffer")
+
+    cols = total_cols - margin_top - margin_bottom
+    if cols <= 0:
+        raise ValueError("margins leave no columns to print")
+
+    chunks = []
+    start = 0
+    while start < cols:
+        chunks.append((start, min(max_cols, cols - start)))
+        start += chunks[-1][1]
+
+    last = len(chunks) - 1
+    buffers = []
+    for i, (start_col, cols_in_buf) in enumerate(chunks):
+        off = (margin_top + start_col) * per_line_byte
+        chunk = image_data[off:off + cols_in_buf * per_line_byte]
+        buffers.append(build_print_buffer(
+            chunk, per_line_byte, cols_in_buf,
+            page_st=(i == 0), page_end=(i == last), prt_end=(i == last),
+            margin_top=margin_top, margin_bottom=margin_bottom,
+            density=density, red_density=red_density))
+    return buffers
+
+
+# Print speed as a function of how well the image compressed, from the
+# vendor's `T50PlusPrint.multiCompression`. Denser data prints slower so
+# the head has time to heat, and the argument is the *average* compressed
+# bytes per buffer rather than the total.
+#
+# This settles the one number in the captured print nobody here could
+# explain: its BUF_FULL frame carried a second value of 60, which this
+# code had been sending as a constant. 123 compressed bytes over three
+# buffers averages 41, and 41 falls in the bottom band - so 60 was not a
+# constant at all, it was this function's answer for a nearly blank
+# label. A real label compresses larger and must be printed slower.
+SPEED_BANDS = ((3000, 10), (2800, 15), (2500, 20), (2000, 25),
+               (1500, 40), (1000, 45), (500, 55))
+
+
+def calc_speed(avg_compressed_per_buffer):
+    """The speed value for BUF_FULL, from the average compressed size."""
+    for threshold, speed in SPEED_BANDS:
+        if avg_compressed_per_buffer > threshold:
+            return speed
+    return 60
+
+
+def build_job(raster, per_line_byte, total_cols,
+              margin_top=DEFAULT_MARGIN_DOTS,
+              margin_bottom=DEFAULT_MARGIN_DOTS,
+              density=DEFAULT_DENSITY, red_density=None, dict_size=None):
+    """Turn a standard MSB-first raster into a job the device will take.
+
+    Returns a dict carrying what `experimental_print` sends: the single
+    LZMA stream over every print buffer, the uncompressed length, the
+    derived speed, and the buffer count for reporting.
+
+    One stream over all the buffers, not one per buffer: the firmware
+    reads a buffer header at each 4096-byte boundary of the *decompressed*
+    data, so the buffers are concatenated first and compressed once. The
+    captured print is exactly this - 123 compressed bytes covering three
+    buffers - which is also why its declared uncompressed size is 12288
+    and not the size of any one buffer."""
+    kw = {} if dict_size is None else {"dict_size": dict_size}
+    buffers = split_into_buffers(
+        raster_to_column_major(raster), per_line_byte, total_cols,
+        margin_top=margin_top, margin_bottom=margin_bottom,
+        density=density, red_density=red_density)
+    blob = b"".join(buffers)
+    compressed = compress_bitmap(blob, **kw)
+    return {
+        "compressed": compressed,
+        "raw_len": len(blob),
+        "speed": calc_speed(len(compressed) // len(buffers)),
+        "buffers": len(buffers),
+    }
+
+
+# ------------------------------------------------ not wired in yet
+
+def print_bitmap(raster, per_line_byte, total_cols, path=DEFAULT_DEVICE,
+                 timeout=DEFAULT_TIMEOUT, density=DEFAULT_DENSITY,
+                 margin_top=DEFAULT_MARGIN_DOTS,
+                 margin_bottom=DEFAULT_MARGIN_DOTS, on_step=None):
+    """Print one raster on the label maker.
+
+    The format is settled (see the section above) but **no label from
+    this function has ever come out of the hardware**, so nothing in
+    mplabel calls it automatically: `mplabel inventory` still writes a
+    CSV for the vendor editor. `mplabel supvan-test-print` drives this
+    same path deliberately, one label at a time, which is how it gets
+    promoted from here.
+
+    Deliberately takes a raster rather than a PDF. Rendering belongs to
+    `printers.render_bitmap`, and keeping this function to bytes-in is
+    what lets the whole job be built and asserted without a device."""
+    job = build_job(raster, per_line_byte, total_cols, density=density,
+                    margin_top=margin_top, margin_bottom=margin_bottom)
+    return experimental_print(job, path=path, timeout=timeout,
+                              speed=job["speed"], on_step=on_step)
 
 
 # ------------------------------------------------------- the experiment

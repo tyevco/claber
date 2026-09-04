@@ -2425,7 +2425,7 @@ def test_supvan_cli_defaults_to_the_device_encoder(monkeypatch, capsys):
     monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
     monkeypatch.setattr(sys, "argv",
                         ["mplabel", "supvan-test-print", "--dry-run",
-                         "--max-buffer", "0"])
+                         "--bare-raster", "--max-buffer", "0"])
     cli.main()
     out = capsys.readouterr().out
     assert "device container" in out
@@ -2634,13 +2634,21 @@ def test_supvan_multi_buffer_print_repeats_the_cycle_per_buffer(monkeypatch):
         assert int.from_bytes(frame[2:4], "big") == len(compressed)
 
 
-def test_supvan_a_whole_label_fits_one_buffer(monkeypatch, capsys):
+def test_supvan_a_whole_label_stays_small_enough_to_reason_about(
+        monkeypatch, capsys):
     """The point of the match coder, asserted through the real CLI.
 
-    The device takes at most 512 compressed bytes and printed nothing
-    above 419. Literals-only put a full 48x256 label at 551-724 bytes,
-    which is what those refusals were; with matches it is well under, so
-    the whole label goes in one buffer and `split_bitmap` never fires."""
+    The bound this used to assert - "the device takes at most 512
+    compressed bytes" - was never real. Three sizes were blamed in turn
+    (448, 512, report count) and each was retracted; what the firmware
+    actually objected to was a payload that was not whole print buffers.
+
+    The property is still worth pinning, for the reason CLAUDE.md gives:
+    an encoder that silently stopped emitting matches would round-trip
+    through liblzma perfectly and simply not print, which is a day spent
+    chasing the printer. Literals-only put a full 48x256 label at
+    551-724 bytes; with matches it is far under that, so the number here
+    is a regression tripwire and not a device limit."""
     from mplabel import cli
 
     monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
@@ -2651,8 +2659,11 @@ def test_supvan_a_whole_label_fits_one_buffer(monkeypatch, capsys):
         cli.main()
         out = capsys.readouterr().out
         size = int(re.search(r"lzma   : (\d+) bytes", out).group(1))
-        assert size <= 512, f"{style} is {size} bytes, over the device limit"
-        assert "in 1 buffer(s)" in out, style
+        assert size <= 512, f"{style} is {size} bytes; matches regressed?"
+        # And it goes as whole print buffers, which is the part that
+        # decides whether the device takes it at all.
+        assert re.search(r"buffers: \d+ x 4096", out), style
+
 
 class _GoesQuiet(_FakeDevice):
     """Answers normally, then ignores `silences` reads, then answers again.
@@ -2860,7 +2871,7 @@ def test_supvan_cli_declares_the_size_by_default(monkeypatch, capsys,
     # the header printed per band is the proof of it.
     monkeypatch.setattr(sys, "argv",
                         ["mplabel", "supvan-test-print", "--dry-run",
-                         "--max-buffer", "0"] + argv)
+                         "--bare-raster", "--max-buffer", "0"] + argv)
     cli.main()
     out = capsys.readouterr().out
     assert expected in out
@@ -2870,16 +2881,32 @@ def test_supvan_cli_declares_the_size_by_default(monkeypatch, capsys,
 def test_supvan_the_alone_container_is_the_one_that_cannot_print():
     """Why `device` exists, kept as a test rather than as a comment.
 
-    Python always appends an end-of-stream marker, and liblzma then
-    refuses its own output when a size is also declared. The captured
-    print has no marker and reads back fine. This is the stream the
-    printer accepted, positioned for, and never completed - three times -
-    and `--lzma alone` is the way back to reproducing that."""
+    Python always appends an end-of-stream marker; the captured print has
+    none. The difference is visible by blanking the declared size and
+    asking each stream to decode as unknown-length: a marker-terminated
+    stream still knows where it ends, one without a marker does not.
+
+    Asserted that way round on purpose. The obvious test - hand liblzma a
+    stream carrying *both* a declared size and a marker and expect it to
+    object - passes only on strict liblzma builds, and quietly decodes on
+    others (it does on xz 5.4.5). That pins the local library's mood
+    rather than our encoder, which is a test that fails on a machine
+    where nothing is wrong."""
     import lzma
+
+    def as_unknown_size(stream):
+        return stream[:5] + b"\xff" * 8 + stream[13:]
+
     raw, _s, _r = supvan.render_test_pattern(384, 64)
+
+    # liblzma's: has a marker, so it decodes with no size to go on.
+    theirs = as_unknown_size(supvan.compress_bitmap(raw, "alone"))
+    assert lzma.decompress(theirs, format=lzma.FORMAT_ALONE) == raw
+
+    # Ours: no marker, so without the size there is nothing to stop at.
+    ours = as_unknown_size(supvan.compress_bitmap(raw, "device"))
     with pytest.raises(lzma.LZMAError):
-        lzma.decompress(supvan.compress_bitmap(raw, "alone"),
-                        format=lzma.FORMAT_ALONE)
+        lzma.decompress(ours, format=lzma.FORMAT_ALONE)
 
 
 @pytest.mark.parametrize("fmt,magic", [
@@ -2977,15 +3004,229 @@ def test_supvan_read_report_returns_what_the_node_held(tmp_path):
         assert dev.read_report() == bytes(range(64))
 
 
-def test_supvan_print_path_refuses_and_names_what_is_unknown():
-    """No guessing at anything that pulls paper through a hot head. The
-    row format, the bit polarity, the dot width and the RFID exchange are
-    all undetermined, and the message has to say so."""
-    with pytest.raises(NotImplementedError) as exc:
-        supvan.print_bitmap(b"")
-    said = str(exc.value)
-    for unknown in ("row format", "polarity", "dot width", "0x5d"):
-        assert unknown in said
+def test_supvan_print_path_builds_a_job_without_touching_hardware():
+    """`print_bitmap` used to refuse outright, because what went inside
+    the compressed stream was unknown. It is known now - but it has still
+    never printed, so the guard that matters is that nothing calls it on
+    its own. It takes a raster and hands the assembled job to the same
+    experimental sequence `supvan-test-print` drives, one label at a
+    time and on purpose."""
+    raw, stride, rows = supvan.render_test_pattern(384, 128)
+    job = supvan.build_job(raw, stride, rows)
+    assert job["raw_len"] % supvan.PRINT_BUF_SIZE == 0
+    assert job["speed"] == supvan.calc_speed(
+        len(job["compressed"]) // job["buffers"])
+
+
+def test_supvan_inventory_still_goes_through_the_vendor_editor():
+    """The print path exists but is not trusted yet, so `mplabel
+    inventory` must still write a CSV rather than quietly starting to
+    print. Deleting this test is the deliberate act that switches the
+    inventory labels over, once a real one has come out correctly."""
+    import inspect
+    from mplabel import cli
+    src = inspect.getsource(cli.cmd_inventory)
+    assert "print_bitmap" not in src
+    assert "csv" in src.lower()
+
+
+# ------------------------------- the print buffer, and why labels were refused
+#
+# Every one of these exists because a bare raster was being sent where the
+# device wanted print buffers, and it answered `media_seating_error` -
+# its only word for "no" - so the shape of the mistake was invisible.
+
+def test_supvan_a_print_buffer_is_4096_bytes_with_its_header():
+    """The unit the firmware reads is a fixed 4096-byte buffer, not a
+    run of raster rows. Nothing this repo drew was ever a multiple of
+    4096, which is the whole reason none of it printed."""
+    buf = supvan.build_print_buffer(b"\xa5" * 96, per_line_byte=48,
+                                    cols_in_buf=2, page_st=True)
+    assert len(buf) == supvan.PRINT_BUF_SIZE
+    assert int.from_bytes(buf[4:6], "little") == 2      # column count
+    assert buf[6] == 48                                 # bytes per line
+    assert buf[supvan.PRINT_BUF_HEADER:supvan.PRINT_BUF_HEADER + 96] \
+        == b"\xa5" * 96
+    # Margins are clamped to at least 1: a declared 0 is not "no margin".
+    assert int.from_bytes(buf[8:10], "little") >= 1
+
+
+def test_supvan_buffer_checksum_folds_in_every_256th_byte():
+    """The firmware re-reads its running checksum every 256 bytes and
+    folds in the byte before each boundary. A checksum over the header
+    alone looks perfectly reasonable and is wrong, so this pins the
+    stride rather than just the total."""
+    data = bytes(range(256)) * 4
+    buf = supvan.build_print_buffer(data, per_line_byte=48, cols_in_buf=20)
+
+    expect = sum(buf[2:supvan.PRINT_BUF_HEADER])
+    data_end = 20 * 48 + supvan.PRINT_BUF_HEADER
+    boundaries = [i * supvan.CHECKSUM_STRIDE - 1
+                  for i in range(1, data_end // supvan.CHECKSUM_STRIDE + 1)]
+    assert boundaries, "this fixture must span at least one boundary"
+    expect += sum(buf[i] for i in boundaries)
+
+    assert int.from_bytes(buf[0:2], "little") == expect & 0xFFFF
+    # And the boundary bytes genuinely move the answer.
+    assert expect != sum(buf[2:supvan.PRINT_BUF_HEADER])
+
+
+def test_supvan_density_rides_in_two_different_places():
+    """Black density is packed into PAGE_REG_BITS and red sits alone in
+    byte 12. They are two independent trims in the vendor's own print
+    dialog, so writing one value into both places is a special case and
+    not the rule."""
+    buf = supvan.build_print_buffer(b"", 48, 1, density=9, red_density=3)
+    assert buf[12] == 3
+    assert (buf[3] >> 2) & 0x0F == 9
+
+
+def test_supvan_page_flags_mark_the_first_and_last_buffer():
+    """A job spans several buffers and the firmware needs to know which
+    end it is at: the first carries PageSt, the last carries PageEnd and
+    PrtEnd. Setting them on every buffer, or on none, both read as a job
+    that never ends."""
+    raster = b"\x00" * (48 * 256)
+    bufs = supvan.split_into_buffers(raster, 48, 256)
+    assert len(bufs) > 1, "this fixture must span more than one buffer"
+    assert bufs[0][2] & 0x02, "first buffer should carry PageSt"
+    assert not bufs[0][2] & 0x04
+    assert bufs[-1][2] & 0x04, "last buffer should carry PageEnd"
+    assert bufs[-1][2] & 0x08, "last buffer should carry PrtEnd"
+    for mid in bufs[1:-1]:
+        assert not mid[2] & 0x0E
+
+
+def test_supvan_buffers_hold_84_printhead_lines_not_a_round_number():
+    """4074 image bytes per buffer, which at 48 bytes a line is 84 lines
+    and 42 bytes left over. The tempting round numbers - 4096/48, or 85 -
+    both overrun."""
+    raster = b"\x00" * (48 * 300)
+    bufs = supvan.split_into_buffers(raster, 48, 300,
+                                     margin_top=0, margin_bottom=0)
+    assert supvan.MAX_BUF_DATA // 48 == 84
+    assert int.from_bytes(bufs[0][4:6], "little") == 84
+    assert sum(int.from_bytes(b[4:6], "little") for b in bufs) == 300
+
+
+def test_supvan_margin_columns_are_declared_but_never_sent():
+    """The margin is fed blank by the firmware from the header, so its
+    columns are not in the data. Sending them as well prints the label
+    twice as long as asked and shifts every dot down the roll."""
+    stride, rows, margin = 48, 200, 8
+    # A recognisable first column so we can see which one was sent first.
+    raster = bytearray(stride * rows)
+    raster[margin * stride:(margin + 1) * stride] = b"\xff" * stride
+    bufs = supvan.split_into_buffers(bytes(raster), stride, rows,
+                                     margin_top=margin, margin_bottom=margin)
+
+    sent = sum(int.from_bytes(b[4:6], "little") for b in bufs)
+    assert sent == rows - 2 * margin
+    head = supvan.PRINT_BUF_HEADER
+    assert bufs[0][head:head + stride] == b"\xff" * stride
+    assert int.from_bytes(bufs[0][8:10], "little") == margin
+
+
+def test_supvan_the_left_dot_is_the_low_bit_not_the_high_one():
+    """The printhead reads the leftmost dot from the *least* significant
+    bit; every raster elsewhere in this codebase puts it in the most.
+    That is a bit reversal per byte and no transpose - a raster row and a
+    printhead line are already the same run of bytes - which is why the
+    stride is unchanged."""
+    assert supvan.raster_to_column_major(b"\x80") == b"\x01"
+    assert supvan.raster_to_column_major(b"\x01") == b"\x80"
+    assert supvan.raster_to_column_major(b"\xa5") == b"\xa5"   # palindrome
+    raw = supvan.render_test_pattern(384, 8)[0]
+    assert len(supvan.raster_to_column_major(raw)) == len(raw)
+    assert supvan.raster_to_column_major(
+        supvan.raster_to_column_major(raw)) == raw
+
+
+def test_supvan_speed_is_derived_from_the_size_not_a_constant():
+    """The captured print's BUF_FULL carried a second value of 60, which
+    this code sent as a constant for months. It is not one: it is what
+    the vendor's own function returns for a nearly blank label. 123
+    compressed bytes over three buffers averages 41, and 41 lands in the
+    bottom band.
+
+    A real label compresses larger and has to print *slower*, so the
+    head has time to heat. Sending 60 for a dense label is the failure
+    this pins."""
+    assert supvan.calc_speed(123 // 3) == 60
+    assert supvan.calc_speed(600) == 55
+    assert supvan.calc_speed(3001) == 10
+    # Monotonically slower as the data gets denser, with no gaps.
+    speeds = [supvan.calc_speed(n) for n in (0, 501, 1001, 1501,
+                                             2001, 2501, 2801, 3001)]
+    assert speeds == sorted(speeds, reverse=True)
+
+
+def test_supvan_a_job_is_one_stream_over_whole_buffers():
+    """One LZMA stream covering every buffer, not one stream per buffer.
+    The firmware reads a buffer header at each 4096-byte boundary of the
+    *decompressed* data, so the buffers are concatenated and compressed
+    once - which is why the captured print declares 12288 and not the
+    size of any single buffer."""
+    raw, stride, rows = supvan.render_test_pattern(384, 256)
+    job = supvan.build_job(raw, stride, rows)
+    assert job["raw_len"] == job["buffers"] * supvan.PRINT_BUF_SIZE
+    declared = int.from_bytes(job["compressed"][5:13], "little")
+    assert declared == job["raw_len"]
+
+
+def test_supvan_a_generated_job_has_the_shape_of_the_captured_print():
+    """The end-to-end check, against the one print known to have come out
+    of this hardware.
+
+    Its uncompressed length was 12288 and this repo read that as 48 bytes
+    x 256 rows - a raster, and the wrong reading. It is 3 x 4096: three
+    print buffers. A 384x256 pattern at the vendor's default 8-dot
+    margins now assembles to exactly that, with the same LZMA header and
+    the same speed.
+
+    The height is not independent evidence - 256 was chosen back when
+    12288 was being read as a raster. What is: that 12288 divides into
+    whole print buffers at all, that the derived speed lands on the
+    captured 60, and that the header is byte-identical."""
+    raw, stride, rows = supvan.render_test_pattern(384, 256)
+    job = supvan.build_job(raw, stride, rows)
+    assert job["buffers"] == 3
+    assert job["raw_len"] == 12288
+    assert job["speed"] == 60
+    assert job["compressed"][:13].hex(" ") == \
+        "5d 00 20 00 00 00 30 00 00 00 00 00 00"
+
+
+def test_supvan_a_job_round_trips_back_to_its_buffers():
+    """Decompressing a job must give back the buffers that went in, each
+    with a checksum that still validates. A silent encoder regression
+    would otherwise look exactly like a device fault - the failure this
+    codebase has already paid for once."""
+    import lzma
+    raw, stride, rows = supvan.render_test_pattern(384, 256)
+    job = supvan.build_job(raw, stride, rows)
+    blob = lzma.decompress(job["compressed"], format=lzma.FORMAT_ALONE)
+    assert len(blob) == job["raw_len"]
+
+    for i in range(job["buffers"]):
+        buf = blob[i * supvan.PRINT_BUF_SIZE:(i + 1) * supvan.PRINT_BUF_SIZE]
+        cols = int.from_bytes(buf[4:6], "little")
+        per_line = buf[6]
+        data_end = cols * per_line + supvan.PRINT_BUF_HEADER
+        chk = sum(buf[2:supvan.PRINT_BUF_HEADER])
+        for n in range(1, data_end // supvan.CHECKSUM_STRIDE + 1):
+            chk += buf[n * supvan.CHECKSUM_STRIDE - 1]
+        assert int.from_bytes(buf[0:2], "little") == chk & 0xFFFF, \
+            f"buffer {i} checksum does not validate"
+
+
+def test_supvan_margins_that_swallow_the_label_are_refused():
+    """Better a clear error here than a job declaring zero columns, which
+    the device accepts and answers by positioning the head and printing
+    nothing."""
+    with pytest.raises(ValueError):
+        supvan.split_into_buffers(b"\x00" * (48 * 10), 48, 10,
+                                  margin_top=8, margin_bottom=8)
 
 
 def test_supvan_probe_is_wired_above_the_database(tmp_path, capsys):
