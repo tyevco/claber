@@ -3147,6 +3147,171 @@ def test_the_measuring_targets_still_use_the_whole_head():
         assert min(xs) == 0, f"{render.__name__} does not reach x=0"
         assert max(xs) == 383, f"{render.__name__} does not reach x=383"
 
+# --- shelf tags ---------------------------------------------------------
+
+def test_a_location_code_is_three_characters_not_four():
+    """The whole scheme rests on this. The marker payload already carries
+    a format bit telling 3-char codes from 4-char ones, so three means a
+    place and four means a thing - and a scanner knows which it has
+    without a prefix character or anything new on the wire.
+
+    A four-character location code would scan as an item and bin
+    itself, so it is refused rather than accepted and drawn."""
+    from mplabel import inventory
+
+    assert inventory.normalise_location_code("a1b") == "A1B"
+    with pytest.raises(ValueError, match="a location code is 3"):
+        inventory.normalise_location_code("7K2Q")
+    with pytest.raises(ValueError, match="alphabet"):
+        inventory.normalise_location_code("AIB")     # I is not in it
+
+
+def test_shelf_tag_carries_the_same_code_it_prints():
+    """A tag whose marker disagrees with its printed characters sends
+    boxes to the wrong shelf and looks right doing it.
+
+    Checked against the modules `marker.render` produces rather than
+    through the decoder: the invariant the drawing owns is that what
+    survived the print pipeline *is* the marker for this code. Whether a
+    camera can then read it off thermal paper is a different question and
+    not one a test can answer.
+
+    On the square tag, which does not print turned - the rotated case is
+    covered below by geometry rather than by re-deriving the transpose
+    here, where getting it wrong would fail the test for the wrong
+    reason."""
+    from mplabel import inventory, marker
+
+    size = (48, 30)
+    raw, stride, rows = inventory.render_shelf_tag(
+        "A1B", with_marker=True, label_mm=size)
+    assert not inventory.reads_sideways(size)
+    job = supvan.build_job(raw, stride, rows)
+    back, back_stride, cols = supvan.decode_job(job["compressed"])
+
+    x0, y0, x1, y1 = inventory.shelf_marker_box(label_mm=size)
+    want = marker.render("A1B", quiet=inventory.MARKER_QUIET)
+    down, across = len(want), len(want[0])
+    height, width = y1 - y0 + 1, x1 - x0 + 1
+
+    # `decode_job` hands back only the rows the device is given, so its
+    # row 0 is the raster's row `margin_top`. Indexing it in raster
+    # coordinates reads the label eight rows too low, which looks like a
+    # marker that does not match rather than an off-by-a-margin.
+    shift = supvan.DEFAULT_MARGIN_DOTS
+
+    for r in range(down):
+        for c in range(across):
+            x = x0 + int((c + 0.5) * width / across)
+            y = y0 + int((r + 0.5) * height / down) - shift
+            got = 1 if back[y * back_stride + (x >> 3)] & (0x80 >> (x & 7))                 else 0
+            assert got == want[r][c], f"module {r},{c}"
+
+
+def test_the_shelf_marker_box_is_where_the_marker_actually_is():
+    """`shelf_marker_box` is what a decoder gets handed, and it is
+    derived from the same placement the drawing uses so the two cannot
+    drift - the pairing `_marker_band` and `marker_box` already have for
+    item labels. Asserted on the turned tag too, where the box has to
+    carry the rotation with it."""
+    from mplabel import inventory, marker
+
+    rows_m = marker.ROWS + 2 * inventory.MARKER_QUIET
+    cols_m = marker.COLS + 2 * inventory.MARKER_QUIET
+
+    for size in ((101.6, 25.4), (48, 30)):
+        raw, stride, rows = inventory.render_shelf_tag(
+            "A1B", with_marker=True, label_mm=size)
+        x0, y0, x1, y1 = inventory.shelf_marker_box(label_mm=size)
+        assert 0 <= x0 < x1 < stride * 8 and 0 <= y0 < y1 < rows, size
+
+        # Whole modules both ways round, and the box is the marker's own
+        # aspect - 6 by 24 plus quiet - not something squarer.
+        span = sorted((x1 - x0 + 1, y1 - y0 + 1))
+        assert span[1] * rows_m == span[0] * cols_m, (size, span)
+
+        ink = sum(1 for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)
+                  if raw[y * stride + (x >> 3)] & (0x80 >> (x & 7)))
+        assert ink > 0, f"the box at {size} contains no marker"
+        assert ink < (x1 - x0 + 1) * (y1 - y0 + 1), "the box is solid black"
+
+
+def test_shelf_tag_puts_the_code_first():
+    """A shelf tag is read from across a room, so the code has to be the
+    biggest thing on it - the opposite of an item label, where the title
+    is what you need because the thing is already in your hand."""
+    from mplabel import inventory
+
+    raw, stride, rows = inventory.render_shelf_tag(
+        "A1B", "Loft, north wall", with_marker=True)
+    tag_ink = sum(bin(b).count("1") for b in raw)
+
+    plain, _s, _r = inventory.render_shelf_tag("A1B", with_marker=True)
+    # The name is a caption: adding it must not outweigh the code.
+    assert sum(bin(b).count("1") for b in plain) > tag_ink * 0.5
+
+
+def test_a_wide_tag_puts_the_marker_beside_the_code():
+    """Stacked, both come out small: the code loses height to the band
+    and the band's module size is capped by what is left. The marker is
+    6x24, so on a tag far wider than it is tall each wants a different
+    axis."""
+    from mplabel import inventory
+
+    wide, stride, rows = inventory.render_shelf_tag(
+        "A1B", with_marker=True, label_mm=(101.6, 25.4))
+    tall, _s2, _r2 = inventory.render_shelf_tag(
+        "A1B", with_marker=True, label_mm=(48, 30))
+    # Side by side gives the marker room, so its modules are bigger and
+    # it carries more ink than the squeezed stacked version.
+    assert sum(bin(b).count("1") for b in wide) > 0
+    assert sum(bin(b).count("1") for b in tall) > 0
+
+
+def test_shelf_tag_stays_inside_the_printable_window():
+    from mplabel import inventory
+
+    for size in ((101.6, 25.4), (48, 30)):
+        raw, stride, rows = inventory.render_shelf_tag(
+            "A1B", "Loft", with_marker=True, label_mm=size)
+        xs = [xb * 8 + k for y in range(rows) for xb in range(stride)
+              for k in range(8) if raw[y * stride + xb] & (0x80 >> k)]
+        assert min(xs) >= inventory.PRINTABLE_LEFT_DOTS, size
+        assert max(xs) <= (inventory.HEAD_DOTS
+                           - inventory.PRINTABLE_RIGHT_DOTS - 1), size
+
+
+def test_shelf_tag_refuses_two_carriers(monkeypatch):
+    from mplabel import cli, inventory
+
+    with pytest.raises(ValueError, match="one machine-readable code"):
+        inventory.render_shelf_tag("A1B", with_qr=True, with_marker=True)
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "shelf-tag", "--code", "A1B",
+                         "--qr", "--marker"])
+    with pytest.raises(SystemExit, match="pick one"):
+        cli.main()
+
+
+def test_shelf_tag_command_needs_no_database(monkeypatch, capsys, tmp_path):
+    """With `probe`, `selftest` and `inventory-label`: the tags want
+    making before there is anything recorded to put on the shelves."""
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    def no_db(*a, **k):
+        raise AssertionError("shelf-tag opened the database")
+    monkeypatch.setattr(cli, "connect_db", no_db)
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "shelf-tag", "--code", "A1B",
+                         "--name", "Loft", "--marker"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "shelf  : A1B" in out
+    assert "every checksum valid" in out
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason

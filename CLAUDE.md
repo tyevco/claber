@@ -60,6 +60,7 @@ run against a real database.
 | `inventory-label --code X [--qr\|--marker] [--size WxH[in]] [--preview PNG]` | draw one inventory label and show what the label maker would burn. `--size 4x1in` for a shelf label. No DB |
 | `supvan-test-print --style ruler [--width W] [--height H]` | the calibration target: scales on both axes in dots, the last dot's number at each far end, an inset comb to measure a clipped edge, and a feed arrow. Moves paper |
 | `supvan-test-print --style edges` | the edge test: eight bars per side, 8 dots apart, each a different length so it names itself without a number beside it. Reads where each edge starts printing and nothing else. Moves paper |
+| `shelf-tag --code XXX [--name N] [--marker\|--qr] [--size WxH[in]] [--preview PNG] [--print]` | a tag for a shelf, bin or area. Code big, name under it, marker beside it. **Three** characters, where an item code is four. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -310,6 +311,26 @@ one. If `v_aging` shows blank prices, the percentages are lying.
 **The unit of a sale is the order, not the listing.** `already_seen` keys on message_id and order_id; `sales.listing_id` is a plain index, not UNIQUE. A buyer cancels, someone else buys the same item, and Facebook sends a second label email with the same listing_id - which the old unique index and the old listing_id check both silently rejected. `mplabel cancel` closes the dead order without counting it as revenue.
 
 **Check a label still matches its sale before printing it.** `label_belongs_to` re-reads the recipient off the PDF and compares it with the `ship_to` recorded from that same page when the sale was filed; `reprint` refuses on a mismatch, and `mplabel verify` sweeps the archive. This is the backstop for anything that leaves a row pointing at the wrong file - the failure is silent and the consequence is a parcel posted to a stranger.
+
+**Three characters means a place, four means a thing.** A location code
+is 3 and an inventory code is 4, and that is load bearing: the marker's
+payload already carries a format bit distinguishing 3-char codes from
+4-char ones, so a scanner knows whether it has a shelf or something to
+put on the shelf without a prefix character, a separate symbol, or
+anything new on the wire. `inventory.normalise_location_code` refuses a
+4-character location rather than drawing it, because such a tag would
+scan as an item and bin itself. `cli.CODE_LENGTH` is 3 as well, but a
+parcel code is stamped as plain text on a 4x6 shipping label and never
+goes into a marker, so the two never meet a scanner together.
+
+**A crop and the drawing that made it must come from one function.** The
+decoder is handed a box; a box computed from different arithmetic than
+the drawing is a marker that reads as noise however good the decoder is.
+`_marker_band`/`marker_box` are that pairing for item labels and
+`_tag_carrier_placement`/`shelf_marker_box` for shelf tags. Note
+`decode_job` returns only the rows the device is *given*, so its row 0 is
+the raster's row `margin_top` - indexing it in raster coordinates reads
+eight rows low and looks like a marker that does not match.
 
 **Two codes, two lifetimes - do not merge them.** The **parcel** code
 (`sales.code`, 3 chars) is about the boxes waiting to go out, so it is

@@ -569,6 +569,184 @@ def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
     return img.tobytes(), stride, rows
 
 
+def _blit(draw, grid, x, y, scale):
+    """Paint a module grid at `scale` dots per module."""
+    for r, row in enumerate(grid):
+        for c, cell in enumerate(row):
+            if cell:
+                draw.rectangle([x + c * scale, y + r * scale,
+                                x + (c + 1) * scale - 1,
+                                y + (r + 1) * scale - 1], fill=1)
+
+
+# A location code is three characters where an item code is four. That is
+# not a style choice: the marker payload already carries a format bit
+# telling 3-char codes from 4-char ones, so a scanner knows whether it is
+# looking at a shelf or at a thing on a shelf without anything new on the
+# wire and without a prefix character eating the address space.
+#
+# `cli.CODE_LENGTH` is 3 as well, but a parcel code is stamped as plain
+# text on a 4x6 shipping label and never goes into a marker, so the two
+# never meet a scanner together.
+LOCATION_CODE_LENGTH = 3
+
+# Shelf tags default to the long thin label - read from across a room,
+# and wider than the head, so it prints with its long axis down the feed.
+DEFAULT_SHELF_MM = (101.6, 25.4)
+
+
+def normalise_location_code(code):
+    """Upper-case and check a location code, or say why not.
+
+    Checked rather than trusted because the whole scheme rests on three
+    characters meaning "a place" and four meaning "a thing"; a four
+    character location code would scan as an item and bin itself."""
+    code = str(code).strip().upper()
+    if len(code) != LOCATION_CODE_LENGTH:
+        raise ValueError(
+            f"{code!r} is {len(code)} characters; a location code is "
+            f"{LOCATION_CODE_LENGTH}, which is what tells a shelf from an "
+            f"item when one is scanned")
+    bad = [ch for ch in code if ch not in marker_mod.ALPHABET]
+    if bad:
+        raise ValueError(
+            f"{''.join(bad)!r} is not in the code alphabet "
+            f"{marker_mod.ALPHABET!r} - I L O U are left out because they "
+            f"are misread as 1 1 0 V on thermal stock")
+    return code
+
+
+def _tag_is_wide(geom):
+    """Is this tag far wider than it is tall, in reading orientation?"""
+    return (geom["right"] - geom["left"]) >= 2 * (geom["bottom"] - geom["top"])
+
+
+def _tag_carrier_placement(geom, grid_rows, grid_cols):
+    """Where a shelf tag's machine-readable grid goes, and at what scale.
+
+    Its own function so that `render_shelf_tag` and `shelf_marker_box`
+    cannot drift: the decoder is handed a crop, and a crop computed from
+    different arithmetic than the drawing is a marker that reads as
+    noise. `_marker_band` and `marker_box` are the same pairing for item
+    labels.
+
+    A shelf tag is usually far wider than it is tall, and the marker is
+    6x24 modules - it wants width as well. Stacked, both come out small:
+    the code loses height to the band and the band's modules are capped
+    by what is left. Side by side, each takes the axis it needs.
+    """
+    left, right = geom["left"], geom["right"]
+    top, bottom = geom["top"], geom["bottom"]
+    if _tag_is_wide(geom):
+        budget = int((right - left) * 0.38)
+        scale = max(1, min(budget // grid_cols, (bottom - top) // grid_rows))
+        return (right - grid_cols * scale,
+                top + (bottom - top - grid_rows * scale) // 2, scale)
+    scale = max(1, min((right - left) // grid_cols,
+                       ((bottom - top) // 3) // grid_rows))
+    return (left + (right - left - grid_cols * scale) // 2,
+            bottom - grid_rows * scale, scale)
+
+
+def shelf_marker_box(label_mm=DEFAULT_SHELF_MM, feed_margin=None):
+    """The shelf marker's box on a tag, in final raster coordinates.
+
+    What a decoder should be handed. Derived from the same placement the
+    drawing uses, for the reason above."""
+    from .supvan import DEFAULT_MARGIN_DOTS
+
+    if feed_margin is None:
+        feed_margin = DEFAULT_MARGIN_DOTS
+    geom = _geometry(label_mm, feed_margin)
+    rows = marker_mod.ROWS + 2 * MARKER_QUIET
+    cols = marker_mod.COLS + 2 * MARKER_QUIET
+    x, y, scale = _tag_carrier_placement(geom, rows, cols)
+    return _to_raster((x, y, x + cols * scale - 1, y + rows * scale - 1),
+                      geom)
+
+
+
+def render_shelf_tag(code, name=None, with_qr=False, with_marker=False,
+                     label_mm=DEFAULT_SHELF_MM, ecl="M", feed_margin=None):
+    """Draw a shelf tag and return (raster, stride, rows).
+
+    A shelf tag names a *place*, and that drives the layout: it is read
+    from across a room while holding a box in both hands, so the code is
+    as large as the label will carry and the name under it is a caption.
+    An item label is the other way round - it is already in your hand,
+    and the title is the thing you need to read.
+    """
+    from PIL import Image, ImageDraw
+    from .supvan import DEFAULT_MARGIN_DOTS
+
+    code = normalise_location_code(code)
+    if with_qr and with_marker:
+        raise ValueError("a tag carries one machine-readable code, not two")
+    if feed_margin is None:
+        feed_margin = DEFAULT_MARGIN_DOTS
+
+    geom = _geometry(label_mm, feed_margin)
+    img = Image.new("1", (geom["w"], geom["h"]), 0)
+    draw = ImageDraw.Draw(img)
+    left, right = geom["left"], geom["right"]
+    top, bottom = geom["top"], geom["bottom"]
+
+    # A shelf tag is usually far wider than it is tall, and the marker
+    # is 6x24 modules - it wants width too. Stacking them makes both
+    # small: the code loses height to the band, and the band's module
+    # size is capped by what is left. Side by side, each takes the axis
+    # it actually needs, and the module size roughly trebles.
+    floor, text_right = bottom, right
+    if with_marker or with_qr:
+        if with_marker:
+            grid = marker_mod.render(code, quiet=MARKER_QUIET)
+        else:
+            grid = qr.render(code, ecl=ecl, quiet=2)
+        gx, gy, scale = _tag_carrier_placement(geom, len(grid), len(grid[0]))
+        _blit(draw, grid, gx, gy, scale)
+        if _tag_is_wide(geom):
+            text_right = gx - 14
+        else:
+            floor = gy - 8
+
+    head_room = floor - top
+    if head_room < 12:
+        raise ValueError(
+            f"a {label_mm[0]}x{label_mm[1]}mm tag leaves no room for the "
+            f"code once the machine-readable part is placed")
+
+    # Reserve the caption's share before sizing the code, or the code
+    # takes the whole gap and the name silently does not fit - which is
+    # what it did: `_wrap` returned the lines and every one of them fell
+    # past the floor, so the tag came out with no name and no complaint.
+    name_room = max(16, head_room // 3) if name else 0
+    span = text_right - left
+    code_font, _ = _fit(draw, code, _font, span,
+                        start=max(18, head_room - name_room), floor=14)
+    code_h = draw.textbbox((0, 0), code, font=code_font)[3]
+    code_w = _text_width(draw, code, code_font)
+    draw.text((left + (span - code_w) // 2, top), code,
+              font=code_font, fill=1)
+
+    if name:
+        name_font, _ = _fit(draw, name, _font, span,
+                            start=max(13, code_h // 3), floor=11)
+        y = top + code_h + 6
+        for line in _wrap(draw, name, name_font, span, 2):
+            line_h = draw.textbbox((0, 0), line, font=name_font)[3] + 2
+            if y + line_h > floor:
+                break
+            line_w = _text_width(draw, line, name_font)
+            draw.text((left + (span - line_w) // 2, y),
+                      line, font=name_font, fill=1)
+            y += line_h
+
+    if geom["rotate"]:
+        img = img.rotate(90, expand=True)
+    canvas = Image.new("1", (HEAD_DOTS, geom["rows"]), 0)
+    canvas.paste(img, (geom["x_off"], 0))
+    return canvas.tobytes(), HEAD_DOTS // 8, geom["rows"]
+
 # The edge test's staircase: 8 steps of 8 dots, so it reads a loss of up
 # to 56 dots on any side.
 EDGE_STEPS = 8
