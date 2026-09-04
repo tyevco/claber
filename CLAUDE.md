@@ -57,7 +57,7 @@ run against a real database.
 | `file <pdf> [-o] [--rotate] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
 | `probe` | printers, USB devices, IEEE-1284 id |
 | `selftest` | tiny text-only TSPL label |
-| `inventory-label --code X [--qr\|--marker] [--preview PNG]` | draw one 48mm inventory label and show what the label maker would burn. No DB |
+| `inventory-label --code X [--qr\|--marker] [--size WxH[in]] [--preview PNG]` | draw one inventory label and show what the label maker would burn. `--size 4x1in` for a shelf label. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -218,7 +218,7 @@ hardware or a real Facebook account.
 | The QR encoder | **Verified against two independent oracles, never printed.** `qr.py` is hand-written to keep the Pi dependency list short. Its codeword stream is identical to `segno`'s for every version, level and mode in range; all 350 symbols in the sweep decoded correctly through `zxing-cpp`; the Reed-Solomon matches the specification's worked example and the format bits match its published table. Neither library is a dependency - they were the oracle, and pinned matrix digests are what is left of them. **Never read off thermal paper**, where the module size and the burn darkness both matter. |
 | The shelf marker | **Round-trips in software, never printed or photographed.** 12x12 modules carrying 4 data bytes and 8 Reed-Solomon parity, so any 4 of the 12 can be wrong. Reads back clean, at all four rotations, under a 2.5px blur, scaled to 35%, with 2% salt-and-pepper noise, and out of the decoded print-buffer payload of a real label at 8 dots per module against the QR's 5. **Never read off thermal paper by a real camera**, which is the only test that counts - bleed closes modules up and a phone adds glare, motion and a lens. 5% salt-and-pepper still defeats it. |
 | The browser decoder | **Agrees with the Python reference; never run against a real camera.** `static/marker.js` matches `marker.py` byte for byte on clean and damaged codewords under node. What is untested is everything a phone does: exposure, focus, rolling shutter, and whether the aiming reticle is a usable way to hold a box. |
-| The inventory label | **Assembles and round-trips; never printed.** `inventory-label --preview` renders it, builds the real print buffers, decodes them back with every checksum checked, and the QR still scans out of that payload at all four correction levels. What is untested is everything physical: whether 5 dots per QR module survives thermal bleed, and whether the text is legible at 48mm. |
+| The inventory label | **Assembles and round-trips; never printed.** `inventory-label --preview` renders it, builds the real print buffers, decodes them back with every checksum checked, and both the QR and the marker still read out of that payload. Two sizes covered: 48x30mm, and 4x1in - which prints sideways, ten buffers, and is the first label to exercise the tiling properly. What is untested is everything physical: whether 5 dots per QR module survives thermal bleed, whether the text is legible, and **whether the media is 48mm at all** - a 4x1in label assumes stock this printer may not take. |
 | TSPL gap value 0.12in | **ASSUMED.** Typical for 4x6 die-cut; not measured on their stock. |
 | Facebook subject patterns | **Partly verified** against a real mailbox survey. Seen and handled: `Shipping label for your Marketplace order`, `New Marketplace order for <item>` (the sale itself, arriving before the label), and messages as `<emoji> <name> sent you a message`. The rest of `EVENT_PATTERNS` (listed / renewed / expired / payout / rating) is still **ASSUMED** - none has been seen. |
 | The mailbox mixes buying and selling | **Verified.** `You placed an order: <item>`, `Offer submitted: <item>` and `Confirm if you received your order: <item>` are *her purchases*. They carry the **seller's** listing id, so they are classified `purchase`, kept out of the listings table by `BUYER_KINDS`, and their listing id is dropped at record time. Counting them would invent listings that were never for sale and drag sell-through down. |
@@ -472,6 +472,34 @@ format renumbering above landed in Python and not in JavaScript.
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
 running the copy it has.
+
+**The printhead does not turn, so the label size chooses its own
+orientation.** The bar is 384 dots - 48mm - and that is the *only* axis
+a label can be wide on. A 4x1in shelf label therefore prints with its
+1in across the head and its 4in down the feed, which means the drawing
+is laid out in reading orientation and rotated a quarter turn at the
+end. `inventory.reads_sideways()` says whether that happened; a size
+that fits neither way round is refused rather than silently cropped to
+its own middle.
+
+**After that rotation the feed axis is the reading orientation's
+*width*.** So the feed margin - whose columns the firmware never sends -
+has to be inset on left and right rather than top and bottom. Inset the
+wrong pair and the ink lands in the dead band: dropped, not printed
+small, and nothing reports it. `_geometry` owns which pair, and a test
+pins that both ends of the raster stay empty at both sizes.
+
+**The raster is head-width; the label usually is not.** Every printhead
+line is 384 dots because the bar is, but a 1in label covers 203 of them
+and the rest is bar hanging off the media. `media_box()` is that band,
+and the preview crops to it - a preview of the whole raster shows broad
+empty margins that read as a badly laid out label and are nothing of the
+sort. The media is *centred* under the bar, which is why the band is
+centred rather than flush left.
+
+**A 4x1in label is the first one that really exercises buffer tiling.**
+813 printhead lines at 84 lines a buffer is ten of them; the 48x30mm
+label fits in three and never tests the tiling past the first split.
 
 **The label preview is decoded from the payload, not from the drawing.**
 `inventory-label --preview` assembles the real job, then takes it apart

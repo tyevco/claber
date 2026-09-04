@@ -3804,7 +3804,7 @@ def test_inventory_label_is_head_width_and_the_asked_for_length():
     assert stride * 8 == inventory.HEAD_DOTS == 384
     assert rows == inventory.DEFAULT_HEIGHT_MM * inventory.DOTS_PER_MM
     assert len(raster) == stride * rows
-    _r, _s, tall = inventory.render_label("7K2Q", height_mm=50)
+    _r, _s, tall = inventory.render_label("7K2Q", label_mm=(48, 50))
     assert tall == 50 * inventory.DOTS_PER_MM
 
 
@@ -4106,7 +4106,8 @@ def test_marker_reads_off_the_wire_payload_of_a_real_label():
 
     margin = supvan.DEFAULT_MARGIN_DOTS
     x0, y0, x1, y1 = inventory.marker_box()
-    crop = img.crop((x0 * 3, (y0 - margin) * 3, x1 * 3, (y1 - margin) * 3))
+    crop = img.crop((x0 * 3, (y0 - margin) * 3,
+                     (x1 + 1) * 3, (y1 - margin + 1) * 3))
     assert marker.read_image(crop) == code
 
 
@@ -4115,14 +4116,12 @@ def test_marker_gets_bigger_modules_than_the_qr_for_the_same_square():
     bits and the code needs 20, and that unwanted capacity is paid for
     in module size - which is the only thing that matters on thermal
     paper."""
+    geom = inventory._geometry(inventory.DEFAULT_LABEL_MM,
+                               supvan.DEFAULT_MARGIN_DOTS)
     _x, _y, _block, marker_scale = inventory._symbol_placement(
-        inventory.DEFAULT_HEIGHT_MM * inventory.DOTS_PER_MM,
-        supvan.DEFAULT_MARGIN_DOTS,
-        marker.SIZE + 2 * inventory.MARKER_QUIET)
+        geom, marker.SIZE + 2 * inventory.MARKER_QUIET)
     _x, _y, _block, qr_scale = inventory._symbol_placement(
-        inventory.DEFAULT_HEIGHT_MM * inventory.DOTS_PER_MM,
-        supvan.DEFAULT_MARGIN_DOTS,
-        len(qr.render("7K2Q", ecl="M", quiet=2)))
+        geom, len(qr.render("7K2Q", ecl="M", quiet=2)))
     assert marker_scale > qr_scale, (marker_scale, qr_scale)
 
 
@@ -4201,3 +4200,142 @@ def test_marker_js_is_listed_for_cache_busting():
     from mplabel import web
     assert "marker.js" in inspect.getsource(web.asset_stamp)
     assert (Path(web.__file__).parent / "static" / "marker.js").exists()
+
+
+# ------------------------------------------- a label wider than the print head
+
+SHELF_4X1 = (101.6, 25.4)      # 4 x 1in, the common shelf size
+
+
+def test_a_label_wider_than_the_head_is_printed_down_the_feed():
+    """The head is 384 dots and does not turn, so 4in cannot go across
+    it. Only one orientation is physically available and the code has to
+    pick it rather than ask: the 1in runs across the head, the 4in runs
+    down the feed, and the drawing is rotated a quarter turn at the end.
+
+    That is why `reads_sideways` exists - a caller cropping or previewing
+    has to know which way round the raster ended up."""
+    assert inventory.reads_sideways(SHELF_4X1)
+    assert not inventory.reads_sideways(inventory.DEFAULT_LABEL_MM)
+
+    raster, stride, rows = inventory.render_label("7K2Q", label_mm=SHELF_4X1)
+    assert stride * 8 == inventory.HEAD_DOTS, "every line is still head width"
+    assert rows == round(101.6 * inventory.DOTS_PER_MM), "4in down the feed"
+    assert len(raster) == stride * rows
+
+
+def test_a_label_too_big_for_the_head_either_way_is_refused():
+    """5in x 3in has no orientation that fits 48mm. Better a clear error
+    than a label silently cropped to the middle of itself."""
+    with pytest.raises(ValueError, match="across the head"):
+        inventory.render_label("7K2Q", label_mm=(127, 76.2))
+
+
+def test_the_media_band_is_narrower_than_the_raster():
+    """A 1in label covers 203 of the head's 384 dots and the rest is bar
+    hanging off the edge. Previewing the whole raster shows those as
+    broad empty margins, which reads as a badly laid out label and is
+    nothing of the sort - `media_box` is what the preview crops to."""
+    x0, _y0, x1, _y1 = inventory.media_box(label_mm=SHELF_4X1)
+    across = x1 - x0 + 1
+    assert across == round(25.4 * inventory.DOTS_PER_MM)
+    assert across < inventory.HEAD_DOTS
+    # Centred, because the media runs centred under the bar.
+    assert x0 == (inventory.HEAD_DOTS - across) // 2
+
+
+def test_the_feed_margin_moves_with_the_rotation():
+    """The subtle one. After the quarter turn the feed axis is the
+    reading orientation's *width*, so the margin has to be inset on left
+    and right rather than top and bottom. Inset the wrong pair and the
+    ink lands in the band the firmware never sends - dropped, not printed
+    small, and nothing reports it."""
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    raster, stride, rows = inventory.render_label(
+        "7K2Q", "Antique Cut Glass Vase", 45.0,
+        label_mm=SHELF_4X1, with_marker=True)
+    head = raster[:margin * stride]
+    tail = raster[(rows - margin) * stride:]
+    assert sum(bin(b).count("1") for b in head) == 0
+    assert sum(bin(b).count("1") for b in tail) == 0
+
+
+def test_the_marker_reads_back_off_a_4x1_label():
+    """End to end at the new size, through the printer's own format. The
+    crop comes from `marker_box`, which has to carry the rotation with
+    it - a box computed in reading coordinates and used against the
+    raster samples the grid at the wrong pitch."""
+    code = "MN4P"
+    raster, stride, rows = inventory.render_label(
+        code, "Antique 1900-1915 American Edwardian Cut Glass Vase", 45.0,
+        label_mm=SHELF_4X1, with_marker=True)
+    job = supvan.build_job(raster, stride, rows)
+    back, back_stride, cols = supvan.decode_job(job["compressed"])
+    img = inventory.to_image(back, back_stride, cols, scale=2)
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    x0, y0, x1, y1 = inventory.marker_box(label_mm=SHELF_4X1)
+    crop = img.crop((x0 * 2, (y0 - margin) * 2,
+                     (x1 + 1) * 2, (y1 - margin + 1) * 2))
+    assert marker.read_image(crop) == code
+
+
+def test_a_4x1_label_needs_more_than_one_print_buffer():
+    """4in is 813 printhead lines and a buffer carries 84, so this is the
+    first real label that exercises the multi-buffer path at all - the
+    48x30 one fits in three and never tests the tiling past that."""
+    raster, stride, rows = inventory.render_label(
+        "7K2Q", "Cut Glass Vase", 45.0, label_mm=SHELF_4X1)
+    job = supvan.build_job(raster, stride, rows)
+    assert job["buffers"] == 10
+    assert job["raw_len"] == job["buffers"] * supvan.PRINT_BUF_SIZE
+    back, _s, cols = supvan.decode_job(job["compressed"])
+    assert cols == rows - 2 * supvan.DEFAULT_MARGIN_DOTS
+
+
+@pytest.mark.parametrize("text,expect", [
+    ("48x30", (48.0, 30.0)),
+    ("4x1in", (101.6, 25.4)),
+    ("101.6x25.4", (101.6, 25.4)),
+])
+def test_size_is_parsed_in_mm_or_inches(text, expect):
+    """Stock is sold in inches - 4x1in is a shelf label - and converting
+    by hand is how a 4in label becomes a 4mm one."""
+    from mplabel import cli
+    got = cli._parse_size(text)
+    assert got == pytest.approx(expect)
+
+
+@pytest.mark.parametrize("bad", ["4", "4x", "axb", "0x1", "-4x1in"])
+def test_a_size_that_is_not_a_label_is_refused(bad):
+    from mplabel import cli
+    with pytest.raises(ValueError):
+        cli._parse_size(bad)
+
+
+def test_the_4x1_preview_is_cropped_to_the_media_and_turned(
+        tmp_path, monkeypatch, capsys):
+    """Through the real CLI: the preview must come out the shape of the
+    label, not the shape of the printhead."""
+    from PIL import Image
+    from mplabel import cli
+    out = tmp_path / "label.png"
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "inventory-label", "--code", "7K2Q",
+                         "--title", "Cut Glass Vase", "--price", "45",
+                         "--marker", "--size", "4x1in", "--scale", "1",
+                         "--preview", str(out)])
+    cli.main()
+    text = capsys.readouterr().out
+    assert "printed sideways" in text
+    assert "203 across is media" in text
+
+    img = Image.open(out)
+    assert img.width > img.height, "the preview should read 4 wide by 1 tall"
+    assert img.height == round(25.4 * inventory.DOTS_PER_MM)
+    # Not the full 813 lines of a 4in label: the preview is decoded from
+    # the payload, and the feed margin at each end is declared in the
+    # buffer header and never sent. What you see is what burns.
+    assert img.width == (round(101.6 * inventory.DOTS_PER_MM)
+                         - 2 * supvan.DEFAULT_MARGIN_DOTS)

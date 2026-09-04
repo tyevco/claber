@@ -800,6 +800,25 @@ def cmd_supvan_probe(cfg, args):
         print(f"{' ' * len(head)} {note}")
 
 
+def _parse_size(text):
+    """`WxH` in millimetres, or with an `in` suffix, in inches.
+
+    Returned as millimetres in reading orientation. Inches are allowed
+    because label stock is sold in them - 4x1in is a shelf label - and
+    converting by hand is how a 4in label becomes a 4mm one."""
+    raw = text.strip().lower()
+    scale = 1.0
+    if raw.endswith("in"):
+        raw, scale = raw[:-2], 25.4
+    try:
+        w, h = (float(v) * scale for v in raw.split("x"))
+    except ValueError:
+        raise ValueError(f"--size wants WxH, not {text!r}")
+    if w <= 0 or h <= 0:
+        raise ValueError(f"--size {text!r} is not a label")
+    return w, h
+
+
 def cmd_inventory_label(cfg, args):
     """Draw one inventory label, and show what the printer would burn.
 
@@ -824,9 +843,16 @@ def cmd_inventory_label(cfg, args):
     if args.qr and args.marker:
         raise SystemExit("--qr and --marker both want the same square; "
                          "pick one")
-    raster, stride, rows = inventory_mod.render_label(
-        args.code, title=args.title, price=price, with_qr=args.qr,
-        with_marker=args.marker, height_mm=args.height, ecl=args.ecl)
+    try:
+        label_mm = _parse_size(args.size)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    try:
+        raster, stride, rows = inventory_mod.render_label(
+            args.code, title=args.title, price=price, with_qr=args.qr,
+            with_marker=args.marker, label_mm=label_mm, ecl=args.ecl)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     job = supvan_mod.build_job(raster, stride, rows,
                                density=args.density)
 
@@ -834,7 +860,13 @@ def cmd_inventory_label(cfg, args):
                "  (+ shelf marker carrying the same code)" if args.marker
                else "")
     print(f"code   : {args.code}{carrier}")
-    print(f"label  : 48 x {args.height}mm, {stride * 8} x {rows} dots")
+    sideways = inventory_mod.reads_sideways(label_mm)
+    print(f"label  : {label_mm[0]:g} x {label_mm[1]:g}mm"
+          + (" - printed sideways, long axis down the feed"
+             if sideways else ""))
+    print(f"raster : {stride * 8} x {rows} dots"
+          + (f", of which {inventory_mod.media_box(label_mm)[2] - inventory_mod.media_box(label_mm)[0] + 1}"
+             f" across is media" if sideways else ""))
     ink = sum(bin(b).count("1") for b in raster)
     print(f"         {100 * ink / (len(raster) * 8):.2f}% ink")
     print(f"job    : {job['buffers']} x {supvan_mod.PRINT_BUF_SIZE} = "
@@ -851,9 +883,21 @@ def cmd_inventory_label(cfg, args):
           f"every checksum valid")
 
     if args.preview:
-        inventory_mod.to_image(back, back_stride, cols,
-                               scale=args.scale).save(args.preview)
-        print(f"\nwrote {args.preview} - this is the payload, decoded back")
+        img = inventory_mod.to_image(back, back_stride, cols,
+                                     scale=args.scale)
+        # Crop to the media and turn it the way you hold it. The raster
+        # is 384 dots because the *bar* is; a 1in label covers 203 of
+        # them and the rest is head hanging off the edge, which in a
+        # preview reads as a badly laid out label and is nothing of the
+        # sort.
+        mx0, _my0, mx1, _my1 = inventory_mod.media_box(label_mm)
+        img = img.crop((mx0 * args.scale, 0,
+                        (mx1 + 1) * args.scale, img.height))
+        if sideways:
+            img = img.rotate(-90, expand=True)
+        img.save(args.preview)
+        print(f"\nwrote {args.preview} - the payload, decoded back"
+              + (", turned the way you hold it" if sideways else ""))
 
     if not args.print:
         print("\nnothing sent, no paper moved. Add --print to try it.")
@@ -1522,10 +1566,12 @@ def _main():
     p.add_argument("--ecl", choices=["L", "M", "Q", "H"], default="M",
                    help="QR error correction (default %(default)s). A "
                         "code this short fits version 1 even at H")
-    p.add_argument("--height", type=int,
-                   default=inventory_mod.DEFAULT_HEIGHT_MM,
-                   help="label length in mm (default %(default)s); the "
-                        "48mm width is the print head's")
+    p.add_argument("--size", default="48x30", metavar="WxH",
+                   help="label size the way you hold it, in mm (default "
+                        "%(default)s). Suffix `in` for inches, so a 4x1in "
+                        "shelf label is --size 4x1in. Anything wider than "
+                        "the 48mm head is printed with its long axis down "
+                        "the feed - the head does not turn")
     p.add_argument("--density", type=int,
                    default=supvan_mod.DEFAULT_DENSITY,
                    help="burn energy 0-15 (default %(default)s)")
