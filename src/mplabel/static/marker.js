@@ -20,15 +20,18 @@ var MK = (function () {
   'use strict';
 
   var ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
-  var SIZE = 12, DATA_BYTES = 4, ECC_BYTES = 8, PAYLOAD_BITS = 20;
+  /* One by four: 6 x 24 modules, interior 4 x 22 = 88, codeword 88 bits.
+     Keep in step with marker.py. */
+  var ROWS = 6, COLS = 24, DATA_BYTES = 4, ECC_BYTES = 7, PAYLOAD_BITS = 20;
+  var BORDER = 2 * ROWS + 2 * COLS - 4;
   /* Formats are numbered from 1 so the all-zero codeword has no valid
      format: all-zero satisfies Reed-Solomon and its CRC is zero too, so
      a camera pointed at a blank wall used to decode confidently to the
      real code "000". Keep in step with marker.py. */
   var FORMAT_3CHAR = 1, FORMAT_4CHAR = 2;
-  /* How much of the 44-module border must match before a grid is worth
-     decoding. Blank and noise both score about 22. */
-  var MIN_FINDER_SCORE = 36;
+  /* How much of the border must match before a grid is worth decoding.
+     82% of it, the same fraction the square version used. */
+  var MIN_FINDER_SCORE = Math.floor(BORDER * 0.82);
 
   /* ------------------------------------------------------- GF(256) */
 
@@ -251,14 +254,14 @@ var MK = (function () {
     return [cols[0], rows[0], cols[cols.length - 1], rows[rows.length - 1]];
   }
 
-  function sample(bits, w, h, box) {
+  function sample(bits, w, h, box, rows, cols) {
     var x0 = box[0], y0 = box[1], x1 = box[2], y1 = box[3];
-    var mw = (x1 - x0 + 1) / SIZE, mh = (y1 - y0 + 1) / SIZE;
+    var mw = (x1 - x0 + 1) / cols, mh = (y1 - y0 + 1) / rows;
     if (mw < 1 || mh < 1) throw new Error('marker too small');
     var grid = [];
-    for (var r = 0; r < SIZE; r++) {
+    for (var r = 0; r < rows; r++) {
       var row = [];
-      for (var c = 0; c < SIZE; c++) {
+      for (var c = 0; c < cols; c++) {
         var cx0 = Math.floor(x0 + c * mw + mw * 0.25);
         var cx1 = Math.max(Math.floor(x0 + c * mw + mw * 0.75), cx0 + 1);
         var cy0 = Math.floor(y0 + r * mh + mh * 0.25);
@@ -280,18 +283,19 @@ var MK = (function () {
 
   function finderWant() {
     var g = [], r, c;
-    for (r = 0; r < SIZE; r++) g.push(new Array(SIZE).fill(0));
-    for (var i = 0; i < SIZE; i++) { g[i][0] = 1; g[SIZE - 1][i] = 1; }
-    for (c = 0; c < SIZE; c++) g[0][c] = c % 2 === 0 ? 1 : 0;
-    for (r = 0; r < SIZE; r++) g[r][SIZE - 1] = r % 2 ? 1 : 0;
+    for (r = 0; r < ROWS; r++) g.push(new Array(COLS).fill(0));
+    for (r = 0; r < ROWS; r++) g[r][0] = 1;
+    for (c = 0; c < COLS; c++) g[ROWS - 1][c] = 1;
+    for (c = 0; c < COLS; c++) g[0][c] = c % 2 === 0 ? 1 : 0;
+    for (r = 0; r < ROWS; r++) g[r][COLS - 1] = r % 2 ? 1 : 0;
     return g;
   }
 
   function finderScore(grid) {
     var want = finderWant(), score = 0;
-    for (var r = 0; r < SIZE; r++) {
-      for (var c = 0; c < SIZE; c++) {
-        if (r === 0 || r === SIZE - 1 || c === 0 || c === SIZE - 1) {
+    for (var r = 0; r < ROWS; r++) {
+      for (var c = 0; c < COLS; c++) {
+        if (r === 0 || r === ROWS - 1 || c === 0 || c === COLS - 1) {
           if (grid[r][c] === want[r][c]) score++;
         }
       }
@@ -299,30 +303,42 @@ var MK = (function () {
     return score;
   }
 
-  function rotate(grid) {
-    var out = [];
-    for (var r = 0; r < SIZE; r++) {
+  function rot180(grid) {
+    return grid.slice().reverse().map(function (row) {
+      return row.slice().reverse();
+    });
+  }
+
+  /* One quarter turn clockwise: an h x w grid becomes w x h. */
+  function rot90(grid) {
+    var h = grid.length, w = grid[0].length, out = [], r, c;
+    for (c = 0; c < w; c++) {
       var row = [];
-      for (var c = 0; c < SIZE; c++) row.push(grid[SIZE - 1 - c][r]);
+      for (r = h - 1; r >= 0; r--) row.push(grid[r][c]);
       out.push(row);
     }
     return out;
   }
 
+  function rot270(grid) { return rot180(rot90(grid)); }
+
   function cells() {
     var out = [];
-    for (var r = 1; r < SIZE - 1; r++) {
-      for (var c = 1; c < SIZE - 1; c++) out.push([r, c]);
+    for (var r = 1; r < ROWS - 1; r++) {
+      for (var c = 1; c < COLS - 1; c++) out.push([r, c]);
     }
     return out;
   }
 
+  /* A rectangle can only be read at 0 or 180 - at 90 it would not be
+     this shape - so the quarter turns are settled by the caller from
+     the box's own aspect, and only the two ways up are tried here. */
   function readGrid(grid) {
-    var cands = [], i;
-    for (i = 0; i < 4; i++) {
-      cands.push({ score: finderScore(grid), turn: i, grid: grid });
-      grid = rotate(grid);
-    }
+    var cands = [
+      { score: finderScore(grid), turn: 0, grid: grid },
+      { score: 0, turn: 1, grid: rot180(grid) }
+    ], i;
+    cands[1].score = finderScore(cands[1].grid);
     cands.sort(function (a, b) { return (b.score - a.score) || (a.turn - b.turn); });
     if (cands[0].score < MIN_FINDER_SCORE) return null;
 
@@ -346,7 +362,7 @@ var MK = (function () {
      that hold nothing. Only exceptions are exceptional. */
   function readImageData(img, rx, ry, rw, rh) {
     rx = rx | 0; ry = ry | 0; rw = rw | 0; rh = rh | 0;
-    if (rw < SIZE || rh < SIZE) return null;
+    if (rw < ROWS || rh < ROWS) return null;
     var gray = new Uint8Array(rw * rh), d = img.data;
     for (var y = 0; y < rh; y++) {
       for (var x = 0; x < rw; x++) {
@@ -358,14 +374,22 @@ var MK = (function () {
     }
     try {
       var bits = despeckle(binarize(gray, rw, rh), rw, rh);
-      return readGrid(sample(bits, rw, rh, inkBounds(bits, rw, rh)));
+      var box = inkBounds(bits, rw, rh);
+      /* The box's own shape settles the quarter turns: a strip seen
+         upright is four times wider than tall, one on its side is the
+         opposite. */
+      if ((box[2] - box[0]) >= (box[3] - box[1])) {
+        return readGrid(sample(bits, rw, rh, box, ROWS, COLS));
+      }
+      var sideways = sample(bits, rw, rh, box, COLS, ROWS);
+      return readGrid(rot90(sideways)) || readGrid(rot270(sideways));
     } catch (e) {
       return null;
     }
   }
 
   return {
-    ALPHABET: ALPHABET, SIZE: SIZE,
+    ALPHABET: ALPHABET, ROWS: ROWS, COLS: COLS, BORDER: BORDER,
     crc8: crc8, rsDecode: rsDecode, decodePayload: decodePayload,
     binarize: binarize, despeckle: despeckle, inkBounds: inkBounds,
     sample: sample, readGrid: readGrid, readImageData: readImageData

@@ -1,29 +1,42 @@
-"""A square code for the four-character codes this system already uses.
+"""A strip code for the three- and four-character codes this system uses.
 
 Why not a QR, which `qr.py` already draws: a QR version 1 holds 152 bits
 and we have 20. Paying for 132 bits we do not want costs module size,
-and module size is the whole game on thermal paper - the QR on a 48mm
-label lands at 5 dots per module, where this lands at 8 or more for the
-same square. Bigger modules survive bleed, a smeared roll, a bad angle
-and a phone that will not focus.
+and module size is the whole game on thermal paper. Bigger modules
+survive bleed, a smeared roll, a bad angle and a phone that will not
+focus.
 
 What it costs: nothing off the shelf reads it. A QR is scanned by the
 camera app; this is scanned by our own. That is the trade, and it is
-only worth it because the phone app already exists and is the thing
-she has open when she is standing at the shelf.
+only worth it because the phone app already exists and is the thing she
+has open when she is standing at the shelf.
 
-    ############        left column and bottom row solid: the L, which
-    #..........#        gives position, rotation and the module pitch
-    #.        .#        in one feature
-    #.  data  .#
-    #.        .#        top row and right column alternate: the clock
-    # # # # # #         track, which says how many modules across and
-                        catches a scale that has drifted
+Six modules tall by twenty-four wide - one by four - so it sits under
+the text as a band rather than stealing a square out of the middle of a
+label that is mostly text:
 
-12x12 modules. The interior 10x10 carries 96 bits: 4 data bytes and 8
-Reed-Solomon parity bytes, so any 4 of the 12 can be wrong and the code
-still reads. The 4 data bytes are a 4-bit format, a 20-bit payload and
-an 8-bit checksum.
+    # # # # # # # # # # # #     top row and right column alternate: the
+    #......................#    clock track, which says how many
+    #.       data         .#    modules across and catches a scale that
+    #.                    .#    has drifted
+    #......................#
+    ########################    left column and bottom row solid: the
+                                L, which gives position, rotation and
+                                the module pitch in one feature
+
+The interior is 4 x 22 = 88 modules and the codeword is exactly 88 bits:
+4 data bytes and 7 Reed-Solomon parity bytes, so any 3 of the 11 can be
+wrong and the code still reads. The 4 data bytes are a 4-bit format, a
+20-bit payload and an 8-bit checksum. Nothing is spare, which is the
+point of choosing this shape over a taller one - every module left over
+would have been a smaller module.
+
+Bits are written in raster order, and on a strip that choice matters
+more than it did on a square. Along the rows, a byte is eight
+neighbouring modules and a scratch down the length of the strip damages
+three of eleven bytes - just inside what the parity carries. Down the
+columns it would be one bit from each of eleven bytes, which is the same
+damage spread so thin that nothing is recoverable.
 
 The checksum is the part that matters most. Reed-Solomon corrects; it
 does not certify. A code that decodes to the *wrong* four characters
@@ -40,11 +53,16 @@ from . import rs
 # this module can be read, and tested, on its own.
 ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
-SIZE = 12                    # modules per side, border included
-INTERIOR = SIZE - 2          # 10
+# One by four. The interior is (ROWS-2) x (COLS-2) = 88 modules and the
+# codeword is 88 bits, so the fit is exact in both directions.
+ROWS = 6
+COLS = 24
 DATA_BYTES = 4
-ECC_BYTES = 8
+ECC_BYTES = 7
 PAYLOAD_BITS = 20            # four characters at five bits each
+
+# Border modules, which is what a finder score is out of.
+BORDER = 2 * ROWS + 2 * COLS - 4
 
 # Numbered from 1 so that format 0 is invalid, which makes the all-zero
 # codeword unreadable. That matters more than it looks: all-zero is a
@@ -54,12 +72,13 @@ PAYLOAD_BITS = 20            # four characters at five bits each
 FORMAT_3CHAR = 1
 FORMAT_4CHAR = 2
 
-# How much of the 44-module border has to be right before a grid is
-# worth decoding at all. A blank region scores 22 (it matches every
-# light module and no dark one) and random noise scores about the same,
-# so this is the difference between "no marker here" and a confident
-# answer drawn from the wallpaper.
-MIN_FINDER_SCORE = 36
+# How much of the border has to be right before a grid is worth decoding
+# at all. A blank region matches every light module and no dark one, so
+# it scores the light count and nothing more; noise scores about the
+# same. This is the difference between "no marker here" and a confident
+# answer drawn from the wallpaper. 82% of the border, the same fraction
+# the square version used.
+MIN_FINDER_SCORE = int(BORDER * 0.82)
 
 
 class MarkerError(ValueError):
@@ -140,7 +159,7 @@ def decode_payload(codeword):
 # ------------------------------------------------------------- drawing
 
 def _blank():
-    return [[0] * SIZE for _ in range(SIZE)]
+    return [[0] * COLS for _ in range(ROWS)]
 
 
 def _finder(grid):
@@ -150,13 +169,14 @@ def _finder(grid):
     out of phase with each other by construction - the top starts dark
     at column 0 and the right ends dark at the bottom row - so an image
     that has been mirrored does not read as a valid finder."""
-    for i in range(SIZE):
-        grid[i][0] = 1                       # left column, solid
-        grid[SIZE - 1][i] = 1                # bottom row, solid
-    for c in range(SIZE):
+    for r in range(ROWS):
+        grid[r][0] = 1                       # left column, solid
+    for c in range(COLS):
+        grid[ROWS - 1][c] = 1                # bottom row, solid
+    for c in range(COLS):
         grid[0][c] = 1 if c % 2 == 0 else 0  # top clock
-    for r in range(SIZE):
-        grid[r][SIZE - 1] = 1 if r % 2 else 0  # right clock
+    for r in range(ROWS):
+        grid[r][COLS - 1] = 1 if r % 2 else 0  # right clock
 
 
 def _cells():
@@ -167,11 +187,11 @@ def _cells():
     bytes - which is what Reed-Solomon over bytes is good at - rather
     than one bit from each of eight, which is the same damage spread so
     thin that it exhausts the parity."""
-    return [(r, c) for r in range(1, SIZE - 1) for c in range(1, SIZE - 1)]
+    return [(r, c) for r in range(1, ROWS - 1) for c in range(1, COLS - 1)]
 
 
 def encode(code):
-    """The finished 12x12 grid, as rows of 0/1."""
+    """The finished ROWS x COLS grid, as rows of 0/1."""
     grid = _blank()
     _finder(grid)
     codeword = encode_payload(code)
@@ -190,8 +210,7 @@ def render(code, scale=1, quiet=2):
     the darkest edges in the crop, and ink butted against the L reads as
     part of it."""
     grid = encode(code)
-    side = SIZE + 2 * quiet
-    out = [[0] * side for _ in range(side)]
+    out = [[0] * (COLS + 2 * quiet) for _ in range(ROWS + 2 * quiet)]
     for r, row in enumerate(grid):
         for c, cell in enumerate(row):
             out[r + quiet][c + quiet] = cell
@@ -297,23 +316,23 @@ def _ink_bounds(bits):
     return min(cols), min(rows), max(cols), max(rows)
 
 
-def _sample(bits, box, size=SIZE):
-    """Read a size x size grid out of the boxed region.
+def _sample(bits, box, rows, cols):
+    """Read a rows x cols grid out of the boxed region.
 
     Each module is decided by a vote over the middle of its cell rather
     than by its centre pixel: one pixel is a coin toss wherever the
     threshold landed near the ink, and the middle half is still well
     inside the module even if the box is a little off."""
     x0, y0, x1, y1 = box
-    w = (x1 - x0 + 1) / size
-    h = (y1 - y0 + 1) / size
+    w = (x1 - x0 + 1) / cols
+    h = (y1 - y0 + 1) / rows
     if w < 1 or h < 1:
         raise MarkerError("the marker is too small in this image to read")
 
     grid = []
-    for r in range(size):
+    for r in range(rows):
         row = []
-        for c in range(size):
+        for c in range(cols):
             cx0 = x0 + c * w + w * 0.25
             cx1 = x0 + c * w + w * 0.75
             cy0 = y0 + r * h + h * 0.25
@@ -333,39 +352,47 @@ def _sample(bits, box, size=SIZE):
 
 
 def _finder_score(grid):
-    """How many finder modules are where they should be, out of 44."""
+    """How many finder modules are where they should be, out of BORDER."""
     want = _blank()
     _finder(want)
     score = 0
-    for r in range(SIZE):
-        for c in range(SIZE):
-            if r in (0, SIZE - 1) or c in (0, SIZE - 1):
+    for r in range(ROWS):
+        for c in range(COLS):
+            if r in (0, ROWS - 1) or c in (0, COLS - 1):
                 score += grid[r][c] == want[r][c]
     return score
 
 
-def _rotate(grid):
-    """One quarter turn clockwise."""
+def _rot180(grid):
+    return [list(reversed(row)) for row in reversed(grid)]
+
+
+def _rot90(grid):
+    """One quarter turn clockwise. An h x w grid becomes w x h."""
     return [list(row) for row in zip(*grid[::-1])]
 
 
-def read_grid(grid):
-    """The code a sampled grid names, trying all four orientations.
+def _rot270(grid):
+    return _rot180(_rot90(grid))
 
-    The label can be photographed any way up - it is a box on a shelf -
-    so the orientation is worked out from the finder rather than
-    assumed. Orientations are tried best-finder-first so a marginal
-    image spends its one good reading on the likeliest one."""
+
+def read_grid(grid):
+    """The code a ROWS x COLS grid names, trying both ways up.
+
+    A rectangle can only be read at 0 or 180 degrees - at 90 it would
+    not be this shape - so the quarter turns are handled by `read_image`,
+    which samples transposed when the ink is taller than it is wide.
+    That is a real simplification over the square: the aspect ratio
+    itself rules out half the orientations before any decoding starts."""
     candidates = []
-    for turn in range(4):
-        candidates.append((_finder_score(grid), turn, grid))
-        grid = _rotate(grid)
+    for turn, candidate in ((0, grid), (1, _rot180(grid))):
+        candidates.append((_finder_score(candidate), turn, candidate))
     candidates.sort(key=lambda t: (-t[0], t[1]))
 
     if candidates[0][0] < MIN_FINDER_SCORE:
         raise MarkerError(
             f"no marker here: the best orientation matches only "
-            f"{candidates[0][0]}/44 of the border")
+            f"{candidates[0][0]}/{BORDER} of the border")
 
     errors = []
     for score, _turn, candidate in candidates:
@@ -381,7 +408,7 @@ def read_grid(grid):
         try:
             return decode_payload(codeword)
         except MarkerError as exc:
-            errors.append(f"finder {score}/44: {exc}")
+            errors.append(f"finder {score}/{BORDER}: {exc}")
     raise MarkerError("; ".join(errors))
 
 
@@ -393,6 +420,25 @@ def read_image(image):
     a price on it - stretches that box across everything and samples the
     marker at the wrong pitch. Crop first. The phone app's aiming
     rectangle is how that happens there; `MIN_FINDER_SCORE` is what
-    stops a bad crop returning an answer anyway."""
+    stops a bad crop returning an answer anyway.
+
+    The box's own shape settles the quarter turns. A strip photographed
+    upright has a box four times wider than tall, so it is sampled
+    ROWS x COLS; one photographed on its side has the opposite, so it is
+    sampled COLS x ROWS and turned. Either way `read_grid` is then left
+    with only the two ways up."""
     bits = _despeckle(_binarize(image))
-    return read_grid(_sample(bits, _ink_bounds(bits)))
+    box = _ink_bounds(bits)
+    wide = (box[2] - box[0]) >= (box[3] - box[1])
+
+    if wide:
+        return read_grid(_sample(bits, box, ROWS, COLS))
+
+    sideways = _sample(bits, box, COLS, ROWS)
+    errors = []
+    for turned in (_rot90(sideways), _rot270(sideways)):
+        try:
+            return read_grid(turned)
+        except MarkerError as exc:
+            errors.append(str(exc))
+    raise MarkerError("; ".join(errors))

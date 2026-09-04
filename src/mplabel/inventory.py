@@ -38,6 +38,10 @@ SIDE_MARGIN_DOTS = 12
 # Quiet modules around the shelf marker, on all four sides.
 MARKER_QUIET = 2
 
+# The fraction of the content height the marker band may take. The rest
+# is for the words it captions.
+MARKER_HEIGHT = 0.42
+
 
 def _font(size):
     """Pillow's built-in scalable face.
@@ -73,6 +77,8 @@ def _wrap(draw, text, font, max_width, max_lines):
     tail is often the only thing that tells two apart - but a label is
     30mm and something has to give. The code above it is what actually
     identifies the item; this is only here to be recognised by."""
+    if max_lines <= 0:
+        return []
     words, lines, line = text.split(), [], ""
     for word in words:
         trial = f"{line} {word}".strip()
@@ -147,6 +153,10 @@ def _to_raster(box, geom):
     return x0 + geom["x_off"], y0, x1 + geom["x_off"], y1
 
 
+def _price_text(price):
+    return f"${price:.2f}" if isinstance(price, (int, float)) else str(price)
+
+
 def _symbol_placement(geom, modules, cap=140):
     """Where a square symbol of `modules` modules goes, in reading
     coordinates, and how many dots each module gets.
@@ -162,20 +172,40 @@ def _symbol_placement(geom, modules, cap=140):
     return (geom["left"], top + (bottom - top - block) // 2, block, scale)
 
 
+def _marker_band(geom):
+    """Where the marker band goes, in reading coordinates.
+
+    Returns (x0, y0, w, h, scale). The marker is one by four, so it sits
+    *under the text* as a band rather than taking a square bite out of a
+    label that is mostly words - which is what the square version did,
+    and it pushed the title into three cramped lines.
+
+    Sized by height first. Filling the width would be the obvious rule
+    and it is the wrong one: at full width on a 48mm label the band
+    would be a third of the label tall, and the text it is supposed to
+    caption has nowhere left to go."""
+    rows = marker_mod.ROWS + 2 * MARKER_QUIET
+    cols = marker_mod.COLS + 2 * MARKER_QUIET
+    room_w = geom["right"] - geom["left"]
+    room_h = geom["bottom"] - geom["top"]
+    scale = max(1, min(room_w // cols, int(room_h * MARKER_HEIGHT) // rows))
+    w, h = cols * scale, rows * scale
+    return geom["left"], geom["bottom"] - h, w, h, scale
+
+
 def marker_box(label_mm=DEFAULT_LABEL_MM, feed_margin=None):
     """The marker's rectangle in the final raster: (x0, y0, x1, y1).
 
     Exposed because reading one back needs a crop that holds the marker
-    and not the title beside it - `marker.read_image` locates the grid
+    and not the title above it - `marker.read_image` locates the grid
     from the bounding box of the ink, so a crop that catches a letter
     samples the whole thing at the wrong pitch."""
     from .supvan import DEFAULT_MARGIN_DOTS
     if feed_margin is None:
         feed_margin = DEFAULT_MARGIN_DOTS
     geom = _geometry(label_mm, feed_margin)
-    modules = marker_mod.SIZE + 2 * MARKER_QUIET
-    x0, y0, block, _scale = _symbol_placement(geom, modules)
-    return _to_raster((x0, y0, x0 + block - 1, y0 + block - 1), geom)
+    x0, y0, w, h, _scale = _marker_band(geom)
+    return _to_raster((x0, y0, x0 + w - 1, y0 + h - 1), geom)
 
 
 def media_box(label_mm=DEFAULT_LABEL_MM, feed_margin=None):
@@ -236,20 +266,21 @@ def render_label(code, title=None, price=None, with_qr=False,
     top, bottom = geom["top"], geom["bottom"]
 
     if with_marker:
-        # The shelf marker carries 20 bits where a QR version 1 carries
-        # 152, so the same square buys far bigger modules - and module
-        # size is what survives thermal bleed. Squared off to a whole
-        # number of dots for the same reason the QR is.
+        # The marker carries 20 bits where a QR version 1 carries 152, so
+        # it buys far bigger modules - and module size is what survives
+        # thermal bleed. Being one by four, it goes along the bottom and
+        # the text keeps the full width above it.
         grid = marker_mod.render(code, quiet=MARKER_QUIET)
-        _x, y0, block, scale = _symbol_placement(geom, len(grid))
+        bx, by, _w, band_h, scale = _marker_band(geom)
         for r, row in enumerate(grid):
             for c, cell in enumerate(row):
                 if cell:
                     draw.rectangle(
-                        [left + c * scale, y0 + r * scale,
-                         left + (c + 1) * scale - 1, y0 + (r + 1) * scale - 1],
+                        [bx + c * scale, by + r * scale,
+                         bx + (c + 1) * scale - 1, by + (r + 1) * scale - 1],
                         fill=1)
-        text_left = left + block + 14
+        bottom -= band_h + 6
+        text_left = left
     elif with_qr:
         # Sized to the space, then rounded down to a whole number of dots
         # per module - a fractional module scales into uneven blocks and
@@ -269,11 +300,29 @@ def render_label(code, title=None, price=None, with_qr=False,
 
     text_width = right - text_left
 
-    # The code, as large as the space allows.
-    code_font, _ = _fit(draw, code, _font, text_width,
-                        start=60 if (with_qr or with_marker) else 90)
+    # The code, as large as the space allows - and the space is now
+    # vertical as often as horizontal. Fitting on width alone sized it
+    # for the whole label while the marker band was taking two fifths of
+    # the height, and the title underneath was pushed into the band.
+    room_h = bottom - top
+    share = 0.38 if with_marker else 0.45
+    start = min(60 if with_qr else 90, max(20, int(room_h * share)))
+    code_font, _ = _fit(draw, code, _font, text_width, start=start)
     code_h = draw.textbbox((0, 0), code, font=code_font)[3]
     draw.text((text_left, top), code, font=code_font, fill=1)
+
+    # With a marker band along the bottom the price shares the code's
+    # line instead of sitting under the title. It is the same two facts
+    # either way, and on a label this size the alternative is a title
+    # with nowhere to go.
+    price_inline = with_marker and price is not None
+    if price_inline:
+        ptext = _price_text(price)
+        pfont = _font(max(14, int(code_h * 0.42)))
+        pw = _text_width(draw, ptext, pfont)
+        ph = draw.textbbox((0, 0), ptext, font=pfont)[3]
+        draw.text((right - pw, top + code_h - ph), ptext, font=pfont, fill=1)
+
     y = top + code_h + 8
 
     # A rule under the code, so the eye separates it from the title.
@@ -281,17 +330,24 @@ def render_label(code, title=None, price=None, with_qr=False,
     y += 8
 
     if title:
-        title_font = _font(18 if (with_qr or with_marker) else 22)
-        room = max(1, (bottom - y - (26 if price else 0))
-                   // (draw.textbbox((0, 0), "Ay", font=title_font)[3] + 2))
+        title_font = _font(18 if with_qr else 22)
+        line_h = draw.textbbox((0, 0), "Ay", font=title_font)[3] + 2
+        limit = bottom - (0 if price_inline or price is None else 26)
+        room = max(0, (limit - y) // line_h)
         for line in _wrap(draw, title, title_font, text_width,
                           max_lines=min(room, 3)):
+            # Never past `bottom`: `max(1, ...)` used to force a line
+            # even where there was no room for one, and on a label with
+            # a marker band that line landed *inside* the marker. The
+            # code still read - the parity carried it - which is exactly
+            # how it would have reached paper unnoticed.
+            if y + line_h > limit:
+                break
             draw.text((text_left, y), line, font=title_font, fill=1)
-            y += draw.textbbox((0, 0), "Ay", font=title_font)[3] + 2
+            y += line_h
 
-    if price is not None:
-        price_text = f"${price:.2f}" if isinstance(price, (int, float)) \
-            else str(price)
+    if price is not None and not price_inline:
+        price_text = _price_text(price)
         price_font = _font(26)
         w = _text_width(draw, price_text, price_font)
         h = draw.textbbox((0, 0), price_text, font=price_font)[3]
