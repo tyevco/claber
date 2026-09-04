@@ -3312,6 +3312,39 @@ def test_shelf_tag_command_needs_no_database(monkeypatch, capsys, tmp_path):
     assert "shelf  : A1B" in out
     assert "every checksum valid" in out
 
+def test_a_tag_defaults_to_the_stock_that_is_in_the_machine():
+    """It defaulted to 4x1in, which reads better from across a room and
+    is 101.6mm down the feed. On the 30mm die-cut stock this printer
+    actually holds, that printed across three and a bit labels - the
+    marker landed on one of them and the code on another, and the label
+    that came back looked like a bug in the layout.
+
+    A default that needs different paper is a default that wastes a roll
+    finding out."""
+    from mplabel import inventory
+
+    assert inventory.DEFAULT_SHELF_MM == inventory.DEFAULT_LABEL_MM
+    _raw, _stride, rows = inventory.render_shelf_tag("A1B", with_marker=True)
+    feed_mm = rows / inventory.DOTS_PER_MM
+    assert feed_mm == inventory.DEFAULT_LABEL_MM[1]
+
+
+def test_the_feed_length_is_reported_before_anything_prints(monkeypatch,
+                                                            capsys):
+    """In millimetres, because that is the number that has to match the
+    paper. Dots do not tell you whether it fits the label in the
+    machine."""
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    for argv in (["mplabel", "shelf-tag", "--code", "A1B", "--marker"],
+                 ["mplabel", "inventory-label", "--code", "7K2Q", "--qr"]):
+        monkeypatch.setattr(sys, "argv", argv)
+        cli.main()
+        out = capsys.readouterr().out
+        assert "30.0mm down the feed" in out, argv
+        assert "nothing sent" in out, argv
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason

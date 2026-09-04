@@ -590,9 +590,13 @@ def _blit(draw, grid, x, y, scale):
 # never meet a scanner together.
 LOCATION_CODE_LENGTH = 3
 
-# Shelf tags default to the long thin label - read from across a room,
-# and wider than the head, so it prints with its long axis down the feed.
-DEFAULT_SHELF_MM = (101.6, 25.4)
+# The same stock as an item label, because that is what is in the
+# machine. A 4x1in tag reads better from across a room and this defaulted
+# to one - but 4in is 101.6mm down the feed, and on 30mm die-cut stock it
+# printed straight across three and a bit labels, putting the code on one
+# and the marker on another. A default that needs different paper is a
+# default that wastes a roll finding out.
+DEFAULT_SHELF_MM = DEFAULT_LABEL_MM
 
 
 def normalise_location_code(code):
