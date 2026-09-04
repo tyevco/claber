@@ -3001,6 +3001,96 @@ def test_ruler_gauges_each_edge_separately():
     assert ink(0, deepest + 14, top + 90, bottom) > 40, "no left labels"
     assert ink(383 - deepest - 14, 383, top + 90, bottom) > 40, "no right"
 
+def test_edge_test_bars_start_exactly_at_their_inset():
+    """What is being read is where the ink starts, so a bar's near edge
+    has to sit on the dot it names - one off and the answer is one step
+    out, which is 8 dots of label thrown away or kept wrongly."""
+    from mplabel import inventory, supvan
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    raw, stride, rows = inventory.render_edge_test(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+    top, bottom = margin, rows - margin - 1
+
+    for i in range(inventory.EDGE_STEPS):
+        near = i * inventory.EDGE_PITCH
+        assert any((near, y) in dots for y in range(top, bottom)), \
+            f"left bar {i} does not reach x={near}"
+        assert any((383 - near, y) in dots for y in range(top, bottom)), \
+            f"right bar {i} does not reach x={383 - near}"
+        assert any((x, top + near) in dots for x in range(384)), \
+            f"top bar {i} does not reach y={top + near}"
+        assert any((x, bottom - near) in dots for x in range(384)), \
+            f"bottom bar {i} does not reach y={bottom - near}"
+
+
+def test_edge_test_bars_identify_themselves_by_length():
+    """No numbers beside the bars, on purpose: a number is exactly as
+    losable as the mark it names, which is what went wrong with the comb.
+    Length has to do that job instead, so every bar must differ."""
+    from mplabel import inventory, supvan
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    raw, stride, rows = inventory.render_edge_test(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+    top = margin
+
+    lengths = []
+    for i in range(inventory.EDGE_STEPS):
+        near = i * inventory.EDGE_PITCH
+        col = [y for y in range(top, rows - margin) if (near, y) in dots]
+        lengths.append(max(col) - min(col))
+    assert len(set(lengths)) == len(lengths), f"ambiguous bars: {lengths}"
+    assert lengths == sorted(lengths), "the innermost must be the longest"
+
+
+def test_edge_test_stays_inside_the_sent_band():
+    """The rule the ruler learned the hard way, asserted again here."""
+    from mplabel import inventory, supvan
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    raw, stride, rows = inventory.render_edge_test(384, 240)
+    dots = _ruler_dots(raw, stride, rows)
+    assert min(y for _x, y in dots) >= margin
+    assert max(y for _x, y in dots) <= rows - margin - 1
+
+
+def test_edge_test_outranges_the_reported_loss():
+    """Reported: 40 dots lost on the left, 24 on the right. A gauge that
+    stopped at 32 could not have said either."""
+    from mplabel import inventory
+
+    reach = (inventory.EDGE_STEPS - 1) * inventory.EDGE_PITCH
+    assert reach >= 56
+
+
+def test_edge_test_refuses_a_label_it_cannot_fit():
+    from mplabel import inventory
+
+    with pytest.raises(ValueError, match="too small"):
+        inventory.render_edge_test(384, 100)
+    with pytest.raises(ValueError, match="wider than"):
+        inventory.render_edge_test(400, 240)
+
+
+def test_edge_test_goes_through_the_real_print_path(monkeypatch, capsys):
+    from mplabel import cli
+
+    monkeypatch.setattr(cli, "load_config", lambda p=None: dict(cli.DEFAULTS))
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run",
+                         "--style", "edges", "--height", "240"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "pattern: edges" in out
+    assert "3 x 4096" in out
+
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "supvan-test-print", "--dry-run",
+                         "--style", "edges", "--invert"])
+    with pytest.raises(SystemExit, match="measurement"):
+        cli.main()
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason

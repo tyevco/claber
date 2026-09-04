@@ -1019,7 +1019,15 @@ def cmd_supvan_test_print(cfg, args):
         except ValueError:
             raise SystemExit(f"--clip wants WxH, not {args.clip!r}")
         clip = (cw, ch)
-    if args.style == "ruler":
+    if args.style == "edges":
+        if clip or args.invert:
+            raise SystemExit(
+                "--style edges is a measurement, so --clip and --invert "
+                "are not allowed with it")
+        from . import inventory as inventory_mod
+        raw, stride, rows = inventory_mod.render_edge_test(args.width,
+                                                            args.height)
+    elif args.style == "ruler":
         # The calibration target, which is drawn rather than plotted and
         # so lives with the other drawing in inventory.py. --clip and
         # --invert are refused rather than ignored: this label exists to
@@ -1695,7 +1703,9 @@ def _main():
                    help="blank any dot at or beyond W across or H "
                         "down, keeping the image the same size. Their "
                         "print fits 352x171")
-    p.add_argument("--style", choices=["blocks", "sparse", "scatter", "ruler"],
+    p.add_argument("--style",
+                   choices=["blocks", "sparse", "scatter", "ruler",
+                            "edges"],
                    default="blocks",
                    help="test pattern (default %(default)s). 'sparse' draws "
                         "the same landmarks in outline, 0.66%% ink "
@@ -1705,8 +1715,11 @@ def _main():
                         "the device objects to. 'ruler' is the "
                         "calibration target - scales on both axes, the "
                         "last dot's number at each far end, and an inset "
-                        "comb to measure a clipped edge. Use --width and "
-                        "--height to ask about a particular label")
+                        "comb to measure a clipped edge. 'edges' asks "
+                        "only where each edge starts printing, in high "
+                        "contrast: eight bars per side, 8 dots apart, each "
+                        "a different length so it names itself. Use "
+                        "--width and --height for a particular label")
     p.add_argument("--reencode", metavar="FILE",
                    help="decode a captured LZMA stream and re-encode "
                         "the same image with our encoder. Holds the "

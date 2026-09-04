@@ -59,6 +59,7 @@ run against a real database.
 | `selftest` | tiny text-only TSPL label |
 | `inventory-label --code X [--qr\|--marker] [--size WxH[in]] [--preview PNG]` | draw one inventory label and show what the label maker would burn. `--size 4x1in` for a shelf label. No DB |
 | `supvan-test-print --style ruler [--width W] [--height H]` | the calibration target: scales on both axes in dots, the last dot's number at each far end, an inset comb to measure a clipped edge, and a feed arrow. Moves paper |
+| `supvan-test-print --style edges` | the edge test: eight bars per side, 8 dots apart, each a different length so it names itself without a number beside it. Reads where each edge starts printing and nothing else. Moves paper |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -409,6 +410,14 @@ try/except now, `printers.print_lock` warns rather than raises when there
 is no flock (a platform without it has no `/dev/usb/lp0` to interlock
 against either), and `needs_flock` skips the one test that genuinely
 needs it.
+
+**A label on a mark is as losable as the mark.** The ruler's edge comb
+pairs a 5x5-dot square with its number, and both vanish together when
+that column is lost - which is correct, but leaves nothing to read when
+the answer is "most of them are gone", and 0.6mm marks photographed at an
+angle are hard to call either way. `--style edges` carries no numbers at
+all: eight bars a side, each a different length, so any single bar that
+survives identifies itself.
 
 **A gauge has to outrange what it measures.** The edge gauge stopped at
 32 dots while the reported loss was around 40, so every mark on that side
