@@ -635,24 +635,47 @@ def build_print_buffer(image_data, per_line_byte, cols_in_buf,
     return bytes(buf)
 
 
-def raster_to_column_major(data):
+def raster_to_column_major(data, per_line_byte):
     """Repack a standard MSB-first raster the way the printhead reads it.
 
-    The device wants the leftmost dot of a printhead line in the *least*
-    significant bit, where every other raster in this codebase - and
-    `render_test_pattern`, and `printers.render_bitmap` - puts it in the
-    most significant. The byte stride is unchanged, so this is a bit
-    reversal within each byte and nothing more; no transpose is involved,
-    because a raster row and a printhead line are already the same run of
-    bytes. Naming it after the vendor's term for the layout rather than
-    after the mechanic, because that is what a reader will be looking
-    for."""
-    return bytes(_REVERSED_BITS[b] for b in data)
+    The device reads a printhead line's **bytes in reverse order**, with
+    the bits inside each byte left alone. So this reverses each line's
+    bytes and nothing else. No transpose is involved: a raster row and a
+    printhead line are already the same run of bytes. Named after the
+    vendor's term for the layout rather than after the mechanic, because
+    that is what a reader will be looking for.
 
+    This started life as a *bit* reversal within each byte, on the
+    reading that the leftmost dot goes in the least significant bit, and
+    the first label printed came out cleanly mirrored left to right. That
+    observation settles it, because the two possibilities compose:
+    writing `T` for the per-byte bit reversal and `R` for the per-line
+    byte reversal, a full 384-bit line reversal is `M = R.T`. The mirror
+    means the device painted `M(row)` when handed `T(row)`, so its own
+    reading is `P(x) = M(T(x)) = R(x)` - and to have `P(E(row)) = row`,
+    `E` must be `R`.
 
-_REVERSED_BITS = bytes(
-    int(f"{b:08b}"[::-1], 2) for b in range(256)
-)
+    If a print from here comes out *scrambled in 8-dot blocks* rather
+    than correct, the bit order is wrong as well and the answer is the
+    full `M` - reverse the bytes and the bits. That is the only other
+    possibility, and it is one line.
+
+    Reversing a line's bytes is its own inverse, so `decode_job` calls
+    this too. That is also why a preview could never have caught the
+    mirror: it applies the exact inverse of whatever this does, so it
+    renders correctly whether or not this is right. Checking orientation
+    needs an assertion on the *absolute* bit position, or paper."""
+    if per_line_byte <= 0:
+        raise ValueError("per_line_byte must be positive")
+    if len(data) % per_line_byte:
+        raise ValueError(
+            f"{len(data)} bytes is not a whole number of "
+            f"{per_line_byte}-byte printhead lines")
+    out = bytearray(len(data))
+    for start in range(0, len(data), per_line_byte):
+        out[start:start + per_line_byte] = data[
+            start + per_line_byte - 1:start - 1 if start else None:-1]
+    return bytes(out)
 
 
 def split_into_buffers(image_data, per_line_byte, total_cols,
@@ -739,7 +762,7 @@ def build_job(raster, per_line_byte, total_cols,
     and not the size of any one buffer."""
     kw = {} if dict_size is None else {"dict_size": dict_size}
     buffers = split_into_buffers(
-        raster_to_column_major(raster), per_line_byte, total_cols,
+        raster_to_column_major(raster, per_line_byte), per_line_byte, total_cols,
         margin_top=margin_top, margin_bottom=margin_bottom,
         density=density, red_density=red_density)
     blob = b"".join(buffers)
@@ -799,7 +822,7 @@ def decode_job(compressed):
 
         data += buf[PRINT_BUF_HEADER:PRINT_BUF_HEADER + n * per_line]
         cols += n
-    return raster_to_column_major(bytes(data)), stride, cols
+    return raster_to_column_major(bytes(data), stride), stride, cols
 
 
 # ------------------------------------------------ not wired in yet

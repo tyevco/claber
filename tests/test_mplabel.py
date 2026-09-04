@@ -3172,19 +3172,66 @@ def test_supvan_margin_columns_are_declared_but_never_sent():
     assert int.from_bytes(bufs[0][8:10], "little") == margin
 
 
-def test_supvan_the_left_dot_is_the_low_bit_not_the_high_one():
-    """The printhead reads the leftmost dot from the *least* significant
-    bit; every raster elsewhere in this codebase puts it in the most.
-    That is a bit reversal per byte and no transpose - a raster row and a
-    printhead line are already the same run of bytes - which is why the
-    stride is unchanged."""
-    assert supvan.raster_to_column_major(b"\x80") == b"\x01"
-    assert supvan.raster_to_column_major(b"\x01") == b"\x80"
-    assert supvan.raster_to_column_major(b"\xa5") == b"\xa5"   # palindrome
+def test_supvan_a_printhead_line_is_sent_last_byte_first():
+    """The first label printed came out **mirrored left to right**.
+
+    This was a per-byte bit reversal, on the reading that the leftmost
+    dot goes in the least significant bit. The mirror settles it: writing
+    `T` for that bit reversal and `R` for a per-line byte reversal, a
+    full 384-bit line reversal is `M = R.T`. Handed `T(row)` the device
+    painted `M(row)`, so its own reading is `P(x) = M(T(x)) = R(x)`, and
+    `E` must be `R` for `P(E(row))` to come back as `row`.
+
+    Asserted on **absolute** positions, not a round trip. The round trip
+    passed throughout: `decode_job` inverts with this same function, so
+    it renders correctly whether or not the function is right, and the
+    preview looked perfect while the paper came out backwards. A test of
+    orientation that composes the transform with its own inverse is
+    measuring nothing at all."""
+    stride = 48
+
+    left = bytearray(stride)
+    left[0] = 0x80                       # the leftmost dot of the image
+    out = supvan.raster_to_column_major(bytes(left), stride)
+    assert out[stride - 1] == 0x80, "x=0 must go out in the last byte"
+    assert not any(out[:stride - 1])
+
+    right = bytearray(stride)
+    right[stride - 1] = 0x01             # the rightmost dot
+    out = supvan.raster_to_column_major(bytes(right), stride)
+    assert out[0] == 0x01, "x=383 must go out in the first byte"
+    assert not any(out[1:])
+
+    # Bits inside a byte are left alone. If that ever turns out wrong the
+    # symptom is a print scrambled in 8-dot blocks rather than mirrored,
+    # and the answer is the full reversal - bytes and bits.
+    one_line = bytes([0b10110010]) + bytes(stride - 1)
+    assert supvan.raster_to_column_major(one_line, stride)[stride - 1] \
+        == 0b10110010
+
+    # Each line is reversed independently; the lines keep their order.
+    two = bytes([1] + [0] * (stride - 1) + [2] + [0] * (stride - 1))
+    got = supvan.raster_to_column_major(two, stride)
+    assert got[stride - 1] == 1 and got[2 * stride - 1] == 2
+
+
+def test_supvan_the_line_transform_is_its_own_inverse():
+    """Which is what lets `decode_job` call it - and, as above, exactly
+    why the preview could not catch the mirror."""
     raw = supvan.render_test_pattern(384, 8)[0]
-    assert len(supvan.raster_to_column_major(raw)) == len(raw)
-    assert supvan.raster_to_column_major(
-        supvan.raster_to_column_major(raw)) == raw
+    once = supvan.raster_to_column_major(raw, 48)
+    assert len(once) == len(raw)
+    assert supvan.raster_to_column_major(once, 48) == raw
+
+
+def test_supvan_the_line_transform_needs_whole_lines():
+    """A stride that does not divide the raster means the caller has the
+    geometry wrong, and silently reversing a ragged tail would print a
+    sheared label rather than say so."""
+    with pytest.raises(ValueError, match="whole number"):
+        supvan.raster_to_column_major(b"\x00" * 50, 48)
+    with pytest.raises(ValueError):
+        supvan.raster_to_column_major(b"\x00" * 48, 0)
 
 
 def test_supvan_speed_is_derived_from_the_size_not_a_constant():

@@ -672,11 +672,19 @@ buffers. There is no per-buffer compressed ceiling to bisect.
 
 Three more things fall out, and one of them is a bug this repo had:
 
-- **Bit order.** The printhead reads the leftmost dot from the *least*
-  significant bit. `render_test_pattern` and `printers.render_bitmap` both
-  pack MSB-first, as every other raster here does. A printhead line and a
-  raster row are already the same run of bytes, so the fix is a bit
-  reversal per byte and no transpose - `supvan.raster_to_column_major`.
+- **Line order — corrected against paper.** This was written as "the
+  printhead reads the leftmost dot from the least significant bit", i.e. a
+  bit reversal per byte. The first label to print came out **mirrored left
+  to right**, which settles it: writing `T` for the per-byte bit reversal
+  and `R` for a per-line byte reversal, a full 384-bit line reversal is
+  `M = R.T`. Handed `T(row)` the device painted `M(row)`, so the device's
+  own reading is `P(x) = M(T(x)) = R(x)`. The printhead takes a line's
+  **bytes last-first, with the bits inside each byte untouched**, and
+  `supvan.raster_to_column_major` does exactly that. If a print ever comes
+  out scrambled in 8-dot blocks rather than mirrored, the bit order is
+  wrong as well and the answer is the full `M`; that is the only other
+  possibility. A printhead line and a raster row are still the same run of
+  bytes, so no transpose is involved either way.
 - **Speed is derived, not constant.** The captured `BUF_FULL` carried a
   second value of 60 and this repo sent 60 as a constant. It is
   `calc_speed(average compressed bytes per buffer)`: 123 bytes over three
