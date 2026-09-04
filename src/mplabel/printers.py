@@ -704,6 +704,287 @@ def print_pi_http(pdf_path, url=None, secret=None, timeout=45.0, job=None,
             f"this job again.")
 
 
+# ------------------------------------------------------- the label maker
+#
+# The 48mm tag printer gets its own dispatch rather than an entry in
+# BACKENDS, because the two are not the same shape: `send()` takes a file
+# path and throws the result away, and a tag is a *spec* whose answer -
+# did it stall, what did the device say at each step - is the whole
+# point of asking.
+#
+# What crosses the wire is the spec, never the raster. The label maker
+# has more roll-and-hardware facts than the 4x6 printer does, not fewer:
+# PRINTABLE_LEFT_DOTS/PRINTABLE_RIGHT_DOTS were measured on one roll and
+# are gap_inches wearing a different hat, `density` is burn energy
+# against a particular paper, and the label size is the die-cut label
+# physically in the machine. Shipping the compressed blob would move all
+# four onto whichever host happened to build it - and the blob is
+# self-contained precisely *because* they are baked into its buffer
+# headers, which is what makes it the wrong thing to send.
+
+TAG_BACKENDS = {}
+
+
+def tag_geometry(cfg):
+    """The roll facts, from the config of the host that has the roll."""
+    from . import inventory as inventory_mod
+
+    raw = (cfg.get("supvan_label_mm") or "").strip()
+    if raw:
+        w, h = parse_label_size(raw)
+    else:
+        w, h = inventory_mod.DEFAULT_LABEL_MM
+    density = cfg.get("supvan_density")
+    density = int(density) if density not in (None, "") else None
+    if density is None:
+        from . import supvan as supvan_mod
+        density = supvan_mod.DEFAULT_DENSITY
+    return (w, h), density
+
+
+def parse_label_size(text):
+    """`WxH` in millimetres, or with an `in` suffix, in inches.
+
+    Inches are allowed because label stock is sold in them - 4x1in is a
+    shelf label - and converting by hand is how a 4in label becomes a
+    4mm one."""
+    raw = str(text).strip().lower()
+    scale = 1.0
+    if raw.endswith("in"):
+        raw, scale = raw[:-2], 25.4
+    try:
+        w, h = (float(v) * scale for v in raw.split("x"))
+    except ValueError:
+        raise ValueError(f"a label size wants WxH, not {text!r}")
+    if w <= 0 or h <= 0:
+        raise ValueError(f"{text!r} is not a label")
+    return w, h
+
+
+def assemble_tag(spec, cfg):
+    """Render a spec and build the job. No device, no network.
+
+    Returns (job, result). `result` is the wire schema minus whatever
+    only printing can fill in, so a dry run and a real print answer in
+    the same shape and the caller has one thing to render."""
+    from . import inventory as inventory_mod
+    from . import supvan as supvan_mod
+
+    label_mm, density = tag_geometry(cfg)
+    # The spec may override, and an override is a deliberate one-shot -
+    # which is why the CLI flags default to None rather than to a value:
+    # "the user typed it" has to be distinguishable from "the default
+    # fired", or every request silently carries the client's opinion of
+    # a roll it cannot see.
+    if spec.get("size_mm"):
+        label_mm = tuple(spec["size_mm"])
+    if spec.get("density") is not None:
+        density = int(spec["density"])
+
+    raster, stride, rows, label_mm = inventory_mod.render_tag(spec, label_mm)
+    job = supvan_mod.build_job(raster, stride, rows, density=density)
+
+    # Round-trip it whatever happens next: a job that will not come back
+    # apart is not going to the printer either, and this is also what
+    # makes a preview a picture of the payload rather than of what we
+    # meant to send.
+    try:
+        back, back_stride, cols = supvan_mod.decode_job(job["compressed"])
+    except supvan_mod.SupvanError as exc:
+        raise ValueError(f"the job does not decode: {exc}")
+
+    ink = sum(bin(b).count("1") for b in raster)
+    result = {
+        "printed": False,
+        "kind": spec.get("kind"),
+        "code": spec.get("code"),
+        "label": {
+            "mm": [label_mm[0], label_mm[1]],
+            "sideways": inventory_mod.reads_sideways(label_mm),
+            "rows": rows,
+            "dots": [stride * 8, rows],
+            "feed_mm": round(rows / inventory_mod.DOTS_PER_MM, 1),
+            "media_box": list(inventory_mod.media_box(label_mm)),
+            "ink_pct": round(100 * ink / (len(raster) * 8), 2),
+        },
+        # `buffer_count`, never `buffers`. The word that means two things
+        # does not appear on the wire at all.
+        "payload": {
+            "buffer_count": job["buffers"],
+            "raw_len": job["raw_len"],
+            "compressed_len": len(job["compressed"]),
+            "speed": job["speed"],
+            "density": density,
+            "decoded_columns": cols,
+            "decoded_stride": back_stride,
+        },
+        "trace": [],
+    }
+    return job, result
+
+
+def print_tag_local(spec, cfg=None, device=None, dry_run=False, job=None):
+    """Render and print a tag on a label maker attached to this host."""
+    from . import supvan as supvan_mod
+
+    cfg = cfg or {}
+    built, result = assemble_tag(spec, cfg)
+    result["job"] = job
+    result["dry_run"] = bool(dry_run)
+    if dry_run:
+        import base64
+        result["compressed_b64"] = base64.b64encode(
+            built["compressed"]).decode()
+        return result
+
+    device = device or cfg.get("supvan_device") or supvan_mod.DEFAULT_DEVICE
+
+    def step(label, status, lit):
+        result["trace"].append({"step": label, "flags": list(lit)})
+
+    # The tag printer gets its own lock file - `lock_path` is keyed on
+    # the device name, so this is `mplabel-hidraw0.lock` and not the
+    # 4x6 printer's. Today the local tag path takes no lock at all, so a
+    # hand-run `inventory-label --print` over ssh and a daemon would
+    # collide on the hidraw node with nothing to serialise them.
+    with print_lock(cfg, device=device, required=False):
+        final = supvan_mod.print_job(built, path=device, on_step=step)
+
+    result["final"] = _jsonable_status(final)
+    result["printed"] = not final.get("stalled")
+    result["stalled"] = bool(final.get("stalled"))
+    return result
+
+
+def _jsonable_status(status):
+    """A status report that survives `json.dumps`.
+
+    `decode_status` puts the raw report in `status["raw"]` as **bytes**,
+    and json refuses them with a TypeError. Inside printd that TypeError
+    becomes a 503 - so a label that printed perfectly would be reported
+    as a failure and the caller would print it again. Same shape as the
+    fsync/EINVAL incident: the print worked, the bookkeeping said
+    otherwise."""
+    out = {}
+    for key, value in (status or {}).items():
+        if isinstance(value, (bytes, bytearray)):
+            out[key] = bytes(value).hex(" ")
+        else:
+            out[key] = value
+    return out
+
+def print_tag_pi_http(spec, url=None, secret=None, timeout=90.0, job=None,
+                      code=None, dry_run=False):
+    """Hand a tag spec to a printd that has the label maker.
+
+    The spec is the body, so the HMAC covers it - which is why `kind`
+    travels inside it rather than in a header or the path. The signature
+    is over the job id and a digest of the body and nothing else, so
+    routing on anything unsigned would let a signed body be aimed at a
+    printer its signer never chose.
+
+    A longer default timeout than the 4x6 path: the deadline header only
+    bounds *getting* the device, and the tag sequence itself polls the
+    printer between every step. The socket has to outlast the print."""
+    import urllib.error
+    import urllib.request
+
+    if not url:
+        raise PrinterUnavailable("printd_url is not set")
+    payload = dict(spec)
+    if dry_run:
+        payload["dry_run"] = True
+    body = json.dumps(payload, sort_keys=True).encode()
+    job = job or f"{code or spec.get('code') or 'tag'}-{os.urandom(8).hex()}"
+
+    req = urllib.request.Request(
+        url.rstrip("/") + "/print-tag", data=body, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-MPLabel-Protocol": "1",
+            "X-MPLabel-Job": job,
+            "X-MPLabel-Sig": _sign_job(secret, job, body),
+            "X-MPLabel-Deadline": str(timeout),
+        })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read() or b"{}"
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            raise PrinterUnavailable(
+                f"printd at {url} answered 200 but not JSON ({exc}); "
+                f"something between here and the printer replied instead.")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        parsed = {}
+        try:
+            parsed = json.loads(detail)
+            detail = parsed.get("error", detail)
+        except ValueError:
+            pass
+        if exc.code == 404:
+            raise PrinterUnavailable(
+                f"printd at {url} has no /print-tag - it predates the label "
+                f"maker being behind the service. Update it.")
+        if exc.code == 409:
+            log.warning("printd says tag job %s already printed", job)
+            return {"printed": False, "job": job, "duplicate": True}
+        if parsed.get("stalled"):
+            # Paper moved and the job never finished. Carry the trace and
+            # the reseat advice - the device leaves the media out of
+            # position, which is the seating error that blocks the *next*
+            # attempt, so "try again" without reseating fails twice.
+            raise PrinterUnavailable(
+                f"the label maker stalled: {detail}\nReseat the media before "
+                f"the next attempt - the positioning move leaves it out of "
+                f"place, which is the seating error that blocks the "
+                f"following run.")
+        raise PrinterUnavailable(f"printd said {exc.code}: {detail}")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PrinterUnavailable(
+            f"could not reach printd at {url}: {exc}. The tag may or may "
+            f"not have printed - ask it with GET /printed before sending "
+            f"this job again.")
+
+
+TAG_BACKENDS.update({
+    "supvan": print_tag_local,
+    "pi-http": print_tag_pi_http,
+})
+
+
+def tag_backend_kwargs(cfg, backend=None, job=None):
+    """Arguments for one tag backend, from config.
+
+    The remote branch deliberately carries no geometry: not the label
+    size, not the density, not PRINTABLE_*. Those describe the roll in
+    the machine, and the machine is at the other end."""
+    backend = backend or cfg.get("tag_backend") or "supvan"
+    if backend == "pi-http":
+        return {"url": cfg.get("printd_url"),
+                "secret": cfg.get("printd_secret"),
+                "timeout": float(cfg.get("printd_tag_timeout") or 90),
+                "job": job}
+    return {"cfg": cfg, "device": cfg.get("supvan_device"), "job": job}
+
+
+def print_tag(spec, backend=None, **kwargs):
+    """Print one tag, and **return what happened**.
+
+    Unlike `send`, which is file-shaped and discards its result. A tag's
+    answer - did it stall, what did the device report at each step - is
+    the reason for asking, so throwing it away would leave a stall
+    indistinguishable from a print."""
+    backend = backend or "supvan"
+    try:
+        fn = TAG_BACKENDS[backend]
+    except KeyError:
+        raise PrinterUnavailable(
+            f"Unknown tag backend {backend!r}. "
+            f"Choose from: {', '.join(TAG_BACKENDS)}")
+    return fn(spec, **kwargs)
+
 def _sign_job(secret, job, body):
     digest = hashlib.sha256(body).hexdigest()
     return hmac.new((secret or "").encode(),

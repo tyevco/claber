@@ -842,6 +842,48 @@ def render_edge_test(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
         img = canvas
     return img.tobytes(), stride, rows
 
+# The two things a tag can be. `kind` travels inside the signed body
+# rather than in a header or a path, because the HMAC covers the job id
+# and a digest of the body and nothing else - routing on anything
+# unsigned would let a signed body be aimed at a printer its signer did
+# not choose.
+TAG_KINDS = ("inventory-label", "shelf-tag")
+
+
+def render_tag(spec, label_mm=None):
+    """Draw a tag from a spec. Returns (raster, stride, rows, label_mm).
+
+    The spec says *what to put on the label*; `label_mm` says what the
+    label is. They are separate arguments because they belong to
+    different machines: the code, the title and the price come from
+    whoever has the orders, and the size of the die-cut label comes from
+    whoever has the roll."""
+    kind = spec.get("kind")
+    if kind not in TAG_KINDS:
+        raise ValueError(
+            f"{kind!r} is not a tag kind; expected one of "
+            f"{', '.join(TAG_KINDS)}")
+    if spec.get("qr") and spec.get("marker"):
+        raise ValueError("a tag carries one machine-readable code, not two")
+
+    code = spec.get("code")
+    if not code:
+        raise ValueError("a tag needs a code")
+    label_mm = tuple(label_mm or DEFAULT_LABEL_MM)
+
+    if kind == "shelf-tag":
+        raster, stride, rows = render_shelf_tag(
+            code, name=spec.get("name"), with_qr=bool(spec.get("qr")),
+            with_marker=bool(spec.get("marker")), label_mm=label_mm,
+            ecl=spec.get("ecl", "M"))
+    else:
+        raster, stride, rows = render_label(
+            code, title=spec.get("title"), price=spec.get("price"),
+            with_qr=bool(spec.get("qr")),
+            with_marker=bool(spec.get("marker")), label_mm=label_mm,
+            ecl=spec.get("ecl", "M"))
+    return raster, stride, rows, label_mm
+
 def to_image(raster, stride, rows, scale=1):
     """A viewable image of a raster, black on white.
 

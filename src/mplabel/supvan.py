@@ -1082,6 +1082,26 @@ def split_bitmap(data, stride, max_bytes=MAX_BUFFER_BYTES, dict_size=None):
                 + " bytes; the limit is too low for this image")
         band_rows = max(1, band_rows // 2)
 
+def print_job(job, path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT,
+              on_step=None, settle=0.2):
+    """Print what `build_job` built. The one place that unpacks a job.
+
+    `experimental_print` reads `payload["streams"]` as a list of separate
+    LZMA streams, while `build_job`'s `"buffers"` is a *count* of
+    4096-byte print buffers inside one stream. Two different things under
+    one word, and handing a job dict straight over already died once on
+    `for c, n in 3` - see the note in `experimental_print`.
+
+    So nothing hands a caller-supplied dict to `experimental_print` any
+    more. This takes a job, names the two fields it actually needs, and
+    is the only door. It matters more now the spec can arrive from a
+    network: a payload that could choose the `streams` branch would let
+    the wire pick a code path meant for a local experiment."""
+    return experimental_print(
+        {"compressed": job["compressed"], "raw_len": job["raw_len"]},
+        path=path, timeout=timeout, speed=job["speed"],
+        settle=settle, on_step=on_step)
+
 def abort_print(path=DEFAULT_DEVICE, timeout=DEFAULT_TIMEOUT):
     """Send stop-print and report the status afterwards.
 

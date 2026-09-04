@@ -83,6 +83,16 @@ DEFAULTS = {
     # first takes it and this one becomes hidraw1. Nothing here prints to
     # it; `mplabel supvan-probe` polls its status and moves no paper.
     "supvan_device": "/dev/hidraw0",
+    # The label maker's own backend, separate from printer_backend:
+    # two devices, and one may be local while the other is not.
+    "tag_backend": "supvan",
+    # The roll in the machine, on the machine that has it.
+    "supvan_label_mm": "48x30",
+    "supvan_density": "4",
+    # The tag sequence polls the device between every step, and the
+    # deadline header only bounds *getting* the device - so the
+    # socket has to outlast the print, not just the queue.
+    "printd_tag_timeout": "90",
     # Dots across the print head. render_bitmap refuses to render wider
     # than this; the overflow is clipped by the hardware and ejects a
     # second, near-blank label. 812 is the G4 at 203dpi.
@@ -833,41 +843,16 @@ def cmd_inventory_label(cfg, args):
     headers - and draws what comes out. So the picture is of the payload
     on the wire, not of what we meant to send, which is the only version
     worth looking at while nothing built here has printed yet."""
-    price = None
-    if args.price is not None:
-        try:
-            price = float(args.price)
-        except ValueError:
-            price = args.price
-
     if args.qr and args.marker:
         raise SystemExit("--qr and --marker both want the same square; "
                          "pick one")
-    try:
-        label_mm = _parse_size(args.size)
-    except ValueError as exc:
-        raise SystemExit(str(exc))
-    try:
-        raster, stride, rows = inventory_mod.render_label(
-            args.code, title=args.title, price=price, with_qr=args.qr,
-            with_marker=args.marker, label_mm=label_mm, ecl=args.ecl)
-    except ValueError as exc:
-        raise SystemExit(str(exc))
+    spec = _tag_spec(args, "inventory-label")
     carrier = ("  (+ QR carrying the same code)" if args.qr else
                "  (+ shelf marker carrying the same code)" if args.marker
                else "")
     print(f"code   : {args.code}{carrier}")
-    sideways = inventory_mod.reads_sideways(label_mm)
-    print(f"label  : {label_mm[0]:g} x {label_mm[1]:g}mm"
-          + (" - printed sideways, long axis down the feed"
-             if sideways else ""))
-    media = inventory_mod.media_box(label_mm)
-    print(f"raster : {stride * 8} x {rows} dots"
-          + (f", of which {media[2] - media[0] + 1} across is media"
-             if sideways else ""))
-    ink = sum(bin(b).count("1") for b in raster)
-    print(f"         {100 * ink / (len(raster) * 8):.2f}% ink")
-    return _emit_label_job(cfg, args, raster, stride, rows, label_mm)
+    return _emit_tag(cfg, args, spec)
+
 
 
 def cmd_shelf_tag(cfg, args):
@@ -884,100 +869,133 @@ def cmd_shelf_tag(cfg, args):
     if args.qr and args.marker:
         raise SystemExit("--qr and --marker both want the same space; "
                          "pick one")
-    try:
-        label_mm = _parse_size(args.size)
-    except ValueError as exc:
-        raise SystemExit(str(exc))
-    try:
-        raster, stride, rows = inventory_mod.render_shelf_tag(
-            args.code, name=args.name, with_qr=args.qr,
-            with_marker=args.marker, label_mm=label_mm, ecl=args.ecl)
-    except ValueError as exc:
-        raise SystemExit(str(exc))
-
+    spec = _tag_spec(args, "shelf-tag")
     carrier = ("  (+ QR carrying the same code)" if args.qr else
                "  (+ shelf marker carrying the same code)" if args.marker
                else "")
     print(f"shelf  : {args.code.upper()}{carrier}")
     if args.name:
         print(f"name   : {args.name}")
-    sideways = inventory_mod.reads_sideways(label_mm)
-    print(f"label  : {label_mm[0]:g} x {label_mm[1]:g}mm"
-          + (" - printed sideways, long axis down the feed"
-             if sideways else ""))
-    print(f"raster : {stride * 8} x {rows} dots")
-    ink = sum(bin(b).count("1") for b in raster)
-    print(f"         {100 * ink / (len(raster) * 8):.2f}% ink")
-    return _emit_label_job(cfg, args, raster, stride, rows, label_mm)
+    return _emit_tag(cfg, args, spec)
 
 
-def _emit_label_job(cfg, args, raster, stride, rows, label_mm):
-    """Build the job for a drawn label, then preview or print it.
 
-    Shared by `inventory-label` and `shelf-tag`, which differ only
-    in what they draw. The round trip below is the reason it is
-    worth sharing rather than copying: it takes the assembled job
-    back apart, checks every buffer checksum and draws what comes
-    out, so a preview is of the payload on the wire and not of what
-    we meant to send.
-    """
-    sideways = inventory_mod.reads_sideways(label_mm)
-    job = supvan_mod.build_job(raster, stride, rows,
-                               density=args.density)
+def _tag_spec(args, kind):
+    """The spec both tag commands send. What to put on the label, only.
 
-    print(f"job    : {job['buffers']} x {supvan_mod.PRINT_BUF_SIZE} = "
-          f"{job['raw_len']} bytes, {len(job['compressed'])} compressed, "
-          f"speed {job['speed']} (derived), density {args.density}")
-    # The feed length in millimetres, because that is the number that has
-    # to match the paper. A tag longer than the die-cut label prints
-    # straight across the gap onto the next one, and the first anybody
-    # knows is a label with a third of the design on it.
-    print(f"feed   : {rows / inventory_mod.DOTS_PER_MM:.1f}mm down the "
-          f"feed - the die-cut label has to be at least this long")
+    Deliberately carries no geometry unless the operator typed some:
+    `--size` and `--density` default to None so that "the user asked for
+    this" is distinguishable from "the default fired". Unset means the
+    host with the roll decides, which is the whole point - it is the one
+    that can see the paper."""
+    spec = {"kind": kind, "code": args.code,
+            "qr": bool(args.qr), "marker": bool(args.marker),
+            "ecl": args.ecl}
+    if kind == "shelf-tag":
+        spec["name"] = args.name
+    else:
+        spec["title"] = args.title
+        price = args.price
+        if price is not None:
+            try:
+                price = float(price)
+            except ValueError:
+                pass
+        spec["price"] = price
+    if getattr(args, "size", None):
+        try:
+            spec["size_mm"] = list(printers.parse_label_size(args.size))
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+    if getattr(args, "density", None) is not None:
+        spec["density"] = int(args.density)
+    return spec
 
-    # Round-trip it whatever we do next: if the job will not come back
-    # apart, it is not going to the printer either.
+
+def _emit_tag(cfg, args, spec):
+    """Dispatch a tag spec and report what came back.
+
+    The output is the same whether the label came out of this machine or
+    one on the other side of the house, because both ends answer in the
+    same schema and this only renders it. That is the ergonomic
+    requirement: nobody should have to learn a second set of words for
+    the remote case."""
+    backend = cfg.get("tag_backend") or "supvan"
+    dry = not args.print
+    kwargs = printers.tag_backend_kwargs(cfg, backend)
+    if backend == "supvan" and getattr(args, "device", None):
+        kwargs["device"] = args.device
+
     try:
-        back, back_stride, cols = supvan_mod.decode_job(job["compressed"])
-    except supvan_mod.SupvanError as exc:
-        raise SystemExit(f"the job does not decode: {exc}")
-    print(f"decoded: {cols} printhead lines, {back_stride} bytes each, "
-          f"every checksum valid")
+        result = printers.print_tag(spec, backend, dry_run=dry, **kwargs)
+    except (ValueError, printers.PrinterUnavailable) as exc:
+        raise SystemExit(str(exc))
 
-    if args.preview:
+    label, payload = result.get("label") or {}, result.get("payload") or {}
+    if backend != "supvan":
+        print(f"printd : {cfg.get('printd_url')}")
+    if label:
+        print(f"label  : {label['mm'][0]:g} x {label['mm'][1]:g}mm"
+              + (" - printed sideways, long axis down the feed"
+                 if label.get("sideways") else ""))
+        wide, tall = label["dots"]
+        media_wide = label["media_box"][2] - label["media_box"][0] + 1
+        # The raster is head-width because the *bar* is; a 1in label
+        # covers 203 of those dots and the rest is head hanging off the
+        # edge, which in a preview reads as a badly laid out label and is
+        # nothing of the sort.
+        print(f"raster : {wide} x {tall} dots"
+              + (f", of which {media_wide} across is media"
+                 if label.get("sideways") else ""))
+        print(f"         {label['ink_pct']:.2f}% ink")
+    if payload:
+        print(f"job    : {payload['buffer_count']} x "
+              f"{supvan_mod.PRINT_BUF_SIZE} = {payload['raw_len']} bytes, "
+              f"{payload['compressed_len']} compressed, "
+              f"speed {payload['speed']} (derived), "
+              f"density {payload['density']}")
+        # Millimetres, because that is the number that has to match the
+        # paper. A tag longer than the die-cut label prints straight
+        # across the gap onto the next one, and the first anybody knows
+        # is a label with a third of the design on it.
+        print(f"feed   : {label['feed_mm']:.1f}mm down the feed - the "
+              f"die-cut label has to be at least this long")
+        print(f"decoded: {payload['decoded_columns']} printhead lines, "
+              f"{payload['decoded_stride']} bytes each, every checksum valid")
+
+    if args.preview and result.get("compressed_b64"):
+        import base64
+        back, back_stride, cols = supvan_mod.decode_job(
+            base64.b64decode(result["compressed_b64"]))
         img = inventory_mod.to_image(back, back_stride, cols,
                                      scale=args.scale)
-        # Crop to the media and turn it the way you hold it. The raster
-        # is 384 dots because the *bar* is; a 1in label covers 203 of
-        # them and the rest is head hanging off the edge, which in a
-        # preview reads as a badly laid out label and is nothing of the
-        # sort.
-        mx0, _my0, mx1, _my1 = inventory_mod.media_box(label_mm)
+        # Cropped with the box the *renderer* reported, never this
+        # host's own PRINTABLE_* - on the remote path those describe a
+        # roll this machine cannot see, and cropping a server-rendered
+        # raster with client-side constants is the precise class of bug
+        # the split exists to prevent.
+        mx0, _my0, mx1, _my1 = label["media_box"]
         img = img.crop((mx0 * args.scale, 0,
                         (mx1 + 1) * args.scale, img.height))
-        if sideways:
+        if label.get("sideways"):
             img = img.rotate(-90, expand=True)
         img.save(args.preview)
         print(f"\nwrote {args.preview} - the payload, decoded back"
-              + (", turned the way you hold it" if sideways else ""))
+              + (", turned the way you hold it"
+                 if label.get("sideways") else ""))
 
-    if not args.print:
+    if dry:
         print("\nnothing sent, no paper moved. Add --print to try it.")
         return
 
-    device = args.device or cfg.get("supvan_device",
-                                    supvan_mod.DEFAULT_DEVICE)
-    print(f"\nsending to {device}:")
-
-    def step(label, status, lit):
-        print(f"  . {label}" + (f": {', '.join(lit) or 'no flags'}"
-                                if status else ""))
-    try:
-        final = supvan_mod.experimental_print(
-            job, path=device, speed=job["speed"], on_step=step)
-    except supvan_mod.SupvanError as exc:
-        raise SystemExit(f"\nstopped: {exc}")
-    print(f"\npages printed now reads {final['pages_printed']}.")
+    for entry in result.get("trace") or []:
+        flags = ", ".join(entry.get("flags") or []) or "no flags"
+        print(f"  . {entry['step']}: {flags}")
+    final = result.get("final") or {}
+    if result.get("printed"):
+        print(f"\npages printed now reads {final.get('pages_printed')}.")
+    else:
+        print("\nit did not report a finished print.")
 
 
 def cmd_supvan_test_print(cfg, args):
@@ -1233,6 +1251,19 @@ def cmd_reconcile(cfg, conn, args):
         job = row.get("job") or ""
         code = job.rsplit("-", 1)[0] if "-" in job else job
         if not code or code == "selftest":
+            continue
+        # Only 4x6 parcel labels. A shelf tag's job id is the same shape
+        # - {code}-{hex} - and a 3-character location code could match a
+        # parcel code by coincidence, which would mark a live parcel
+        # printed because a shelf tag came out. Checked structurally on
+        # `kind`, not by prefixing job ids. Rows written before the field
+        # existed have no `kind` and are parcel labels by definition.
+        if row.get("kind", "pdf") != "pdf":
+            continue
+        # And only rows that actually printed. A stall is journaled so a
+        # retry of the same id is refused, but paper moving is not the
+        # same as a label coming out.
+        if row.get("outcome", "printed") != "printed":
             continue
         # Only rows that still claim they never printed, and only by a
         # code that is still open - a shipped parcel's code goes back in
@@ -1789,15 +1820,16 @@ def _main():
     p.add_argument("--ecl", choices=["L", "M", "Q", "H"], default="M",
                    help="QR error correction (default %(default)s). A "
                         "code this short fits version 1 even at H")
-    p.add_argument("--size", default="48x30", metavar="WxH",
+    p.add_argument("--size", default=None, metavar="WxH",
                    help="label size the way you hold it, in mm (default "
                         "%(default)s). Suffix `in` for inches, so a 4x1in "
                         "shelf label is --size 4x1in. Anything wider than "
                         "the 48mm head is printed with its long axis down "
                         "the feed - the head does not turn")
-    p.add_argument("--density", type=int,
-                   default=supvan_mod.DEFAULT_DENSITY,
-                   help="burn energy 0-15 (default %(default)s)")
+    p.add_argument("--density", type=int, default=None,
+                   help="burn energy 0-15. Unset means the host with the "
+                        "roll decides (supvan_density), which is the point "
+                        "- it is the one that can see the paper")
     p.add_argument("--preview", metavar="PNG",
                    help="write what the payload decodes back to")
     p.add_argument("--scale", type=int, default=2,
@@ -1820,15 +1852,16 @@ def _main():
                    help="add a QR carrying the same code instead")
     p.add_argument("--ecl", choices=["L", "M", "Q", "H"], default="M",
                    help="QR error correction (default %(default)s)")
-    p.add_argument("--size", default="48x30", metavar="WxH",
+    p.add_argument("--size", default=None, metavar="WxH",
                    help="tag size the way you hold it, mm unless suffixed "
                         "`in` (default %(default)s, the same stock as an "
                         "item label). A bigger tag reads better across a "
                         "room, but it must fit the die-cut label or it "
                         "prints across several of them")
-    p.add_argument("--density", type=int,
-                   default=supvan_mod.DEFAULT_DENSITY,
-                   help="burn energy 0-15 (default %(default)s)")
+    p.add_argument("--density", type=int, default=None,
+                   help="burn energy 0-15. Unset means the host with the "
+                        "roll decides (supvan_density), which is the point "
+                        "- it is the one that can see the paper")
     p.add_argument("--preview", metavar="PNG",
                    help="write what the payload decodes back to")
     p.add_argument("--scale", type=int, default=2,

@@ -64,6 +64,13 @@ JOURNAL_KEEP = 5000
 # `selftest-{hex}`; this is deliberately a little wider than that.
 SAFE_JOB = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
+# Advertised in /healthz so a client can tell an old printd from a
+# printer with nothing plugged in, without bumping PROTOCOL - which
+# would make this daemon reject every existing client the moment it
+# restarted.
+ENDPOINTS = ("/healthz", "/printed", "/tag-status", "/print",
+             "/print-tag", "/selftest")
+
 
 def sign(secret, job, body):
     """HMAC over the job id and a digest of the body.
@@ -101,11 +108,19 @@ class Journal:
         with self._lock:
             return job in self._done
 
-    def record(self, job, nbytes, digest):
+    def record(self, job, nbytes, digest, kind="pdf", outcome="printed"):
         # ts is informational only. The Pi may have no correct clock yet;
         # nothing here depends on it being right.
+        #
+        # `kind` so `mplabel reconcile` can tell a parcel label from a
+        # shelf tag - it matches job ids against sales.code, and a tag id
+        # is the same shape. `outcome` because a stall means paper moved
+        # and the job did not finish: it must be journaled, so a retry of
+        # the same id is refused, and it must be distinguishable from a
+        # print. Rows written before these existed have neither, so every
+        # reader defaults them.
         row = {"job": job, "ts": time.time(), "bytes": nbytes,
-               "sha256": digest}
+               "sha256": digest, "kind": kind, "outcome": outcome}
         with self._lock:
             self._done.add(job)
             with open(self.path, "a") as fh:
@@ -222,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.h_health()
             if path == "/printed":
                 return self.h_printed()
+            if path == "/tag-status":
+                return self.h_tag_status()
             self.fail(404, "no such endpoint")
         except BrokenPipeError:
             log.debug("caller went away")
@@ -237,6 +254,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/print":
                 return self.h_print()
+            if path == "/print-tag":
+                return self.h_print_tag()
             if path == "/selftest":
                 return self.h_selftest()
             self.fail(404, "no such endpoint")
@@ -263,9 +282,15 @@ class Handler(BaseHTTPRequestHandler):
         answering, or the one command you would run to diagnose the
         problem hangs in exactly the case it exists for. `printing_since`
         is how a wedge becomes visible rather than silent."""
+        from . import inventory as inventory_mod
+        from . import supvan as supvan_mod
+
         srv = self.server
         device = srv.cfg.get("printer_device")
         since = srv.printing_since
+        tag_node = srv.cfg.get("supvan_device") or supvan_mod.DEFAULT_DEVICE
+        tag_since = srv.tag_printing_since
+        tag_mm, tag_density = printers.tag_geometry(srv.cfg)
         self._send(200, {
             "ok": True,
             "backend": srv.cfg.get("printer_backend"),
@@ -282,6 +307,27 @@ class Handler(BaseHTTPRequestHandler):
                              if since is not None else None),
             "build": build_mod.stamp(),
             "protocol": PROTOCOL,
+            # The label maker, reported without touching it. A wedged tag
+            # print now also holds a device, and this must keep answering
+            # through that too - so `tag_status` is whatever the last
+            # poll saw, with its age, and never a fresh read. /tag-status
+            # is the live one.
+            "tag_device": tag_node,
+            "tag_device_present": bool(tag_node) and Path(tag_node).exists(),
+            "tag_printing": tag_since is not None,
+            "tag_printing_for": (round(time.monotonic() - tag_since, 1)
+                                 if tag_since is not None else None),
+            "tag_label_mm": list(tag_mm),
+            "tag_density": tag_density,
+            "tag_printable": [inventory_mod.PRINTABLE_LEFT_DOTS,
+                              inventory_mod.PRINTABLE_RIGHT_DOTS],
+            "tag_status": srv.tag_status,
+            "tag_status_age": (round(time.monotonic() - srv.tag_status_at, 1)
+                               if srv.tag_status_at is not None else None),
+            # How a client tells "no tag support" from "tag support,
+            # device unplugged" without bumping the protocol version and
+            # locking out every existing caller on restart.
+            "endpoints": sorted(ENDPOINTS),
         })
 
     def h_printed(self):
@@ -328,6 +374,126 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"printed": True, "job": job, "bytes": row["bytes"],
                          "backend": self.server.cfg.get("printer_backend")})
 
+    def h_print_tag(self):
+        """Print one tag on the label maker.
+
+        A separate endpoint from `/print`, not a Content-Type branch
+        inside it. The signature covers the job id and a digest of the
+        body and nothing else - no header, no path - so if the choice of
+        physical device rode on an unsigned header, a signed body could
+        be aimed at a printer its signer never chose. `kind` lives inside
+        the body instead, where the HMAC covers it, and a PDF replayed
+        here fails as not-JSON while a spec replayed to `/print` fails
+        the %PDF guard."""
+        body = self._read_body()
+        job = self._check(body)
+        if job is None:
+            return
+        if not body:
+            return self.fail(400, "empty body")
+        try:
+            spec = json.loads(body)
+        except ValueError as exc:
+            return self.fail(400, f"body is not JSON: {exc}")
+        if not isinstance(spec, dict):
+            return self.fail(400, "body is not a tag spec")
+
+        if self.server.journal.seen(job):
+            return self._send(409, {"printed": False, "job": job,
+                                    "error": "job already printed"})
+
+        dry = bool(spec.get("dry_run"))
+        if dry:
+            # Renders and builds, opens nothing, journals nothing. This is
+            # what makes a preview a picture of the payload on the wire
+            # rather than of what the caller meant to send.
+            try:
+                result = printers.print_tag_local(
+                    spec, self.server.cfg, dry_run=True, job=job)
+            except ValueError as exc:
+                return self.fail(400, str(exc))
+            return self._send(200, result)
+
+        deadline = self._deadline()
+        with self.server.tag_device(deadline) as got:
+            if not got:
+                return self._send(410, {
+                    "printed": False, "job": job,
+                    "error": f"could not reach the label maker within "
+                             f"{deadline}s; another job was ahead of it"})
+            try:
+                result = printers.print_tag_local(
+                    spec, self.server.cfg, job=job)
+            except ValueError as exc:
+                return self.fail(400, str(exc))
+            except printers.PrinterUnavailable as exc:
+                return self.fail(503, str(exc))
+
+        # Cache whatever the device last said, so /healthz can report it
+        # without opening the node.
+        final = result.get("final") or {}
+        if final:
+            self.server.tag_status = final
+            self.server.tag_status_at = time.monotonic()
+
+        if result.get("stalled"):
+            # Paper moved and the job never finished. Journal it so a
+            # retry of the same id is refused, and answer non-2xx: a
+            # 200 {"printed": false} is discarded by the client's success
+            # path and would read as a print.
+            self.server.journal.record(
+                job, len(body), hashlib.sha256(body).hexdigest(),
+                kind=spec.get("kind", "tag"), outcome="stalled")
+            return self._send(503, dict(result, error=(
+                "the label maker accepted the job and never finished it; "
+                "it was sent stop. Reseat the media before the next "
+                "attempt - the positioning move leaves it out of place, "
+                "which is the seating error that blocks the following "
+                "run.")))
+
+        self.server.journal.record(job, len(body),
+                                   hashlib.sha256(body).hexdigest(),
+                                   kind=spec.get("kind", "tag"))
+        return self._send(200, result)
+
+    def h_tag_status(self):
+        """Ask the label maker how it is. Moves no paper.
+
+        Takes the tag gate **without blocking**: hidraw permits
+        concurrent opens, so slipping an inquiry frame into the middle of
+        a bulk transfer is a live corruption risk, not a theoretical one.
+        If a print holds the gate, answer with the cached reading and say
+        it is busy.
+
+        A device that does not answer is reported at 200 with
+        `answered: false`, not as a server error - "it did not answer" is
+        the answer, and it is the same shape `mplabel status` uses for
+        the other printer."""
+        from . import supvan as supvan_mod
+
+        srv = self.server
+        node = srv.cfg.get("supvan_device") or supvan_mod.DEFAULT_DEVICE
+        age = (round(time.monotonic() - srv.tag_status_at, 1)
+               if srv.tag_status_at is not None else None)
+
+        if not srv._tag_gate.acquire(blocking=False):
+            return self._send(200, {"answered": False, "busy": True,
+                                    "device": node, "cached": srv.tag_status,
+                                    "age_seconds": age})
+        try:
+            status = printers._jsonable_status(supvan_mod.poll_status(node))
+            srv.tag_status = status
+            srv.tag_status_at = time.monotonic()
+            self._send(200, {"answered": True, "busy": False,
+                             "device": node, "status": status,
+                             "age_seconds": 0.0})
+        except supvan_mod.SupvanError as exc:
+            self._send(200, {"answered": False, "busy": False,
+                             "device": node, "error": str(exc),
+                             "cached": srv.tag_status, "age_seconds": age})
+        finally:
+            srv._tag_gate.release()
+
     def h_selftest(self):
         body = self._read_body()
         if self._check(body) is None:
@@ -361,6 +527,14 @@ class Server(ThreadingHTTPServer):
         self.journal = Journal(state / "done.jsonl")
         self._gate = threading.Lock()
         self.printing_since = None
+        # A second gate for the label maker. Not the same one: they are
+        # two physical devices on two buses, and a wedged shipping label
+        # must not block a shelf tag. `print_lock` is already keyed on
+        # the device name, so the flocks are distinct for free.
+        self._tag_gate = threading.Lock()
+        self.tag_printing_since = None
+        self.tag_status = None
+        self.tag_status_at = None
 
     def device(self, deadline):
         """Exclusive use of the printer, or a clean refusal.
@@ -372,31 +546,43 @@ class Server(ThreadingHTTPServer):
         not have its label printed to an empty room ten minutes later."""
         return _Device(self, deadline)
 
+    def tag_device(self, deadline):
+        """The same, for the label maker, on its own gate and its own lock."""
+        from . import supvan as supvan_mod
+
+        node = self.cfg.get("supvan_device") or supvan_mod.DEFAULT_DEVICE
+        return _Device(self, deadline, gate=self._tag_gate, node=node,
+                       attr="tag_printing_since")
+
 
 class _Device:
-    def __init__(self, server, deadline):
+    def __init__(self, server, deadline, gate=None, node=None, attr=None):
         self.server = server
         self.deadline = deadline
+        self.gate = gate or server._gate
+        self.node = node
+        self.attr = attr or "printing_since"
         self.held = False
 
     def __enter__(self):
-        if not self.server._gate.acquire(timeout=max(0.05, self.deadline)):
+        if not self.gate.acquire(timeout=max(0.05, self.deadline)):
             return False
         # The flock as well: another process on this Pi - a hand-run
         # `mplabel reprint` over ssh - reaches the same printer.
-        self._lock = printers.print_lock(self.server.cfg, required=True)
+        self._lock = printers.print_lock(self.server.cfg, device=self.node,
+                                         required=True)
         self._lock.__enter__()
         self.held = True
-        self.server.printing_since = time.monotonic()
+        setattr(self.server, self.attr, time.monotonic())
         return True
 
     def __exit__(self, *exc):
         if self.held:
-            self.server.printing_since = None
+            setattr(self.server, self.attr, None)
             try:
                 self._lock.__exit__(*exc)
             finally:
-                self.server._gate.release()
+                self.gate.release()
         return False
 
 

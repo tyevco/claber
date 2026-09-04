@@ -61,6 +61,7 @@ run against a real database.
 | `supvan-test-print --style ruler [--width W] [--height H]` | the calibration target: scales on both axes in dots, the last dot's number at each far end, an inset comb to measure a clipped edge, and a feed arrow. Moves paper |
 | `supvan-test-print --style edges` | the edge test: eight bars per side, 8 dots apart, each a different length so it names itself without a number beside it. Reads where each edge starts printing and nothing else. Moves paper |
 | `shelf-tag --code XXX [--name N] [--marker\|--qr] [--size WxH[in]] [--preview PNG] [--print]` | a tag for a shelf, bin or area. Code big, name under it, marker beside it. **Three** characters, where an item code is four. No DB |
+| `config [--all]` | the resolved config, each key marked `default`/`file`/`env`, secrets redacted, and **which** file was read. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -320,6 +321,41 @@ and nothing else - which reads as a broken layout and is not. Both label
 commands now print the feed length **in millimetres**, because that is
 the number that has to match the paper, and the default is the stock that
 is actually loaded.
+
+**Both printers are behind `printd`, and the label maker sends a *spec*
+not a raster.** `tag_backend` picks `supvan` (the local hidraw node) or
+`pi-http` (`POST /print-tag`). What crosses is what to put on the label -
+code, title, name, price - and never the roll: `PRINTABLE_LEFT_DOTS`,
+`PRINTABLE_RIGHT_DOTS`, `--density` and the label size all describe the
+paper in the machine, so they come from the host that can see it.
+`--size`/`--density` default to **None** for exactly this reason, so
+"the operator typed it" is distinguishable from "the default fired". The
+compressed blob is self-contained *because* geometry and density are
+baked into its buffer headers - which is what makes it the wrong thing
+to send.
+
+**`kind` travels inside the signed body, never a header.** The HMAC
+covers the job id and a digest of the body and nothing else - not the
+path, not the headers - so routing the choice of *physical device* on
+anything unsigned would let a signed body be aimed at a printer its
+signer never chose. Cross-posting then fails on body validation alone:
+a PDF to `/print-tag` is not JSON, a spec to `/print` fails the `%PDF`
+guard.
+
+**A stalled tag is a 503, and it is journaled.** `final["stalled"]`
+means paper moved and the job never finished. `200 {"printed": false}`
+would be discarded by the client's success path and read as a print.
+The journal row carries `outcome`, so a retry of the same id is refused
+rather than printing again onto media the last attempt left out of
+position - and `kind`, so `reconcile` cannot mark a live parcel printed
+because a shelf tag came out with a coincidentally matching code.
+
+**A status report is not JSON-serialisable.** `decode_status` puts the
+raw bytes in `status["raw"]`, `json.dumps` raises `TypeError`, and
+printd's catch-all turns that into a 503 - so a label that printed
+perfectly is reported as a failure and the caller prints it again. Same
+shape as the fsync/EINVAL incident: the print worked, the bookkeeping
+said otherwise. `printers._jsonable_status` hexes anything bytes-shaped.
 
 **Three characters means a place, four means a thing.** A location code
 is 3 and an inventory code is 4, and that is load bearing: the marker's

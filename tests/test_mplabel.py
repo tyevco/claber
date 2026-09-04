@@ -3511,6 +3511,215 @@ def test_config_says_which_file_and_where_each_value_came_from(
     assert "topsecretvalue" not in out, "a secret was echoed to the terminal"
     assert "<set>" in out
 
+# --- phase 2: the label maker behind printd ------------------------------
+
+SHELF_SPEC = {"kind": "shelf-tag", "code": "A1B", "name": "Loft",
+              "marker": True}
+
+
+def _tag_req(base, spec, job="A1B-0011223344556677", secret="s3cret",
+             protocol="1", deadline="5", body=None):
+    import json as _json
+    from mplabel import printd as printd_mod
+
+    if body is None:
+        body = _json.dumps(spec, sort_keys=True).encode()
+    sig = printd_mod.sign(secret, job, body)
+    return _http_raw(f"{base}/print-tag", body, {
+        "Content-Type": "application/json", "X-MPLabel-Protocol": protocol,
+        "X-MPLabel-Job": job, "X-MPLabel-Sig": sig,
+        "X-MPLabel-Deadline": deadline})
+
+
+def _get_json(url):
+    import json as _json
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=5) as res:
+        return res.status, _json.loads(res.read() or b"{}")
+
+
+def test_a_tag_spec_crosses_the_wire_not_a_raster(printd):
+    """The label maker has more roll facts than the 4x6 printer, not
+    fewer: PRINTABLE_* were measured on one roll, density is burn energy
+    against a particular paper, and the size is the die-cut label in the
+    machine. Sending the compressed blob would move all four onto
+    whichever host built it - and the blob is self-contained precisely
+    because they are baked into its buffer headers."""
+    base, _sent, srv = printd
+    srv.cfg["supvan_density"] = "7"
+
+    status, result = _tag_req(base, dict(SHELF_SPEC, dry_run=True))
+    assert status == 200, result
+    # The server's roll, not the client's - the spec named neither.
+    assert result["payload"]["density"] == 7
+    assert result["label"]["mm"] == [48, 30]
+    assert result["kind"] == "shelf-tag"
+    assert result["printed"] is False and result["dry_run"] is True
+
+
+def test_a_tag_result_survives_json_when_the_device_answers(printd,
+                                                            monkeypatch):
+    """decode_status puts the raw report in status["raw"] as bytes, and
+    json refuses them with a TypeError - which the catch-all turns into a
+    503. A label that printed perfectly would be reported as a failure
+    and the caller would print it again."""
+    import contextlib
+    from mplabel import printers, supvan
+
+    base, _sent, _srv = printd
+    final = {"pages_printed": 41, "errors": [], "stalled": False,
+             "raw": b"\x08\x00\x00\x10\x00\x00"}
+    monkeypatch.setattr(supvan, "print_job", lambda *a, **k: final)
+    monkeypatch.setattr(printers, "print_lock",
+                        lambda *a, **k: contextlib.nullcontext())
+
+    status, result = _tag_req(base, SHELF_SPEC)
+    assert status == 200, result
+    assert result["printed"] is True
+    assert result["final"]["raw"] == "08 00 00 10 00 00"
+    assert json.dumps(result)
+
+
+def test_a_stalled_tag_is_not_reported_as_printed(printd, monkeypatch):
+    """A stall means paper moved and the job never finished. A 200 with
+    printed=false is discarded by the client's success path and would
+    read as a print, so it has to be a non-2xx - and it has to be
+    journaled, or a retry of the same id prints again on media the last
+    attempt left out of position."""
+    import contextlib
+    from mplabel import printers, supvan
+
+    base, _sent, srv = printd
+    monkeypatch.setattr(supvan, "print_job",
+                        lambda *a, **k: {"stalled": True, "errors": [],
+                                         "pages_printed": 0})
+    monkeypatch.setattr(printers, "print_lock",
+                        lambda *a, **k: contextlib.nullcontext())
+
+    status, result = _tag_req(base, SHELF_SPEC)
+    assert status == 503
+    assert result["printed"] is False and result["stalled"] is True
+    assert "reseat" in result["error"].lower()
+
+    rows = srv.journal.since()
+    assert rows[-1]["outcome"] == "stalled"
+    assert rows[-1]["kind"] == "shelf-tag"
+    # And the same id is refused rather than moving paper twice.
+    again, _payload = _tag_req(base, SHELF_SPEC)
+    assert again == 409
+
+
+def test_the_two_endpoints_refuse_each_others_bodies(printd):
+    """kind rides inside the signed body, so routing cannot be moved by
+    an unsigned header. Cross-posting then fails on body validation
+    alone, in both directions."""
+    base, sent, _srv = printd
+
+    status, payload = _tag_req(base, None, body=PDF)
+    assert status == 400 and "JSON" in payload["error"]
+
+    spec_body = json.dumps(SHELF_SPEC, sort_keys=True).encode()
+    status, payload = _print_req(base, spec_body, job="A1B-1122334455667788")
+    assert status == 400 and "PDF" in payload["error"]
+    assert sent == []
+
+
+def test_a_bad_tag_spec_is_refused_before_anything_moves(printd):
+    base, _sent, _srv = printd
+    cases = (({"kind": "nope", "code": "A1B"}, "tag kind"),
+             ({"kind": "shelf-tag"}, "needs a code"),
+             ({"kind": "shelf-tag", "code": "7K2Q"}, "location code"),
+             ({"kind": "shelf-tag", "code": "A1B", "qr": True,
+               "marker": True}, "one machine-readable"))
+    for i, (bad, why) in enumerate(cases):
+        status, payload = _tag_req(base, bad, job=f"bad{i}")
+        assert status == 400, (bad, payload)
+        assert why in payload["error"], (bad, payload)
+
+
+def test_healthz_reports_the_label_maker_without_touching_it(printd):
+    """It must keep answering through a wedged tag print too, so the
+    status it carries is the last one seen, with its age, and never a
+    fresh read. /tag-status is the live one."""
+    base, _sent, _srv = printd
+    status, health = _get_json(f"{base}/healthz")
+    assert status == 200
+    assert "/print-tag" in health["endpoints"]
+    assert health["tag_printing"] is False
+    assert health["tag_status"] is None and health["tag_status_age"] is None
+    assert health["tag_printable"] == [40, 32]
+    assert health["tag_label_mm"] == [48, 30]
+
+
+def test_tag_status_does_not_open_the_node_mid_print(printd):
+    """hidraw permits concurrent opens, so slipping an inquiry frame into
+    the middle of a bulk transfer is a live corruption risk, not a
+    theoretical one. If a print holds the gate, answer from cache."""
+    base, _sent, srv = printd
+
+    assert srv._tag_gate.acquire(blocking=False)
+    try:
+        status, payload = _get_json(f"{base}/tag-status")
+    finally:
+        srv._tag_gate.release()
+    assert status == 200
+    assert payload["busy"] is True and payload["answered"] is False
+
+
+def test_the_two_printers_do_not_block_each_other(printd):
+    """Two physical devices on two buses. A wedged shipping label must
+    not stop a shelf tag, so they get separate gates and - because
+    lock_path is keyed on the device name - separate lock files."""
+    base, _sent, srv = printd
+    assert srv._gate is not srv._tag_gate
+
+    assert srv._gate.acquire(blocking=False)
+    try:
+        status, payload = _tag_req(base, dict(SHELF_SPEC, dry_run=True))
+        assert status == 200, payload
+    finally:
+        srv._gate.release()
+
+
+def test_reconcile_ignores_tag_rows(db, monkeypatch):
+    """A shelf tag's job id is the same shape as a parcel's, and a
+    3-character location code could match a parcel code by coincidence -
+    which would mark a live parcel printed because a tag came out."""
+    import argparse as _argparse
+    from mplabel import cli, printers
+
+    db.execute("INSERT INTO sales (message_id, item, code, status) "
+               "VALUES ('m1', 'Lamp', 'A1B', 'new')")
+    db.commit()
+    monkeypatch.setattr(printers, "printd_printed", lambda *a, **k: [
+        {"job": "A1B-aaaa", "kind": "shelf-tag", "outcome": "printed"},
+        {"job": "A1B-bbbb", "kind": "pdf", "outcome": "stalled"},
+    ])
+    cli.cmd_reconcile({}, db, _argparse.Namespace(since=None, dry_run=False))
+    row = db.execute(
+        "SELECT printed_at FROM sales WHERE code='A1B'").fetchone()
+    assert row["printed_at"] is None, "a tag or a stall marked a parcel printed"
+
+
+def test_print_job_is_the_only_door_to_the_device():
+    """experimental_print reads payload["streams"] as a list of LZMA
+    streams while build_job's "buffers" is a count inside one stream -
+    two things under one word, which already died once on `for c, n in
+    3`. Nothing hands it a caller-supplied dict any more, and that
+    matters more now a spec can arrive from a network."""
+    import inspect
+    from mplabel import printers, supvan
+
+    src = inspect.getsource(printers.print_tag_local)
+    assert "experimental_print" not in src
+    assert "print_job" in src
+    assert "job" in inspect.signature(supvan.print_job).parameters
+
+    # And the word that means two things is not on the wire at all.
+    _job, result = printers.assemble_tag(SHELF_SPEC, {})
+    assert "buffers" not in json.dumps(result)
+    assert result["payload"]["buffer_count"] == 3
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason

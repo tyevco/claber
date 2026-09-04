@@ -164,6 +164,23 @@ printd_state_dir =
 printd_url      =
 printd_timeout  = 45
 
+# The label maker has its own backend, because it is a second device and
+# one may be local while the other is not. `supvan` drives /dev/hidraw0
+# here; `pi-http` sends the tag spec to printd_url instead.
+tag_backend     = supvan
+
+# Longer than printd_timeout on purpose: that deadline only bounds
+# *getting* the device, and the tag sequence polls the printer between
+# every step, so the socket has to outlast the print itself.
+printd_tag_timeout = 90
+
+# The roll in the label maker, on the machine that has it. A tag spec
+# carries neither unless the operator typed --size or --density, so an
+# override is a deliberate one-shot and the default answer comes from
+# whichever host can actually see the paper.
+supvan_label_mm = 48x30
+supvan_density  = 4
+
 # Dots across the print head. render_bitmap refuses to render wider - the
 # overflow is clipped by the hardware and ejects a second, blank label.
 printer_head_dots = 812
