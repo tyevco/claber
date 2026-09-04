@@ -853,9 +853,6 @@ def cmd_inventory_label(cfg, args):
             with_marker=args.marker, label_mm=label_mm, ecl=args.ecl)
     except ValueError as exc:
         raise SystemExit(str(exc))
-    job = supvan_mod.build_job(raster, stride, rows,
-                               density=args.density)
-
     carrier = ("  (+ QR carrying the same code)" if args.qr else
                "  (+ shelf marker carrying the same code)" if args.marker
                else "")
@@ -864,11 +861,70 @@ def cmd_inventory_label(cfg, args):
     print(f"label  : {label_mm[0]:g} x {label_mm[1]:g}mm"
           + (" - printed sideways, long axis down the feed"
              if sideways else ""))
+    media = inventory_mod.media_box(label_mm)
     print(f"raster : {stride * 8} x {rows} dots"
-          + (f", of which {inventory_mod.media_box(label_mm)[2] - inventory_mod.media_box(label_mm)[0] + 1}"
-             f" across is media" if sideways else ""))
+          + (f", of which {media[2] - media[0] + 1} across is media"
+             if sideways else ""))
     ink = sum(bin(b).count("1") for b in raster)
     print(f"         {100 * ink / (len(raster) * 8):.2f}% ink")
+    return _emit_label_job(cfg, args, raster, stride, rows, label_mm)
+
+
+def cmd_shelf_tag(cfg, args):
+    """Draw one shelf tag: a code for a *place*, not a thing.
+
+    Three characters where an item code is four, which is what lets a
+    scanner tell "put things here" from "this is a thing" - the marker's
+    payload already carries a format bit for 3-char codes against 4-char
+    ones, so nothing new goes on the wire.
+
+    Above `connect_db` with the other printer commands: printing a tag
+    for a shelf needs no database, and the labels want making before
+    there is anything to record against them."""
+    if args.qr and args.marker:
+        raise SystemExit("--qr and --marker both want the same space; "
+                         "pick one")
+    try:
+        label_mm = _parse_size(args.size)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    try:
+        raster, stride, rows = inventory_mod.render_shelf_tag(
+            args.code, name=args.name, with_qr=args.qr,
+            with_marker=args.marker, label_mm=label_mm, ecl=args.ecl)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    carrier = ("  (+ QR carrying the same code)" if args.qr else
+               "  (+ shelf marker carrying the same code)" if args.marker
+               else "")
+    print(f"shelf  : {args.code.upper()}{carrier}")
+    if args.name:
+        print(f"name   : {args.name}")
+    sideways = inventory_mod.reads_sideways(label_mm)
+    print(f"label  : {label_mm[0]:g} x {label_mm[1]:g}mm"
+          + (" - printed sideways, long axis down the feed"
+             if sideways else ""))
+    print(f"raster : {stride * 8} x {rows} dots")
+    ink = sum(bin(b).count("1") for b in raster)
+    print(f"         {100 * ink / (len(raster) * 8):.2f}% ink")
+    return _emit_label_job(cfg, args, raster, stride, rows, label_mm)
+
+
+def _emit_label_job(cfg, args, raster, stride, rows, label_mm):
+    """Build the job for a drawn label, then preview or print it.
+
+    Shared by `inventory-label` and `shelf-tag`, which differ only
+    in what they draw. The round trip below is the reason it is
+    worth sharing rather than copying: it takes the assembled job
+    back apart, checks every buffer checksum and draws what comes
+    out, so a preview is of the payload on the wire and not of what
+    we meant to send.
+    """
+    sideways = inventory_mod.reads_sideways(label_mm)
+    job = supvan_mod.build_job(raster, stride, rows,
+                               density=args.density)
+
     print(f"job    : {job['buffers']} x {supvan_mod.PRINT_BUF_SIZE} = "
           f"{job['raw_len']} bytes, {len(job['compressed'])} compressed, "
           f"speed {job['speed']} (derived), density {args.density}")
@@ -1656,6 +1712,33 @@ def _main():
                         "printed yet - see open work 1b")
     p.add_argument("--device", help="hidraw node, default supvan_device")
 
+    p = sub.add_parser("shelf-tag",
+                       help="draw a tag for a shelf, bin or area")
+    p.add_argument("--code", required=True,
+                   help="the location code: THREE characters, where an "
+                        "item code is four. That is what tells a scanner "
+                        "a shelf from a thing on it")
+    p.add_argument("--name", help="what the place is called, under the code")
+    p.add_argument("--marker", action="store_true",
+                   help="add the shelf marker carrying the same code")
+    p.add_argument("--qr", action="store_true",
+                   help="add a QR carrying the same code instead")
+    p.add_argument("--ecl", choices=["L", "M", "Q", "H"], default="M",
+                   help="QR error correction (default %(default)s)")
+    p.add_argument("--size", default="4x1in", metavar="WxH",
+                   help="tag size the way you hold it, mm unless suffixed "
+                        "`in` (default %(default)s - a long thin tag, read "
+                        "from across the room)")
+    p.add_argument("--density", type=int,
+                   default=supvan_mod.DEFAULT_DENSITY,
+                   help="burn energy 0-15 (default %(default)s)")
+    p.add_argument("--preview", metavar="PNG",
+                   help="write what the payload decodes back to")
+    p.add_argument("--scale", type=int, default=2,
+                   help="preview magnification (default %(default)s)")
+    p.add_argument("--print", action="store_true", help="actually send it")
+    p.add_argument("--device", help="hidraw node, default supvan_device")
+
     p = sub.add_parser("supvan-probe",
                        help="status of the 48mm inventory label maker; "
                             "prints nothing and moves no paper")
@@ -1857,6 +1940,9 @@ def _main():
         return
     if args.cmd == "inventory-label":
         cmd_inventory_label(cfg, args)
+        return
+    if args.cmd == "shelf-tag":
+        cmd_shelf_tag(cfg, args)
         return
 
     if args.cmd == "supvan-probe":
