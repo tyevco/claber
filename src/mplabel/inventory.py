@@ -31,9 +31,27 @@ HEAD_DOTS = 384
 DEFAULT_LABEL_MM = (48, 30)
 DEFAULT_HEIGHT_MM = 30          # the short axis of the default label
 
-# The label is drawn a little narrower than the head and centred, because
-# the media runs centred under the bar and 48mm stock is not exactly 48mm.
-SIDE_MARGIN_DOTS = 12
+# What the head actually marks on the label, measured with
+# `supvan-test-print --style edges`: the left 40 dots and the right 32
+# never reach the paper, leaving 312 - 39mm, not 48 - and the window is
+# **not centred** under the head.
+#
+# This was guessed at first, as a symmetric 12-dot margin, on the reading
+# that "the media runs centred under the bar and 48mm stock is not
+# exactly 48mm". Both halves of that were wrong, and the cost was a QR
+# drawn from x=22: it lost its left finder column and would not scan,
+# while looking intact in a photograph. Unequal insets are the tell that
+# the media sits off-centre rather than the head being narrow.
+#
+# Measured on one roll. Different stock will differ, and the edge test is
+# how to find out rather than a thing to assume.
+PRINTABLE_LEFT_DOTS = 40
+PRINTABLE_RIGHT_DOTS = 32
+PRINTABLE_DOTS = HEAD_DOTS - PRINTABLE_LEFT_DOTS - PRINTABLE_RIGHT_DOTS
+
+# A cosmetic breathing space inside that window, not a guard against the
+# edge loss - the window above is what handles that.
+SIDE_MARGIN_DOTS = 8
 
 # Quiet modules around the shelf marker, on all four sides.
 MARKER_QUIET = 2
@@ -121,11 +139,28 @@ def _geometry(label_mm, feed_margin):
     h = round(label_mm[1] * DOTS_PER_MM)
     rotate = w > HEAD_DOTS
     across = h if rotate else w
-    if across > HEAD_DOTS:
-        raise ValueError(
-            f"a {label_mm[0]}x{label_mm[1]}mm label needs {across} dots "
-            f"across the head and it has {HEAD_DOTS}; neither way round "
-            f"fits, so this size cannot be printed on a 48mm head")
+
+    # Only PRINTABLE_DOTS of the head reach the label, and not centred.
+    # A label whose across dimension is wider than that is drawn to the
+    # printable width instead: the paper is still 48mm, but the part of
+    # it this printer can mark is 39mm, so laying out to 48 puts ink
+    # where nothing burns.
+    if rotate:
+        # Rotated already means the long axis runs down the feed, so
+        # `across` is the label's *short* side. If that does not fit the
+        # printable window, no orientation does - refuse rather than
+        # silently crop a label to the middle of itself.
+        if across > PRINTABLE_DOTS:
+            raise ValueError(
+                f"a {label_mm[0]}x{label_mm[1]}mm label needs {across} dots "
+                f"across the head and only {PRINTABLE_DOTS} of them reach "
+                f"the paper; neither way round fits")
+    elif w > PRINTABLE_DOTS:
+        # Not rotated, so the label is at most head-width and the excess
+        # is the edge loss itself: the paper is still 48mm, but the part
+        # of it this printer marks is 39mm. Lay out to what burns.
+        w = PRINTABLE_DOTS
+        across = PRINTABLE_DOTS
 
     if rotate:
         left, right = feed_margin + 4, w - feed_margin - 4
@@ -136,7 +171,8 @@ def _geometry(label_mm, feed_margin):
 
     return {"w": w, "h": h, "rotate": rotate, "across": across,
             "left": left, "right": right, "top": top, "bottom": bottom,
-            "x_off": (HEAD_DOTS - across) // 2, "rows": w if rotate else h}
+            "x_off": PRINTABLE_LEFT_DOTS + (PRINTABLE_DOTS - across) // 2,
+            "rows": w if rotate else h}
 
 
 def _to_raster(box, geom):
