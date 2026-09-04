@@ -4019,8 +4019,9 @@ def test_marker_carries_both_code_lengths_and_says_which():
     """A parcel code is three characters and an inventory code is four,
     and the same symbol has to carry either without the reader having to
     be told which it is holding."""
-    assert len(marker.encode_payload("XYZ")) == 12
-    assert len(marker.encode_payload("MN4P")) == 12
+    size = marker.DATA_BYTES + marker.ECC_BYTES
+    assert len(marker.encode_payload("XYZ")) == size
+    assert len(marker.encode_payload("MN4P")) == size
     assert marker.decode_payload(marker.encode_payload("XYZ")) == "XYZ"
     assert marker.decode_payload(marker.encode_payload("MN4P")) == "MN4P"
 
@@ -4034,11 +4035,11 @@ def test_marker_refuses_a_blank_picture_instead_of_reading_zero():
     A camera pointed at a white wall returned a code. Formats are
     numbered from 1 so that the all-zero word has no valid format, and
     the finder has to match before any of it is attempted."""
-    blank = [[0] * marker.SIZE for _ in range(marker.SIZE)]
+    blank = [[0] * marker.COLS for _ in range(marker.ROWS)]
     with pytest.raises(marker.MarkerError):
         marker.read_grid(blank)
     with pytest.raises(marker.MarkerError):
-        marker.decode_payload(bytes(12))
+        marker.decode_payload(bytes(marker.DATA_BYTES + marker.ECC_BYTES))
     # And "000" is still a code this can carry.
     assert marker.decode_payload(marker.encode_payload("000")) == "000"
 
@@ -4047,11 +4048,14 @@ def test_marker_finder_is_solid_on_two_sides_and_clocked_on_two():
     """The L gives position, rotation and module pitch in one feature;
     the clock track catches a scale that has drifted."""
     grid = marker.encode("7K2Q")
+    assert (len(grid), len(grid[0])) == (marker.ROWS, marker.COLS)
+    assert len(grid[0]) == 4 * len(grid), "one by four"
     assert all(row[0] for row in grid), "left column solid"
-    assert all(grid[marker.SIZE - 1]), "bottom row solid"
+    assert all(grid[marker.ROWS - 1]), "bottom row solid"
     assert [grid[0][c] for c in range(6)] == [1, 0, 1, 0, 1, 0]
-    assert [grid[r][marker.SIZE - 1] for r in range(6)] == [0, 1, 0, 1, 0, 1]
-    assert marker._finder_score(grid) == 44
+    assert [grid[r][marker.COLS - 1]
+            for r in range(marker.ROWS)] == [0, 1, 0, 1, 0, 1]
+    assert marker._finder_score(grid) == marker.BORDER == 56
 
 
 def test_marker_reads_back_from_a_rendered_image():
@@ -4078,7 +4082,8 @@ def test_marker_survives_blur_and_a_small_scale():
 def test_marker_survives_specks_that_would_move_the_bounding_box():
     """One dark speck in a corner used to decide the bounding box, so
     every module afterwards was sampled in the wrong place - the finder
-    went from 44/44 to 11/44 with the picture otherwise perfect."""
+    went from a perfect finder to a quarter of one with the picture
+    otherwise untouched."""
     import random
     img = _marker_image("7K2Q")
     rng = random.Random(2)
@@ -4119,7 +4124,7 @@ def test_marker_gets_bigger_modules_than_the_qr_for_the_same_square():
     geom = inventory._geometry(inventory.DEFAULT_LABEL_MM,
                                supvan.DEFAULT_MARGIN_DOTS)
     _x, _y, _block, marker_scale = inventory._symbol_placement(
-        geom, marker.SIZE + 2 * inventory.MARKER_QUIET)
+        geom, marker.ROWS + 2 * inventory.MARKER_QUIET)
     _x, _y, _block, qr_scale = inventory._symbol_placement(
         geom, len(qr.render("7K2Q", ecl="M", quiet=2)))
     assert marker_scale > qr_scale, (marker_scale, qr_scale)
@@ -4162,9 +4167,9 @@ def test_marker_js_port_agrees_with_python():
     for code in ("7K2Q", "A1B2", "ZZZZ", "0000", "XYZ", "999", "MN4P"):
         cw = list(marker.encode_payload(code))
         damaged = []
-        for nerr in (1, 2, 3, 4):
+        for nerr in range(1, marker.ECC_BYTES // 2 + 1):
             d = list(cw)
-            for pos in rng.sample(range(12), nerr):
+            for pos in rng.sample(range(len(cw)), nerr):
                 d[pos] ^= rng.randrange(1, 256)
             damaged.append(d)
         vectors.append({"code": code, "clean": cw, "damaged": damaged,
@@ -4339,3 +4344,80 @@ def test_the_4x1_preview_is_cropped_to_the_media_and_turned(
     # buffer header and never sent. What you see is what burns.
     assert img.width == (round(101.6 * inventory.DOTS_PER_MM)
                          - 2 * supvan.DEFAULT_MARGIN_DOTS)
+
+
+# ------------------------------------- the marker is a band, not a square
+
+def test_the_marker_is_one_by_four_and_fills_its_interior_exactly():
+    """The shape is the point. A square marker took a bite out of the
+    middle of a label that is mostly words and pushed the title into
+    three cramped lines; a band goes under the text.
+
+    The interior is 4 x 22 = 88 modules and the codeword is 88 bits, so
+    nothing is spare - which is why this shape rather than a taller one.
+    Every module left over would have been a smaller module."""
+    assert marker.COLS == 4 * marker.ROWS
+    assert len(marker._cells()) == (marker.ROWS - 2) * (marker.COLS - 2)
+    assert len(marker._cells()) == (marker.DATA_BYTES + marker.ECC_BYTES) * 8
+
+
+def test_the_marker_band_sits_below_the_text_not_beside_it():
+    """Checked by looking at the raster rather than at the arithmetic:
+    the band's rows must be the lowest inked ones on the label, and the
+    text must reach further right than the band does."""
+    raster, stride, rows = inventory.render_label(
+        "7K2Q", "Antique Cut Glass Vase", 45.0, with_marker=True)
+
+    def row_ink(y):
+        return sum(bin(b).count("1")
+                   for b in raster[y * stride:(y + 1) * stride])
+
+    x0, y0, x1, y1 = inventory.marker_box()
+    assert y1 > rows * 0.6, "the band belongs at the bottom"
+    assert all(row_ink(y) == 0 for y in range(y1 + 1, rows)), \
+        "nothing below the band"
+    # The text above it uses width the band does not.
+    def widest_ink(y0_, y1_):
+        best = 0
+        for y in range(y0_, y1_):
+            row = raster[y * stride:(y + 1) * stride]
+            for x in range(stride * 8 - 1, -1, -1):
+                if (row[x >> 3] >> (7 - (x & 7))) & 1:
+                    best = max(best, x)
+                    break
+        return best
+    assert widest_ink(0, y0) > x1, "the text should run wider than the band"
+
+
+def test_a_rectangle_rules_out_half_the_orientations():
+    """A square had to try four ways up; a 6x24 can only be read at 0 or
+    180, because at 90 it would not be this shape. The quarter turns are
+    settled from the ink's own aspect before any decoding starts, which
+    is a real simplification and not just a saving."""
+    import inspect
+    src = inspect.getsource(marker.read_grid)
+    assert "_rot180" in src
+    assert "_rot90" not in src, "quarter turns belong to read_image"
+    # And both ways up really do read.
+    for turn in (0, 180):
+        img = _marker_image("MN4P")
+        if turn:
+            img = img.rotate(turn, expand=True, fillcolor=255)
+        assert marker.read_image(img) == "MN4P"
+
+
+def test_the_title_never_runs_into_the_marker_band():
+    """It did. The code was sized on width alone while the band was
+    taking two fifths of the height, so the title was pushed down into
+    the marker - and the code still read, because the parity carried it,
+    which is exactly how it would have reached paper unnoticed."""
+    raster, stride, _rows = inventory.render_label(
+        "7K2Q",
+        "Antique 1900-1915 American Edwardian Late Victorian Cut Glass "
+        "Crystal Vase With Sterling Silver Rim And Original Box",
+        325.0, with_marker=True)
+    x0, y0, x1, y1 = inventory.marker_box()
+    # The gap the layout leaves above the band must be genuinely blank.
+    for y in range(y0 - 5, y0):
+        row = raster[y * stride:(y + 1) * stride]
+        assert sum(bin(b).count("1") for b in row) == 0, f"ink at row {y}"

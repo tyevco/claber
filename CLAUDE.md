@@ -110,7 +110,7 @@ src/mplabel/
   backfill.py    one-off mailbox survey and historical import
   rs.py          Reed-Solomon over GF(256), encode and decode
   qr.py          a QR encoder, stdlib only, versions 1-10
-  marker.py      the shelf marker: a 12x12 code for our own 3-4 char codes
+  marker.py      the shelf marker: a 6x24 band for our own 3-4 char codes
   inventory.py   draws the 48mm inventory label; QR or shelf marker
   static/marker.js  the marker decoder in the browser, a port of marker.py
   savedpage.py   parse a saved Marketplace selling page
@@ -216,7 +216,7 @@ hardware or a real Facebook account.
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
 | `escpos` backend | **UNUSED and unproven.** Written while the id was believed, kept because the job structure is unit-tested and some sibling models really do speak ESC/POS. Nothing it produces has ever printed. Its banding size and trailing form feed are guesses. |
 | The QR encoder | **Verified against two independent oracles, never printed.** `qr.py` is hand-written to keep the Pi dependency list short. Its codeword stream is identical to `segno`'s for every version, level and mode in range; all 350 symbols in the sweep decoded correctly through `zxing-cpp`; the Reed-Solomon matches the specification's worked example and the format bits match its published table. Neither library is a dependency - they were the oracle, and pinned matrix digests are what is left of them. **Never read off thermal paper**, where the module size and the burn darkness both matter. |
-| The shelf marker | **Round-trips in software, never printed or photographed.** 12x12 modules carrying 4 data bytes and 8 Reed-Solomon parity, so any 4 of the 12 can be wrong. Reads back clean, at all four rotations, under a 2.5px blur, scaled to 35%, with 2% salt-and-pepper noise, and out of the decoded print-buffer payload of a real label at 8 dots per module against the QR's 5. **Never read off thermal paper by a real camera**, which is the only test that counts - bleed closes modules up and a phone adds glare, motion and a lens. 5% salt-and-pepper still defeats it. |
+| The shelf marker | **Round-trips in software, never printed or photographed.** 6x24 modules - one by four - carrying 4 data bytes and 7 Reed-Solomon parity, so any 3 of the 11 can be wrong. The interior is 4x22 = 88 modules and the codeword is exactly 88 bits, so nothing is spare. Reads back clean at all four rotations, under a 2.5px blur, scaled to 40%, with 4% salt-and-pepper noise, and out of the decoded print-buffer payload of a real label at both sizes. **Never read off thermal paper by a real camera**, which is the only test that counts - bleed closes modules up and a phone adds glare, motion and a lens. |
 | The browser decoder | **Agrees with the Python reference; never run against a real camera.** `static/marker.js` matches `marker.py` byte for byte on clean and damaged codewords under node. What is untested is everything a phone does: exposure, focus, rolling shutter, and whether the aiming reticle is a usable way to hold a box. |
 | The inventory label | **Assembles and round-trips; never printed.** `inventory-label --preview` renders it, builds the real print buffers, decodes them back with every checksum checked, and both the QR and the marker still read out of that payload. Two sizes covered: 48x30mm, and 4x1in - which prints sideways, ten buffers, and is the first label to exercise the tiling properly. What is untested is everything physical: whether 5 dots per QR module survives thermal bleed, whether the text is legible, and **whether the media is 48mm at all** - a 4x1in label assumes stock this printer may not take. |
 | TSPL gap value 0.12in | **ASSUMED.** Typical for 4x6 die-cut; not measured on their stock. |
@@ -473,6 +473,36 @@ It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
 running the copy it has.
 
+**The marker is one by four, and that is a layout decision as much as a
+format one.** A square marker took a bite out of the middle of a label
+that is mostly words and pushed the title into three cramped lines. A
+6x24 band goes *under* the text, which keeps the full width for the code
+and the title above it. `_marker_band` places it; it is sized by height
+first, because filling the width would make the band a third of a 48mm
+label's height and leave the text it captions nowhere to go.
+
+**A rectangle rules out half the orientations before decoding starts.**
+A 6x24 grid photographed at 90 degrees is not 6x24, so `read_image`
+settles the quarter turns from the ink's own aspect - sampling
+transposed when the box is taller than it is wide - and `read_grid` is
+left with only the two ways up. Do not put quarter turns back into
+`read_grid`; the shape already carries that information.
+
+**Raster order matters more on a strip than it did on a square.** Along
+the rows a byte is eight neighbouring modules, so a scratch down the
+length damages three of eleven bytes - just inside what the parity
+carries. Down the columns it would be one bit from each of eleven,
+which is the same damage spread so thin that nothing is recoverable.
+
+**The code font has to be sized on height, not just width.** It was
+fitted to the available width while the marker band was taking two
+fifths of the height, so the title underneath was pushed *into* the
+band - and the marker still read, because the parity absorbed it, which
+is exactly how that would have reached paper unnoticed. The title loop
+also used to force a line with `max(1, ...)` where there was room for
+none. Both are pinned by tests that read the raster rather than trust
+the arithmetic.
+
 **The printhead does not turn, so the label size chooses its own
 orientation.** The bar is 384 dots - 48mm - and that is the *only* axis
 a label can be wide on. A 4x1in shelf label therefore prints with its
@@ -654,8 +684,8 @@ Roughly in priority order.
    Three things to check on the paper that no test here can reach:
    whether the QR scans off thermal stock at 5 dots per module (it scans
    out of the wire payload, which is not the same thing - bleed closes
-   up the modules), whether the **shelf marker** scans at 8, and whether
-   the wrapped title is legible at 48mm. All are `--density` knobs
+   up the modules), whether the **shelf marker band** scans at the 7-9
+   dots per module it gets, and whether the wrapped title is legible. All are `--density` knobs
    before they are layout changes. `inventory-label --marker` and
    `--qr` draw the two candidates on the same label size, so one print
    run settles which carrier to keep.
