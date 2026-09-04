@@ -1264,7 +1264,19 @@ def cmd_status(cfg):
     back? If it does, a print can be refused when the paper is out and
     the parcel stays visible in Pending. If it does not, at-least-once
     is the best available and that is worth writing down rather than
-    assuming either way."""
+    assuming either way.
+
+    Refuses on a host whose backend is remote, rather than querying the
+    local device name that `DEFAULTS` always supplies. Without this it
+    reads a node that is not there and prints the "answered no, printing
+    stays at-least-once" finding - a finding-shaped answer, about the
+    highest-value open experiment in the project, delivered by a machine
+    with no printer attached."""
+    if cfg.get("printer_backend") in printers.REMOTE_BACKENDS:
+        raise SystemExit(
+            f"printer_backend is {cfg['printer_backend']!r}, so the printer "
+            f"is on another host and there is nothing here to ask.\nRun this "
+            f"on the printd host, or `mplabel probe --remote` from here.")
     info = printers.ask_status(cfg["printer_device"])
     print(f"device   {info['device']}")
     if info["answered"]:
@@ -1277,6 +1289,83 @@ def cmd_status(cfg):
         print(f"note     {info['note']}")
         print("\nNothing to read back, so a failed print cannot be detected\nin software. Record that as a finding: printing stays at-least-once and\nthe paper is the only source of truth.")
 
+
+# Anything whose value must not be echoed to a terminal or a paste.
+SECRET_KEYS = ("imap_password", "printd_secret", "web_password_hash",
+               "sheets_key", "sheets_key_json")
+
+
+def config_sources(path=None):
+    """Where every resolved config value actually came from.
+
+    Returns (rows, config_path). Each row is (key, value, origin) with
+    origin one of `default`, `file`, `env`.
+
+    Written because three things decide a value and none of them is
+    visible from the others: `DEFAULTS`, the *first* config file that
+    exists - the search stops there, so `~/.config/mplabel.conf` is never
+    read while `/etc/mplabel.conf` is present - and `MPLABEL_*`, which
+    wins, is invisible in the file, and comes from an `EnvironmentFile`
+    nobody remembers. This is the only way to answer "which value is in
+    force" without reading three places and guessing."""
+    defaults = dict(DEFAULTS)
+    from_file, used = {}, None
+    candidates = [Path(path)] if path else [
+        Path("/etc/mplabel.conf"),
+        Path.home() / ".config" / "mplabel.conf",
+    ]
+    for cand in candidates:
+        if cand and cand.exists():
+            parser = configparser.ConfigParser()
+            parser.read(cand)
+            if parser.has_section("mplabel"):
+                from_file = dict(parser["mplabel"])
+            used = cand
+            break
+
+    rows = []
+    for key in sorted(set(defaults) | set(from_file)):
+        env = os.environ.get("MPLABEL_" + key.upper())
+        if env:
+            rows.append((key, env, "env"))
+        elif key in from_file:
+            rows.append((key, from_file[key], "file"))
+        else:
+            rows.append((key, defaults[key], "default"))
+    return rows, used
+
+
+def cmd_config(args):
+    """Show the resolved config, and where each value came from.
+
+    Above `connect_db` with the printer commands: the reason to run this
+    is usually that something is not working, and needing a writable data
+    directory to find out which config file is in force would be exactly
+    the wrong dependency."""
+    rows, used = config_sources(args.config)
+
+    print(f"host   {socket.gethostname()}")
+    print(f"file   {used or 'none found - every value is a built-in default'}")
+    if used and not args.config:
+        # The search stops at the first hit, so say what was skipped.
+        skipped = [c for c in (Path("/etc/mplabel.conf"),
+                               Path.home() / ".config" / "mplabel.conf")
+                   if c != used and c.exists()]
+        for other in skipped:
+            print(f"       (ignoring {other} - the search stops at the "
+                  f"first file that exists, values do not merge)")
+    print()
+
+    width = max(len(k) for k, _v, _o in rows)
+    for key, value, origin in rows:
+        if not args.all and origin == "default":
+            continue
+        shown = "<set>" if (value and key in SECRET_KEYS) else value
+        print(f"  {key:<{width}}  {shown or '':<28}  {origin}")
+
+    if not args.all:
+        n = sum(1 for _k, _v, o in rows if o == "default")
+        print(f"\n{n} more at their built-in default; --all shows them.")
 
 def cmd_passwd():
     """Print the `web_password_hash` line for mplabel.conf.
@@ -1895,6 +1984,11 @@ def _main():
     p.add_argument("--bind", help="default 127.0.0.1; the intended route "
                                   "in is a Cloudflare tunnel")
     p.add_argument("--port", type=int)
+    p = sub.add_parser("config",
+                       help="show the resolved config and where each "
+                            "value came from")
+    p.add_argument("--all", action="store_true",
+                   help="include keys still at their built-in default")
     sub.add_parser("passwd", help="hash a password for web_password_hash")
     sub.add_parser("status", help="ask the printer how it is (does it "
                                   "answer at all?)")
@@ -1966,6 +2060,9 @@ def _main():
         return
     if args.cmd == "passwd":
         cmd_passwd()
+        return
+    if args.cmd == "config":
+        cmd_config(args)
         return
     if args.cmd == "status":
         cmd_status(cfg)

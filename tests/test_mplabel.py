@@ -3345,6 +3345,172 @@ def test_the_feed_length_is_reported_before_anything_prints(monkeypatch,
         assert "30.0mm down the feed" in out, argv
         assert "nothing sent" in out, argv
 
+# --- phase 1: correctness fixes the wire would amplify -------------------
+
+def test_printd_refuses_to_print_to_itself(tmp_path):
+    """`printer_backend = pi-http` on the printd host makes printd POST to
+    printd_url - itself. The inner request finds the gate held, burns the
+    whole deadline and answers 410, which surfaces as "printd said 410"
+    and reads exactly like a busy printer.
+
+    `docs/split-architecture.md` phase 3 used to instruct this config, and
+    the tests missed it because the fixture hands printd and the client
+    two separate dicts. Refuse at startup instead of at 11pm."""
+    from mplabel import cli, printd as printd_mod, printers
+
+    cfg = dict(cli.DEFAULTS)
+    cfg.update({"printd_secret": "s" * 8, "home": str(tmp_path),
+                "printer_backend": "pi-http",
+                "printd_url": "http://127.0.0.1:9101"})
+    with pytest.raises(SystemExit, match="print to itself"):
+        printd_mod.serve(cfg)
+
+    # A local backend still starts far enough to bind, so the guard is
+    # not just rejecting everything.
+    assert "pi-http" in printers.REMOTE_BACKENDS
+    assert "tspl" not in printers.REMOTE_BACKENDS
+
+
+def test_printd_answers_even_when_healthz_itself_raises(printd, monkeypatch):
+    """`/healthz` exists so a wedged printer is visible. An unhandled
+    exception in it closed the connection with no HTTP response at all -
+    so the triage command hung in exactly the case it was written to
+    diagnose."""
+    import urllib.error
+    import urllib.request
+    from mplabel import build
+
+    base, sent, _srv = printd
+
+    def boom():
+        raise RuntimeError("the health check itself is broken")
+
+    monkeypatch.setattr(build, "stamp", boom)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(base + "/healthz", timeout=5)
+    assert exc.value.code == 503
+    assert "RuntimeError" in exc.value.read().decode()
+    assert sent == []
+
+
+def test_printd_refuses_a_job_id_that_is_a_path(printd):
+    """The job id becomes a spool filename and arrives from the wire.
+    Holding the secret is not a licence to choose paths on this host."""
+    base, sent, _srv = printd
+
+    for bad in ("../../etc/passwd", "a/b", "x" * 200, "sp ace"):
+        status, payload = _print_req(base, PDF, job=bad)
+        assert status == 400, bad
+        assert "job id" in payload.get("error", ""), bad
+    assert sent == []
+
+    # The real shapes still work: {code}-{hex} and selftest-{hex}.
+    status, _payload = _print_req(base, PDF, job="W7X-0011223344556677")
+    assert status == 200
+    assert len(sent) == 1
+
+
+def test_send_returns_what_the_backend_said():
+    """It discarded the return value, so `pi-http`'s 409 duplicate came
+    back as {"duplicate": True}, was thrown away, and the caller marked
+    the sale printed - a duplicate recorded as a successful print."""
+    from mplabel import printers
+
+    seen = {}
+
+    def fake(pdf_path, **kw):
+        seen["path"] = pdf_path
+        return {"printed": False, "duplicate": True}
+
+    original = printers.BACKENDS.get("tspl")
+    printers.BACKENDS["tspl"] = fake
+    try:
+        got = printers.send("x.pdf", "tspl")
+    finally:
+        printers.BACKENDS["tspl"] = original
+    assert got == {"printed": False, "duplicate": True}
+    assert seen["path"] == "x.pdf"
+
+
+def test_pi_http_treats_a_non_json_200_as_unreachable(monkeypatch, tmp_path):
+    """A 200 that is not JSON is a proxy answering instead of printd.
+    Left as a bare ValueError it reaches the phone app as a 400 'bad
+    request', blaming the caller for something upstream."""
+    import io
+    import urllib.request
+    from mplabel import printers
+
+    pdf = tmp_path / "l.pdf"
+    pdf.write_bytes(PDF)
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: FakeResponse(b"<html>captive</html>"))
+    with pytest.raises(printers.PrinterUnavailable, match="not JSON"):
+        printers.print_pi_http(str(pdf), url="http://pi:9101", secret="s",
+                               code="W7X")
+
+
+def test_backend_kwargs_survives_a_host_with_no_printer_config():
+    """A host that has never had a printer has no reason to carry
+    printer_dpi, and a KeyError there became a 503 per request inside
+    printd - a daemon failing on a key nobody knew was required."""
+    from mplabel import printers
+
+    cfg = {"printer_backend": "tspl", "printer_device": "/dev/usb/lp0"}
+    kw = printers.backend_kwargs(cfg, "tspl")
+    assert kw["dpi"] == printers.DEFAULT_DPI
+
+
+def test_status_refuses_on_a_host_whose_printer_is_elsewhere(monkeypatch,
+                                                             capsys):
+    """`DEFAULTS` always supplies printer_device, so this queried a node
+    that was not there and printed the "answered no, printing stays
+    at-least-once" finding - a finding-shaped answer about the highest
+    value open experiment in the project, from a machine with no
+    printer."""
+    from mplabel import cli
+
+    cfg = dict(cli.DEFAULTS)
+    cfg["printer_backend"] = "pi-http"
+    with pytest.raises(SystemExit, match="another host"):
+        cli.cmd_status(cfg)
+    assert "answered no" not in capsys.readouterr().out
+
+
+def test_config_says_which_file_and_where_each_value_came_from(
+        tmp_path, monkeypatch, capsys):
+    """Three things decide a value and none is visible from the others:
+    DEFAULTS, the first config file that exists, and MPLABEL_*."""
+    from mplabel import cli
+
+    conf = tmp_path / "mplabel.conf"
+    conf.write_text("[mplabel]\nprinter_backend = pi-http\n"
+                    "printd_secret = topsecretvalue\n", encoding="utf-8")
+    monkeypatch.setenv("MPLABEL_PRINTD_TIMEOUT", "90")
+
+    rows, used = cli.config_sources(str(conf))
+    origin = {k: o for k, _v, o in rows}
+    value = {k: v for k, v, _o in rows}
+    assert used == Path(conf)
+    assert origin["printer_backend"] == "file"
+    assert origin["printd_timeout"] == "env" and value["printd_timeout"] == "90"
+    assert origin["poll_seconds"] == "default"
+
+    monkeypatch.setattr(sys, "argv",
+                        ["mplabel", "-c", str(conf), "config"])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "pi-http" in out
+    assert "topsecretvalue" not in out, "a secret was echoed to the terminal"
+    assert "<set>" in out
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason

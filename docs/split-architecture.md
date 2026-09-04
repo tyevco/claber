@@ -227,7 +227,9 @@ Also here, standalone and off to one side: the **paper-out read experiment** (A2
 **Do not proceed past this phase until item 1 is signed off.** This is the gate.
 
 ### Phase 3 — split over loopback. Nothing moves.
-Add `src/mplabel/printd.py` and the `pi-http` backend. Install `mplabel-printd.service`. In `/etc/mplabel.conf`: `printer_backend = pi-http`, `printd_url = http://127.0.0.1:9101`, a generated `printd_secret`, `printd_bind = 127.0.0.1`.
+Add `src/mplabel/printd.py` and the `pi-http` backend. Install `mplabel-printd.service`. In `/etc/mplabel.conf`: a generated `printd_secret` and `printd_bind = 127.0.0.1`.
+
+**Correction — do not put `printer_backend = pi-http` in that file.** `printd` reads `printer_backend` from the same config, so on the one host that runs both it would print by POSTing to `printd_url`: itself. The inner request finds the gate held, burns the whole deadline and answers 410, which surfaces as `printd said 410` and reads exactly like a busy printer. `printd.serve` now refuses to start rather than allow it. Smoke the client half with a throwaway file instead — `mplabel -c /tmp/orders-loopback.conf test-print` — which is also closer to the two-host arrangement being rehearsed. The tests never caught this because the fixture hands printd and the client separate config dicts, i.e. the tests already modelled two hosts and only this document modelled the broken one.
 Everything is still on the Pi and the phone app is unchanged, but HMAC, HTTP framing, the temp file, the deadline check, the done journal, the lock-as-hard-error, and the 400/409/410/503/500 paths are all now exercised on real orders. Print one label, then a batch of three, and confirm one job still advances exactly one label.
 **Rollback: `printer_backend = tspl`, restart.** This phase is the whole point — it de-risks the split before the split.
 

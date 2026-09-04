@@ -538,7 +538,10 @@ def backend_kwargs(cfg, backend=None, code=None):
     - a print daemon, a test - builds them the same way rather than
     growing a second, drifting copy."""
     backend = backend or cfg["printer_backend"]
-    dpi = int(cfg["printer_dpi"])
+    # `.get` with the module default, not `cfg[...]`: a host that has
+    # never had a printer has no reason to carry printer_dpi, and a
+    # KeyError here becomes a 503 per request inside printd.
+    dpi = int(cfg.get("printer_dpi") or DEFAULT_DPI)
     darkness = int(cfg["printer_darkness"]) if cfg.get("printer_darkness") else None
     head = int(cfg.get("printer_head_dots") or DEFAULT_HEAD_DOTS)
     settle = float(cfg.get("settle_seconds", 2.0))
@@ -670,7 +673,19 @@ def print_pi_http(pdf_path, url=None, secret=None, timeout=45.0, job=None,
         })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
-            return json.loads(res.read() or b"{}")
+            raw = res.read() or b"{}"
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            # A 200 that is not JSON is a proxy or a captive portal
+            # answering instead of printd. Left as a bare ValueError it
+            # reaches the phone app as a 400 "bad request", blaming the
+            # caller for something upstream.
+            raise PrinterUnavailable(
+                f"printd at {url} answered 200 but not JSON ({exc}); "
+                f"something between here and the printer replied instead. "
+                f"The label may or may not have printed - ask it with "
+                f"GET /printed before sending this job again.")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
         try:
@@ -804,7 +819,12 @@ def send(pdf_path, backend="cups-pdf", **kwargs):
     except KeyError:
         raise SystemExit(f"Unknown backend {backend!r}. "
                          f"Choose from: {', '.join(BACKENDS)}")
-    fn(pdf_path, **kwargs)
+    # Return what the backend returned. `pi-http` answers a 409 with
+    # {"duplicate": True} rather than raising, and discarding that meant
+    # `print_label` came back clean and the caller marked the sale
+    # printed - a duplicate recorded as a successful print, which is the
+    # one thing the journal exists to make legible.
+    return fn(pdf_path, **kwargs)
 
 
 # -------------------------------------------------------------------- probe

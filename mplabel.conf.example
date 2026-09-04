@@ -141,6 +141,12 @@ sheets_after_poll = yes
 # cannot attribute to either change.
 
 # On the Pi that has the printer, run: mplabel printd
+#
+# printer_backend on THIS host must be a local one (tspl, zpl, escpos,
+# cups-*). pi-http here would make printd print to itself: the inner
+# request finds the gate held, burns the deadline and answers 410,
+# which reads exactly like a busy printer. printd refuses to start
+# rather than let that happen. pi-http belongs on the orders host.
 printd_bind     = 127.0.0.1
 printd_port     = 9101
 

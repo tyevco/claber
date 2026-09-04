@@ -39,6 +39,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +58,11 @@ DEFAULT_PORT = 9101
 # How many job records to keep. Enough to answer "did that batch print?"
 # long after the fact, small enough that the file stays trivial.
 JOURNAL_KEEP = 5000
+
+# A job id becomes a filename in the spool, so it is checked before
+# it is used as one. Real ids are `{code}-{16 hex}` and
+# `selftest-{hex}`; this is deliberately a little wider than that.
+SAFE_JOB = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
 def sign(secret, job, body):
@@ -140,6 +146,12 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "mplabel-printd"
     sys_version = ""
 
+    # HTTP/1.1 means keep-alive, and without this a caller that opens a
+    # connection and then says nothing holds a thread for ever. There are
+    # only so many threads, and the one that matters is the one left to
+    # answer /healthz while something is wrong.
+    timeout = 30
+
     def log_message(self, fmt, *args):
         log.info("%s %s", self.address_string(), fmt % args)
 
@@ -165,11 +177,21 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     def _check(self, body):
-        """Protocol, then signature. Returns the job id or None (answered)."""
+        """Protocol, then shape, then signature. Job id or None (answered).
+
+        The shape check is not cosmetic: the job id becomes a spool
+        filename below, and it arrives from the wire. A `..` or a `/` in
+        it writes outside the spool directory. Holding the secret is not
+        a licence to choose paths on this host."""
         if self.headers.get("X-MPLabel-Protocol") != PROTOCOL:
             self.fail(400, f"unsupported protocol; this printd speaks {PROTOCOL}")
             return None
         job = self.headers.get("X-MPLabel-Job") or ""
+        if job and not SAFE_JOB.fullmatch(job):
+            log.warning("rejected job %r from %s: unusable id",
+                        job, self.address_string())
+            self.fail(400, "job id must be 1-128 of [A-Za-z0-9._-]")
+            return None
         got = self.headers.get("X-MPLabel-Sig") or ""
         want = sign(self.server.secret, job, body)
         if not job or not hmac.compare_digest(got, want):
@@ -189,12 +211,23 @@ class Handler(BaseHTTPRequestHandler):
     # --- dispatch
 
     def do_GET(self):
+        # Wrapped for the same reason `do_POST` is, and it matters more
+        # here: `/healthz` exists so that a wedged printer is *visible*,
+        # and an unhandled exception in it closes the connection with no
+        # HTTP response at all. The triage command would then hang in
+        # exactly the case it was written to diagnose.
         path = urlparse(self.path).path
-        if path == "/healthz":
-            return self.h_health()
-        if path == "/printed":
-            return self.h_printed()
-        self.fail(404, "no such endpoint")
+        try:
+            if path == "/healthz":
+                return self.h_health()
+            if path == "/printed":
+                return self.h_printed()
+            self.fail(404, "no such endpoint")
+        except BrokenPipeError:
+            log.debug("caller went away")
+        except BaseException as exc:
+            log.exception("%s failed", path)
+            self.fail(503, f"{type(exc).__name__}: {exc}")
 
     def do_HEAD(self):
         self.do_GET()
@@ -370,6 +403,19 @@ class _Device:
 def serve(cfg, bind=None, port=None):
     bind = bind or cfg.get("printd_bind", "127.0.0.1")
     port = int(port or cfg.get("printd_port", DEFAULT_PORT))
+    # A remote backend here means printd prints by POSTing to printd_url -
+    # itself. The inner request finds the gate held, burns the whole
+    # deadline and answers 410, which surfaces as "printd said 410" and
+    # reads exactly like a busy printer. `docs/split-architecture.md`
+    # phase 3 used to instruct precisely this config, and the tests never
+    # caught it because they give printd and the client separate dicts.
+    if cfg.get("printer_backend") in printers.REMOTE_BACKENDS:
+        raise SystemExit(
+            f"printer_backend is {cfg['printer_backend']!r}, which sends "
+            f"jobs to another printd - and this *is* one, so it would "
+            f"print to itself and time out.\nThe host with the printer "
+            f"needs a local backend (tspl, zpl, escpos, cups-pdf, "
+            f"cups-raster). pi-http belongs on the host with the orders.")
     if not cfg.get("printd_secret"):
         raise SystemExit(
             "printd_secret is not set, and this refuses to accept unsigned "
