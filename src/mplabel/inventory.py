@@ -25,7 +25,11 @@ from . import qr
 DOTS_PER_MM = 8
 HEAD_DOTS = 384
 
-DEFAULT_HEIGHT_MM = 30
+# Label size in *reading* orientation - the way round you hold it - as
+# (across, down) millimetres. The printer's own axes are derived from it
+# below, and are not always the same two.
+DEFAULT_LABEL_MM = (48, 30)
+DEFAULT_HEIGHT_MM = 30          # the short axis of the default label
 
 # The label is drawn a little narrower than the head and centred, because
 # the media runs centred under the bar and 48mm stock is not exactly 48mm.
@@ -92,23 +96,74 @@ def _wrap(draw, text, font, max_width, max_lines):
     return lines
 
 
-def _symbol_placement(height, feed_margin, modules, cap=140):
-    """Where a square symbol of `modules` modules goes, and how big.
+def _geometry(label_mm, feed_margin):
+    """Turn a label size into everything the drawing needs.
+
+    The printhead is 384 dots and does not turn, so a label wider than
+    48mm can only be printed with its long axis running down the *feed*.
+    That is not a preference - it is the only orientation the hardware
+    allows, and it is why a 4x1in label is drawn sideways and rotated at
+    the end rather than laid out directly.
+
+    The consequence worth spelling out: after that rotation the feed axis
+    is the reading orientation's **width**, so the feed margin - whose
+    columns the firmware never sends - has to be inset on left and right
+    rather than top and bottom. Insetting the wrong pair puts ink in the
+    dead band, where it is dropped rather than printed small.
+    """
+    w = round(label_mm[0] * DOTS_PER_MM)
+    h = round(label_mm[1] * DOTS_PER_MM)
+    rotate = w > HEAD_DOTS
+    across = h if rotate else w
+    if across > HEAD_DOTS:
+        raise ValueError(
+            f"a {label_mm[0]}x{label_mm[1]}mm label needs {across} dots "
+            f"across the head and it has {HEAD_DOTS}; neither way round "
+            f"fits, so this size cannot be printed on a 48mm head")
+
+    if rotate:
+        left, right = feed_margin + 4, w - feed_margin - 4
+        top, bottom = SIDE_MARGIN_DOTS, h - SIDE_MARGIN_DOTS
+    else:
+        left, right = SIDE_MARGIN_DOTS, w - SIDE_MARGIN_DOTS
+        top, bottom = feed_margin + 4, h - feed_margin - 4
+
+    return {"w": w, "h": h, "rotate": rotate, "across": across,
+            "left": left, "right": right, "top": top, "bottom": bottom,
+            "x_off": (HEAD_DOTS - across) // 2, "rows": w if rotate else h}
+
+
+def _to_raster(box, geom):
+    """A reading-orientation box, in final raster coordinates.
+
+    `Image.rotate(90, expand=True)` turns anticlockwise, so a point
+    (x, y) on a w-wide canvas lands at (y, w - 1 - x). Settled by
+    rotating a marked pixel and looking at where it went, because this is
+    exactly the arithmetic that looks right and is off by a reflection.
+    """
+    x0, y0, x1, y1 = box
+    if geom["rotate"]:
+        x0, y0, x1, y1 = y0, geom["w"] - 1 - x1, y1, geom["w"] - 1 - x0
+    return x0 + geom["x_off"], y0, x1 + geom["x_off"], y1
+
+
+def _symbol_placement(geom, modules, cap=140):
+    """Where a square symbol of `modules` modules goes, in reading
+    coordinates, and how many dots each module gets.
 
     Returns (x0, y0, side_in_dots, dots_per_module). One function owns
     this so that `render_label` and `marker_box` cannot drift: a caller
     cropping a photograph to the wrong rectangle reads the marker at the
     wrong pitch and gets either nothing or, worse, something."""
-    top = feed_margin + 4
-    bottom = height - feed_margin - 4
+    top, bottom = geom["top"], geom["bottom"]
     side = min(bottom - top, cap)
     scale = max(1, side // modules)
     block = modules * scale
-    return (SIDE_MARGIN_DOTS, top + (bottom - top - block) // 2, block, scale)
+    return (geom["left"], top + (bottom - top - block) // 2, block, scale)
 
 
-def marker_box(height_mm=DEFAULT_HEIGHT_MM, feed_margin=None):
-    """The marker's rectangle on the label, in dots: (x0, y0, x1, y1).
+def marker_box(label_mm=DEFAULT_LABEL_MM, feed_margin=None):
+    """The marker's rectangle in the final raster: (x0, y0, x1, y1).
 
     Exposed because reading one back needs a crop that holds the marker
     and not the title beside it - `marker.read_image` locates the grid
@@ -117,14 +172,37 @@ def marker_box(height_mm=DEFAULT_HEIGHT_MM, feed_margin=None):
     from .supvan import DEFAULT_MARGIN_DOTS
     if feed_margin is None:
         feed_margin = DEFAULT_MARGIN_DOTS
+    geom = _geometry(label_mm, feed_margin)
     modules = marker_mod.SIZE + 2 * MARKER_QUIET
-    x0, y0, block, _scale = _symbol_placement(
-        height_mm * DOTS_PER_MM, feed_margin, modules)
-    return x0, y0, x0 + block, y0 + block
+    x0, y0, block, _scale = _symbol_placement(geom, modules)
+    return _to_raster((x0, y0, x0 + block - 1, y0 + block - 1), geom)
+
+
+def media_box(label_mm=DEFAULT_LABEL_MM, feed_margin=None):
+    """Where the label itself sits in the raster: (x0, y0, x1, y1).
+
+    Not the same as the raster. Every printhead line is 384 dots because
+    the bar is, but a 1in-wide label only covers 203 of them and the rest
+    is head hanging off the media. A preview of the whole raster shows
+    those as broad empty margins, which reads as a badly laid out label
+    and is nothing of the sort."""
+    from .supvan import DEFAULT_MARGIN_DOTS
+    if feed_margin is None:
+        feed_margin = DEFAULT_MARGIN_DOTS
+    geom = _geometry(label_mm, feed_margin)
+    return (geom["x_off"], 0,
+            geom["x_off"] + geom["across"] - 1, geom["rows"] - 1)
+
+
+def reads_sideways(label_mm=DEFAULT_LABEL_MM):
+    """Whether this size has to be printed with its long axis down the
+    feed - which is to say, whether the raster is a quarter turn from the
+    way you hold the label."""
+    return round(label_mm[0] * DOTS_PER_MM) > HEAD_DOTS
 
 
 def render_label(code, title=None, price=None, with_qr=False,
-                 height_mm=DEFAULT_HEIGHT_MM, ecl="M", feed_margin=None,
+                 label_mm=DEFAULT_LABEL_MM, ecl="M", feed_margin=None,
                  with_marker=False):
     """Draw one label and return (raster, stride, rows).
 
@@ -132,6 +210,11 @@ def render_label(code, title=None, price=None, with_qr=False,
     convention everywhere else in this codebase; `supvan.build_job`
     repacks it for the printhead. Returning the raster rather than an
     image keeps this function testable without a device or a viewer.
+
+    `label_mm` is (across, down) in the orientation you hold the label,
+    not the printer's. A label wider than the 48mm head is drawn sideways
+    and rotated at the end, because the head does not turn - see
+    `_geometry`.
 
     `feed_margin` is the blank run the firmware feeds at each end of the
     label, and its columns are **not sent** - so anything drawn there is
@@ -145,15 +228,12 @@ def render_label(code, title=None, price=None, with_qr=False,
     if feed_margin is None:
         feed_margin = DEFAULT_MARGIN_DOTS
 
-    width = HEAD_DOTS
-    height = height_mm * DOTS_PER_MM
-    img = Image.new("1", (width, height), 0)      # 0 = no dot
+    geom = _geometry(label_mm, feed_margin)
+    img = Image.new("1", (geom["w"], geom["h"]), 0)   # 0 = no dot
     draw = ImageDraw.Draw(img)
 
-    left = SIDE_MARGIN_DOTS
-    right = width - SIDE_MARGIN_DOTS
-    top = feed_margin + 4
-    bottom = height - feed_margin - 4
+    left, right = geom["left"], geom["right"]
+    top, bottom = geom["top"], geom["bottom"]
 
     if with_marker:
         # The shelf marker carries 20 bits where a QR version 1 carries
@@ -161,8 +241,7 @@ def render_label(code, title=None, price=None, with_qr=False,
         # size is what survives thermal bleed. Squared off to a whole
         # number of dots for the same reason the QR is.
         grid = marker_mod.render(code, quiet=MARKER_QUIET)
-        _x, y0, block, scale = _symbol_placement(
-            height, feed_margin, len(grid))
+        _x, y0, block, scale = _symbol_placement(geom, len(grid))
         for r, row in enumerate(grid):
             for c, cell in enumerate(row):
                 if cell:
@@ -176,8 +255,7 @@ def render_label(code, title=None, price=None, with_qr=False,
         # per module - a fractional module scales into uneven blocks and
         # is the classic reason a printed code will not scan.
         matrix = qr.render(code, ecl=ecl, quiet=2)
-        _x, y0, block, scale = _symbol_placement(
-            height, feed_margin, len(matrix))
+        _x, y0, block, scale = _symbol_placement(geom, len(matrix))
         for r, row in enumerate(matrix):
             for c, cell in enumerate(row):
                 if cell:
@@ -220,8 +298,20 @@ def render_label(code, title=None, price=None, with_qr=False,
         draw.text((right - w, bottom - h), price_text,
                   font=price_font, fill=1)
 
-    stride = (width + 7) // 8
-    return img.tobytes(), stride, height
+    # Sideways until now if the label is wider than the head. Rotate
+    # once, at the end, so every measurement above is in the orientation
+    # a person reads.
+    if geom["rotate"]:
+        img = img.rotate(90, expand=True)
+
+    # The media runs centred under a fixed 384-dot bar, so a narrower
+    # label is centred in a head-width raster rather than pushed left.
+    # Every printhead line is still 48 bytes; `build_job` needs that.
+    canvas = Image.new("1", (HEAD_DOTS, geom["rows"]), 0)
+    canvas.paste(img, (geom["x_off"], 0))
+
+    stride = HEAD_DOTS // 8
+    return canvas.tobytes(), stride, geom["rows"]
 
 
 def to_image(raster, stride, rows, scale=1):
