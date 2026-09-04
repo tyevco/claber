@@ -597,7 +597,7 @@ def build_print_buffer(image_data, per_line_byte, cols_in_buf,
         [10:12] margin bottom
         [12]    red density
         [13]    0
-        [14:]   image data, column-major LSB-first
+        [14:]   image data, column-major, each line's bytes last-first
 
     A "column" is one printhead line - one firing of the 384-dot bar -
     so the column count runs along the feed direction and `per_line_byte`

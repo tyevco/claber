@@ -370,6 +370,133 @@ def render_label(code, title=None, price=None, with_qr=False,
     return canvas.tobytes(), stride, geom["rows"]
 
 
+# Ruler spacing, in dots. 8 dots is 1mm on this head, so a minor tick is a
+# millimetre and a numbered one is a centimetre.
+RULER_MINOR = 8
+RULER_MAJOR = 40
+RULER_LABEL = 80
+
+
+def render_ruler(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM):
+    """Draw a calibration target and return (raster, stride, rows).
+
+    Answers, off one label, the things no amount of unit testing can:
+
+      - **how wide the print really is.** The head is 384 dots on paper
+        and the media is not exactly 48mm; the across-head scale runs to
+        the last dot, so whichever tick is the last one visible is the
+        answer.
+      - **how far down the feed it really goes**, the same way.
+      - **which end of the label is fed first.** The feed arrow and the
+        `0,0` block sit at the origin corner and nowhere else, so the
+        origin is wherever they came out.
+      - **whether the line order is still right.** Nothing here is
+        symmetric in either axis, so a mirror or a flip is visible at a
+        glance rather than something you have to measure for.
+
+    Deliberately drawn in **device coordinates** - full head width, no
+    side margin, no rotation - unlike `render_label`, which centres a
+    label of a given size under the head. A calibration target that had
+    been centred and rotated first would be measuring this module's
+    arithmetic rather than the printer.
+    """
+    from PIL import Image, ImageDraw
+
+    if width_dots <= 0 or rows <= 0:
+        raise ValueError("a ruler needs a positive width and height")
+    if width_dots > HEAD_DOTS:
+        raise ValueError(
+            f"{width_dots} dots is wider than the {HEAD_DOTS}-dot head")
+
+    img = Image.new("1", (width_dots, rows), 0)
+    draw = ImageDraw.Draw(img)
+    font = _font(13)
+
+    last_x, last_y = width_dots - 1, rows - 1
+
+    # A one-dot rule along all four edges. A missing side is the whole
+    # point: it means that edge is outside what the printer will burn.
+    draw.line((0, 0, last_x, 0), fill=1)
+    draw.line((0, last_y, last_x, last_y), fill=1)
+    draw.line((0, 0, 0, last_y), fill=1)
+    draw.line((last_x, 0, last_x, last_y), fill=1)
+
+    def scale(length, across):
+        """Ticks hanging off one edge. `across` picks the axis."""
+        for pos in range(0, length, RULER_MINOR):
+            if pos % RULER_LABEL == 0:
+                depth, label = 17, str(pos)
+            elif pos % RULER_MAJOR == 0:
+                depth, label = 11, None
+            else:
+                depth, label = 5, None
+            if across:
+                draw.line((pos, 1, pos, depth), fill=1)
+                if label and pos:
+                    draw.text((pos + 2, 19), label, font=font, fill=1)
+            else:
+                draw.line((1, pos, depth, pos), fill=1)
+                if label and pos:
+                    draw.text((19, pos - 6), label, font=font, fill=1)
+        # The far end always gets a tick, whatever the spacing lands on:
+        # the last dot is the number being looked for.
+        if across:
+            draw.line((last_x, 1, last_x, 17), fill=1)
+        else:
+            draw.line((1, last_y, 17, last_y), fill=1)
+
+    scale(width_dots, across=True)
+    scale(rows, across=False)
+
+    # The last dot's own number, at the far end of each scale. "Is 383
+    # there?" is the entire width question, and counting ticks back from
+    # an edge that may itself be missing is exactly the sum nobody wants
+    # to be doing while holding a warm label.
+    w_lab = str(last_x)
+    draw.text((last_x - 4 - _text_width(draw, w_lab, font), 19),
+              w_lab, font=font, fill=1)
+    draw.text((19, last_y - 17), str(last_y), font=font, fill=1)
+
+    # Inset comb at the far corner, so a clipped edge can be *measured*
+    # and not just noticed: the ticks stand 0, 8, 16, 24 and 32 dots in
+    # from the corner, and whichever is the first one showing is how much
+    # was lost.
+    for inset in (0, 8, 16, 24, 32):
+        x, y = last_x - inset, last_y - inset
+        if x < 40 or y < 40:
+            continue
+        draw.line((x, y - 30, x, y - 6), fill=1)
+        draw.line((x - 30, y, x - 6, y), fill=1)
+        if inset % 16 == 0:
+            tag = str(inset)
+            draw.text((x - 3 - _text_width(draw, tag, font), y - 51),
+                      tag, font=font, fill=1)
+
+    # Origin marker and feed arrow, both only at 0,0. Put well inside the
+    # scales so they cannot be confused with a tick.
+    ox, oy = 46, 44
+    draw.rectangle((ox, oy, ox + 21, oy + 21), fill=1)
+    draw.text((ox + 27, oy + 3), "0,0", font=font, fill=1)
+
+    ax, ay = ox + 4, oy + 34
+    tip = min(ay + 46, last_y - 4)
+    if tip > ay:
+        draw.line((ax, ay, ax, tip), fill=1)
+        draw.polygon((ax - 7, tip - 11, ax + 7, tip - 11, ax, tip), fill=1)
+        draw.text((ax + 11, ay + 12), "FEED", font=font, fill=1)
+
+    # What was asked for, printed on the thing itself, so a label found
+    # loose in a drawer still says what it was measuring.
+    draw.text((ox, min(oy + 92, last_y - 16)),
+              f"{width_dots}x{rows}", font=font, fill=1)
+
+    stride = (width_dots + 7) // 8
+    if width_dots != stride * 8:
+        canvas = Image.new("1", (stride * 8, rows), 0)
+        canvas.paste(img, (0, 0))
+        img = canvas
+    return img.tobytes(), stride, rows
+
 def to_image(raster, stride, rows, scale=1):
     """A viewable image of a raster, black on white.
 
