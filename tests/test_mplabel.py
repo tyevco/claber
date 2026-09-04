@@ -3091,6 +3091,62 @@ def test_edge_test_goes_through_the_real_print_path(monkeypatch, capsys):
     with pytest.raises(SystemExit, match="measurement"):
         cli.main()
 
+@pytest.mark.parametrize("label_mm", [(48, 30), (101.6, 25.4), (40, 20)])
+@pytest.mark.parametrize("carrier", ["qr", "marker", "plain"])
+def test_label_ink_stays_inside_the_printable_window(label_mm, carrier):
+    """Measured with `--style edges`: the left 40 dots and the right 32
+    never reach the paper on this stock, and the window is not centred.
+
+    This was a symmetric 12-dot guess before, and the cost was real - a
+    QR drawn from x=22 lost its left finder column and would not scan,
+    while looking intact in a photograph. Every carrier and every size
+    has to land inside what actually burns."""
+    from mplabel import inventory
+
+    kw = {"code": "7K2Q", "title": "Antique brass reading lamp",
+          "price": 45.0, "label_mm": label_mm}
+    if carrier == "qr":
+        kw["with_qr"] = True
+    elif carrier == "marker":
+        kw["with_marker"] = True
+
+    raw, stride, rows = inventory.render_label(**kw)
+    xs = [xb * 8 + k for y in range(rows) for xb in range(stride)
+          for k in range(8) if raw[y * stride + xb] & (0x80 >> k)]
+    assert xs, "the label drew nothing"
+
+    lo = inventory.PRINTABLE_LEFT_DOTS
+    hi = inventory.HEAD_DOTS - inventory.PRINTABLE_RIGHT_DOTS - 1
+    assert min(xs) >= lo, f"ink at x={min(xs)}, left of the window at {lo}"
+    assert max(xs) <= hi, f"ink at x={max(xs)}, right of the window at {hi}"
+
+
+def test_printable_window_is_not_assumed_symmetric():
+    """The two insets differ, and that asymmetry is the finding: unequal
+    losses mean the media sits off-centre under the head, where equal
+    ones would have meant the head is simply narrower than the paper.
+    Collapsing them back to one number would re-introduce the bug."""
+    from mplabel import inventory
+
+    assert inventory.PRINTABLE_LEFT_DOTS != inventory.PRINTABLE_RIGHT_DOTS
+    assert inventory.PRINTABLE_DOTS == (
+        inventory.HEAD_DOTS - inventory.PRINTABLE_LEFT_DOTS
+        - inventory.PRINTABLE_RIGHT_DOTS)
+    assert inventory.PRINTABLE_DOTS < inventory.HEAD_DOTS
+
+
+def test_the_measuring_targets_still_use_the_whole_head():
+    """The ruler and the edge test must NOT be inset - they exist to find
+    where the edges are, so they have to be drawn where the edges are."""
+    from mplabel import inventory
+
+    for render in (inventory.render_ruler, inventory.render_edge_test):
+        raw, stride, rows = render(384, 240)
+        xs = [xb * 8 + k for y in range(rows) for xb in range(stride)
+              for k in range(8) if raw[y * stride + xb] & (0x80 >> k)]
+        assert min(xs) == 0, f"{render.__name__} does not reach x=0"
+        assert max(xs) == 383, f"{render.__name__} does not reach x=383"
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason
@@ -4656,8 +4712,14 @@ def test_the_media_band_is_narrower_than_the_raster():
     across = x1 - x0 + 1
     assert across == round(25.4 * inventory.DOTS_PER_MM)
     assert across < inventory.HEAD_DOTS
-    # Centred, because the media runs centred under the bar.
-    assert x0 == (inventory.HEAD_DOTS - across) // 2
+    # Centred in the *printable window*, not in the head. It was centred
+    # in the head, on the reading that the media runs centred under the
+    # bar; the edge test says otherwise - 40 dots lost on the left and 32
+    # on the right, so the window itself is off-centre.
+    assert x0 == (inventory.PRINTABLE_LEFT_DOTS
+                  + (inventory.PRINTABLE_DOTS - across) // 2)
+    assert x0 >= inventory.PRINTABLE_LEFT_DOTS
+    assert x1 <= inventory.HEAD_DOTS - inventory.PRINTABLE_RIGHT_DOTS - 1
 
 
 def test_the_feed_margin_moves_with_the_rotation():
