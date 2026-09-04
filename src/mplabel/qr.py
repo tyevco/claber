@@ -81,61 +81,19 @@ class QRError(ValueError):
 
 # ----------------------------------------------------------- GF(256)
 #
-# Reed-Solomon over the field the QR specification names, generator
-# polynomial x^8 + x^4 + x^3 + x^2 + 1 = 0x11d.
+# The field arithmetic and the Reed-Solomon encoder live in `rs.py`,
+# shared with `marker.py`. This module only ever *makes* error-correction
+# bytes; the marker has to use them, so the decoding half is over there.
 
-_EXP = [0] * 512
-_LOG = [0] * 256
-
-
-def _build_tables():
-    x = 1
-    for i in range(255):
-        _EXP[i] = x
-        _LOG[x] = i
-        x <<= 1
-        if x & 0x100:
-            x ^= 0x11D
-    for i in range(255, 512):
-        _EXP[i] = _EXP[i - 255]
-
-
-_build_tables()
-
-
-def _gf_mul(a, b):
-    if a == 0 or b == 0:
-        return 0
-    return _EXP[_LOG[a] + _LOG[b]]
-
-
-def _rs_generator(degree):
-    """The generator polynomial for `degree` error-correction codewords."""
-    poly = [1]
-    for i in range(degree):
-        # Multiply by (x - alpha^i), which in this field is (x + alpha^i).
-        nxt = [0] * (len(poly) + 1)
-        for j, coef in enumerate(poly):
-            nxt[j] ^= _gf_mul(coef, _EXP[i])
-            nxt[j + 1] ^= coef
-        poly = nxt
-    # Built lowest power first because that is how the multiplication
-    # above falls out; returned highest first, which is how every
-    # published generator table is written and what `_rs_remainder`
-    # below assumes when it drops the leading 1.
-    return poly[::-1]
+from .rs import mul as _gf_mul          # noqa: E402  (kept for tests)
+from .rs import generator as _rs_generator  # noqa: E402
+from .rs import _EXP                    # noqa: E402
+from .rs import encode as rs_encode      # noqa: E402
 
 
 def _rs_remainder(data, degree):
     """The `degree` error-correction codewords for one block."""
-    gen = _rs_generator(degree)
-    rem = [0] * degree
-    for byte in data:
-        factor = byte ^ rem[0]
-        rem = rem[1:] + [0]
-        for i, coef in enumerate(gen[1:]):
-            rem[i] ^= _gf_mul(coef, factor)
-    return rem
+    return list(rs_encode(data, degree))
 
 
 # ------------------------------------------------------------ encoding

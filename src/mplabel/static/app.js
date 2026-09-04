@@ -16,7 +16,8 @@ var S = {
   screen: 'ship', orders: [], pending: [], stats: null, system: null,
   detail: null, sel: [], dry: false, toast: null, undo: null,
   theme: localStorage.getItem('mp-theme') || 'dark',
-  authed: false, loginError: '', busy: false
+  authed: false, loginError: '', busy: false,
+  scan: null   /* {stream, timer, status, code} while the camera is live */
 };
 
 var app = document.getElementById('app');
@@ -277,6 +278,7 @@ function shipView() {
         '<div class="eyebrow">' + esc(new Date().toDateString()) + '</div>' +
         '<div class="title">To ship</div>' +
       '</div>' +
+      '<button class="iconbtn" onclick="startScan()" aria-label="Scan a code">⌗</button>' +
       '<button class="iconbtn" onclick="go(\'settings\')" aria-label="Settings">≡</button>' +
     '</div>' +
     '<div class="chips">' +
@@ -555,6 +557,134 @@ function tabs(active) {
   }).join('') + '</nav>';
 }
 
+/* ----------------------------------------------------------- scanning */
+/*
+ * Reading a shelf marker off a box. The decoder is marker.js, ported
+ * from marker.py; this is only the camera and the aiming rectangle.
+ *
+ * The aiming rectangle is not decoration. marker.js reads a crop that
+ * mostly contains one marker rather than searching a whole frame, so
+ * asking the person to line the code up is what makes the simple
+ * decoder correct instead of a lie. It also means we sample a small
+ * region every frame rather than a full-resolution image, which is what
+ * keeps this usable on an old phone.
+ */
+
+var SCAN_BOX = 0.62;      /* the aiming square, as a fraction of the short side */
+
+function scanView() {
+  var st = S.scan || {};
+  return '<div class="screen scan">' +
+    '<header class="bar"><button class="link" onclick="stopScan()">Close</button>' +
+    '<h1>Scan a code</h1><span></span></header>' +
+    '<div class="viewport">' +
+      '<video id="scanvid" playsinline muted autoplay></video>' +
+      '<div class="reticle"></div>' +
+    '</div>' +
+    '<p class="scanhint">' + esc(st.status || 'Line the square code up inside the frame.') + '</p>' +
+    '<canvas id="scancv" hidden></canvas></div>';
+}
+
+async function startScan() {
+  S.screen = 'scan';
+  S.scan = { status: 'Starting the camera…' };
+  render();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    S.scan.status = 'This browser will not give the page a camera.';
+    return render();
+  }
+  try {
+    /* The rear camera, and as much resolution as it will give: the
+       marker is 12 modules across and every one has to survive being
+       resampled into the crop. */
+    S.scan.stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' },
+               width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+  } catch (e) {
+    S.scan.status = 'No camera: ' + (e && e.name === 'NotAllowedError' ?
+      'permission was refused.' : (e && e.message) || 'unavailable.');
+    return render();
+  }
+  var vid = document.getElementById('scanvid');
+  if (!vid) return stopScan();
+  vid.srcObject = S.scan.stream;
+  try { await vid.play(); } catch (e) {}
+  S.scan.status = 'Looking…';
+  render();
+  S.scan.timer = setInterval(scanTick, 120);
+}
+
+function stopScan() {
+  if (S.scan) {
+    if (S.scan.timer) clearInterval(S.scan.timer);
+    if (S.scan.stream) {
+      S.scan.stream.getTracks().forEach(function (t) { t.stop(); });
+    }
+  }
+  S.scan = null;
+  if (S.screen === 'scan') S.screen = 'ship';
+  render();
+}
+
+function scanTick() {
+  var vid = document.getElementById('scanvid');
+  var cv = document.getElementById('scancv');
+  if (!vid || !cv || !S.scan || vid.readyState < 2) return;
+
+  var vw = vid.videoWidth, vh = vid.videoHeight;
+  if (!vw || !vh) return;
+  var side = Math.floor(Math.min(vw, vh) * SCAN_BOX);
+  cv.width = side; cv.height = side;
+  var ctx = cv.getContext('2d', { willReadFrequently: true });
+  /* Draw only the aimed square, so everything downstream works on the
+     region the person actually lined up. */
+  ctx.drawImage(vid, (vw - side) / 2, (vh - side) / 2, side, side,
+                0, 0, side, side);
+
+  var code;
+  try {
+    code = MK.readImageData(ctx.getImageData(0, 0, side, side), 0, 0, side, side);
+  } catch (e) { code = null; }
+  if (!code) return;
+
+  clearInterval(S.scan.timer);
+  S.scan.timer = null;
+  S.scan.status = 'Read ' + code + ' — looking it up…';
+  render();
+  if (navigator.vibrate) navigator.vibrate(30);
+  lookupCode(code);
+}
+
+async function lookupCode(code) {
+  var found;
+  try {
+    found = await api('/api/lookup/' + encodeURIComponent(code));
+  } catch (e) {
+    /* Not an error worth a dead end: the code read cleanly, it just is
+       not in the database. Say which code, because the next question is
+       always "did it read it wrong?" and now that is answerable. */
+    if (S.scan) {
+      S.scan.status = 'Read ' + code + ', but nothing here is called that.';
+      S.scan.timer = setInterval(scanTick, 120);
+    }
+    return render();
+  }
+  var stream = S.scan && S.scan.stream;
+  if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+  S.scan = null;
+
+  if (found.kind === 'sale') {
+    S.detail = found.detail;
+    S.screen = 'detail';
+  } else {
+    S.screen = 'ship';
+    toast(found.listing.title || found.listing.inventory_code);
+  }
+  render();
+}
+
 /* ---------------------------------------------------------------- shell */
 
 function go(screen) {
@@ -590,6 +720,7 @@ function render() {
   else if (S.screen === 'pending') body = pendingView();
   else if (S.screen === 'profit') body = profitView();
   else if (S.screen === 'settings') body = settingsView();
+  else if (S.screen === 'scan') body = scanView();
   else if (S.screen === 'sourcing') body = soonView('Sourcing',
     'Receipt capture, triage and the cost basis they feed are designed but ' +
     'not built. Until the database can hold what an item cost, this screen ' +

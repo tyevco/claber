@@ -18,6 +18,7 @@ disagree, and `render_label` derives both from the same string rather
 than taking them separately.
 """
 
+from . import marker as marker_mod
 from . import qr
 
 # 8 dots/mm on a 48mm head. Both are the printer's, not ours to choose.
@@ -29,6 +30,9 @@ DEFAULT_HEIGHT_MM = 30
 # The label is drawn a little narrower than the head and centred, because
 # the media runs centred under the bar and 48mm stock is not exactly 48mm.
 SIDE_MARGIN_DOTS = 12
+
+# Quiet modules around the shelf marker, on all four sides.
+MARKER_QUIET = 2
 
 
 def _font(size):
@@ -88,8 +92,40 @@ def _wrap(draw, text, font, max_width, max_lines):
     return lines
 
 
+def _symbol_placement(height, feed_margin, modules, cap=140):
+    """Where a square symbol of `modules` modules goes, and how big.
+
+    Returns (x0, y0, side_in_dots, dots_per_module). One function owns
+    this so that `render_label` and `marker_box` cannot drift: a caller
+    cropping a photograph to the wrong rectangle reads the marker at the
+    wrong pitch and gets either nothing or, worse, something."""
+    top = feed_margin + 4
+    bottom = height - feed_margin - 4
+    side = min(bottom - top, cap)
+    scale = max(1, side // modules)
+    block = modules * scale
+    return (SIDE_MARGIN_DOTS, top + (bottom - top - block) // 2, block, scale)
+
+
+def marker_box(height_mm=DEFAULT_HEIGHT_MM, feed_margin=None):
+    """The marker's rectangle on the label, in dots: (x0, y0, x1, y1).
+
+    Exposed because reading one back needs a crop that holds the marker
+    and not the title beside it - `marker.read_image` locates the grid
+    from the bounding box of the ink, so a crop that catches a letter
+    samples the whole thing at the wrong pitch."""
+    from .supvan import DEFAULT_MARGIN_DOTS
+    if feed_margin is None:
+        feed_margin = DEFAULT_MARGIN_DOTS
+    modules = marker_mod.SIZE + 2 * MARKER_QUIET
+    x0, y0, block, _scale = _symbol_placement(
+        height_mm * DOTS_PER_MM, feed_margin, modules)
+    return x0, y0, x0 + block, y0 + block
+
+
 def render_label(code, title=None, price=None, with_qr=False,
-                 height_mm=DEFAULT_HEIGHT_MM, ecl="M", feed_margin=None):
+                 height_mm=DEFAULT_HEIGHT_MM, ecl="M", feed_margin=None,
+                 with_marker=False):
     """Draw one label and return (raster, stride, rows).
 
     Raster is MSB-first with a set bit meaning a black dot, which is the
@@ -119,15 +155,29 @@ def render_label(code, title=None, price=None, with_qr=False,
     top = feed_margin + 4
     bottom = height - feed_margin - 4
 
-    if with_qr:
+    if with_marker:
+        # The shelf marker carries 20 bits where a QR version 1 carries
+        # 152, so the same square buys far bigger modules - and module
+        # size is what survives thermal bleed. Squared off to a whole
+        # number of dots for the same reason the QR is.
+        grid = marker_mod.render(code, quiet=MARKER_QUIET)
+        _x, y0, block, scale = _symbol_placement(
+            height, feed_margin, len(grid))
+        for r, row in enumerate(grid):
+            for c, cell in enumerate(row):
+                if cell:
+                    draw.rectangle(
+                        [left + c * scale, y0 + r * scale,
+                         left + (c + 1) * scale - 1, y0 + (r + 1) * scale - 1],
+                        fill=1)
+        text_left = left + block + 14
+    elif with_qr:
         # Sized to the space, then rounded down to a whole number of dots
         # per module - a fractional module scales into uneven blocks and
         # is the classic reason a printed code will not scan.
-        side = min(bottom - top, 140)
         matrix = qr.render(code, ecl=ecl, quiet=2)
-        scale = max(1, side // len(matrix))
-        block = len(matrix) * scale
-        y0 = top + (bottom - top - block) // 2
+        _x, y0, block, scale = _symbol_placement(
+            height, feed_margin, len(matrix))
         for r, row in enumerate(matrix):
             for c, cell in enumerate(row):
                 if cell:
@@ -143,7 +193,7 @@ def render_label(code, title=None, price=None, with_qr=False,
 
     # The code, as large as the space allows.
     code_font, _ = _fit(draw, code, _font, text_width,
-                        start=90 if not with_qr else 60)
+                        start=60 if (with_qr or with_marker) else 90)
     code_h = draw.textbbox((0, 0), code, font=code_font)[3]
     draw.text((text_left, top), code, font=code_font, fill=1)
     y = top + code_h + 8
@@ -153,7 +203,7 @@ def render_label(code, title=None, price=None, with_qr=False,
     y += 8
 
     if title:
-        title_font = _font(22 if not with_qr else 18)
+        title_font = _font(18 if (with_qr or with_marker) else 22)
         room = max(1, (bottom - y - (26 if price else 0))
                    // (draw.textbbox((0, 0), "Ay", font=title_font)[3] + 2))
         for line in _wrap(draw, title, title_font, text_width,

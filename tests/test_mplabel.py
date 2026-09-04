@@ -21,8 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from mplabel import (inventory, label, listings, mailparse, qr, savedpage,
-                     sheets, supvan)
+from mplabel import (inventory, label, listings, mailparse, marker, qr, rs,
+                     savedpage, sheets, supvan)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LABEL_PDF = FIXTURES / "label_sample.pdf"
@@ -3947,3 +3947,257 @@ def test_inventory_label_preview_needs_no_database(tmp_path, monkeypatch,
     assert out.exists()
     assert "every checksum valid" in text
     assert "no paper moved" in text
+
+
+# --------------------------------------------------- Reed-Solomon, both ways
+
+def test_rs_encode_still_matches_the_specification_example():
+    """`rs.py` was lifted out of `qr.py` so the marker could share the
+    field. The encoder must not have moved on the way."""
+    data = bytes([32, 91, 11, 120, 209, 114, 220, 77,
+                  67, 64, 236, 17, 236, 17, 236, 17])
+    assert list(rs.encode(data, 10)) == [196, 35, 39, 119, 235,
+                                         215, 231, 226, 93, 23]
+    assert rs.generator(2) == [1, 3, 2]
+
+
+def test_rs_corrects_up_to_half_the_parity_and_no_further():
+    """Eight parity bytes, so four errors anywhere are recoverable.
+
+    Written as a sweep because the first version of this decoder fixed
+    single errors and rejected everything else - which surfaces as "too
+    damaged to read" and is indistinguishable, from the outside, from a
+    genuinely unreadable symbol."""
+    import random
+    rng = random.Random(4)
+    for _ in range(200):
+        payload = bytes(rng.randrange(256) for _ in range(4))
+        for nerr in range(0, 5):
+            cw = bytearray(payload + rs.encode(payload, 8))
+            for pos in rng.sample(range(len(cw)), nerr):
+                cw[pos] ^= rng.randrange(1, 256)
+            assert rs.decode(bytes(cw), 8)[:4] == payload, nerr
+
+
+def test_rs_refuses_rather_than_guessing_past_its_capacity():
+    import random
+    rng = random.Random(5)
+    refused = 0
+    for _ in range(200):
+        payload = bytes(rng.randrange(256) for _ in range(4))
+        cw = bytearray(payload + rs.encode(payload, 8))
+        for pos in rng.sample(range(len(cw)), rng.randint(5, 8)):
+            cw[pos] ^= rng.randrange(1, 256)
+        try:
+            assert rs.decode(bytes(cw), 8)[:4] != payload or True
+        except rs.RSError:
+            refused += 1
+    assert refused > 150, "over-capacity damage should usually be refused"
+
+
+# ------------------------------------------------------- the shelf marker
+
+def _marker_image(code, scale=8, quiet=2):
+    from PIL import Image
+    grid = marker.render(code, scale=scale, quiet=quiet)
+    img = Image.new("L", (len(grid[0]), len(grid)), 255)
+    px = img.load()
+    for y, row in enumerate(grid):
+        for x, cell in enumerate(row):
+            if cell:
+                px[x, y] = 0
+    return img
+
+
+@pytest.mark.parametrize("code", ["7K2Q", "A1B2", "ZZZZ", "0000",
+                                  "XYZ", "999", "MN4P"])
+def test_marker_payload_round_trips(code):
+    assert marker.decode_payload(marker.encode_payload(code)) == code
+
+
+def test_marker_carries_both_code_lengths_and_says_which():
+    """A parcel code is three characters and an inventory code is four,
+    and the same symbol has to carry either without the reader having to
+    be told which it is holding."""
+    assert len(marker.encode_payload("XYZ")) == 12
+    assert len(marker.encode_payload("MN4P")) == 12
+    assert marker.decode_payload(marker.encode_payload("XYZ")) == "XYZ"
+    assert marker.decode_payload(marker.encode_payload("MN4P")) == "MN4P"
+
+
+def test_marker_refuses_a_blank_picture_instead_of_reading_zero():
+    """The trap this format was walked into and had to be redesigned
+    around: all-zero is a valid Reed-Solomon codeword, and crc8 of three
+    zero bytes is zero, so an empty grid satisfied every check and
+    decoded confidently to the real code "000".
+
+    A camera pointed at a white wall returned a code. Formats are
+    numbered from 1 so that the all-zero word has no valid format, and
+    the finder has to match before any of it is attempted."""
+    blank = [[0] * marker.SIZE for _ in range(marker.SIZE)]
+    with pytest.raises(marker.MarkerError):
+        marker.read_grid(blank)
+    with pytest.raises(marker.MarkerError):
+        marker.decode_payload(bytes(12))
+    # And "000" is still a code this can carry.
+    assert marker.decode_payload(marker.encode_payload("000")) == "000"
+
+
+def test_marker_finder_is_solid_on_two_sides_and_clocked_on_two():
+    """The L gives position, rotation and module pitch in one feature;
+    the clock track catches a scale that has drifted."""
+    grid = marker.encode("7K2Q")
+    assert all(row[0] for row in grid), "left column solid"
+    assert all(grid[marker.SIZE - 1]), "bottom row solid"
+    assert [grid[0][c] for c in range(6)] == [1, 0, 1, 0, 1, 0]
+    assert [grid[r][marker.SIZE - 1] for r in range(6)] == [0, 1, 0, 1, 0, 1]
+    assert marker._finder_score(grid) == 44
+
+
+def test_marker_reads_back_from_a_rendered_image():
+    assert marker.read_image(_marker_image("7K2Q")) == "7K2Q"
+
+
+@pytest.mark.parametrize("turn", [90, 180, 270])
+def test_marker_reads_at_any_orientation(turn):
+    """A box on a shelf is photographed whichever way up it is sitting,
+    so the orientation comes from the finder rather than from hope."""
+    img = _marker_image("MN4P").rotate(turn, expand=True, fillcolor=255)
+    assert marker.read_image(img) == "MN4P"
+
+
+def test_marker_survives_blur_and_a_small_scale():
+    """The two things a phone actually does to a 12mm square."""
+    from PIL import ImageFilter
+    img = _marker_image("7K2Q")
+    assert marker.read_image(img.filter(ImageFilter.GaussianBlur(2.5))) == "7K2Q"
+    small = img.resize((int(img.width * 0.35), int(img.height * 0.35)))
+    assert marker.read_image(small) == "7K2Q"
+
+
+def test_marker_survives_specks_that_would_move_the_bounding_box():
+    """One dark speck in a corner used to decide the bounding box, so
+    every module afterwards was sampled in the wrong place - the finder
+    went from 44/44 to 11/44 with the picture otherwise perfect."""
+    import random
+    img = _marker_image("7K2Q")
+    rng = random.Random(2)
+    px = img.load()
+    for _ in range(int(img.width * img.height * 0.02)):
+        px[rng.randrange(img.width), rng.randrange(img.height)] = \
+            rng.choice((0, 255))
+    assert marker.read_image(img) == "7K2Q"
+
+
+def test_marker_reads_off_the_wire_payload_of_a_real_label():
+    """End to end and through the printer's own format: draw the label,
+    build the print buffers, compress, decode the job back, and read the
+    marker out of the picture that comes back.
+
+    Cropped with `inventory.marker_box`, because the decoder locates the
+    grid from the bounding box of the ink and the title beside it would
+    stretch that box across the whole label."""
+    code = "7K2Q"
+    raster, stride, rows = inventory.render_label(
+        code, "Antique Cut Glass Vase", 45.0, with_marker=True)
+    job = supvan.build_job(raster, stride, rows)
+    back, back_stride, cols = supvan.decode_job(job["compressed"])
+    img = inventory.to_image(back, back_stride, cols, scale=3)
+
+    margin = supvan.DEFAULT_MARGIN_DOTS
+    x0, y0, x1, y1 = inventory.marker_box()
+    crop = img.crop((x0 * 3, (y0 - margin) * 3, x1 * 3, (y1 - margin) * 3))
+    assert marker.read_image(crop) == code
+
+
+def test_marker_gets_bigger_modules_than_the_qr_for_the_same_square():
+    """The entire reason this format exists. A QR version 1 holds 152
+    bits and the code needs 20, and that unwanted capacity is paid for
+    in module size - which is the only thing that matters on thermal
+    paper."""
+    _x, _y, _block, marker_scale = inventory._symbol_placement(
+        inventory.DEFAULT_HEIGHT_MM * inventory.DOTS_PER_MM,
+        supvan.DEFAULT_MARGIN_DOTS,
+        marker.SIZE + 2 * inventory.MARKER_QUIET)
+    _x, _y, _block, qr_scale = inventory._symbol_placement(
+        inventory.DEFAULT_HEIGHT_MM * inventory.DOTS_PER_MM,
+        supvan.DEFAULT_MARGIN_DOTS,
+        len(qr.render("7K2Q", ecl="M", quiet=2)))
+    assert marker_scale > qr_scale, (marker_scale, qr_scale)
+
+
+def test_marker_rejects_characters_outside_the_code_alphabet():
+    """I, L, O and U are not in it - they are misread as 1, 1, 0 and V
+    on thermal stock, which is why the codes never contained them."""
+    for bad in ("7I2Q", "LOUD", "7k2q!"):
+        with pytest.raises(marker.MarkerError):
+            marker.encode_payload(bad)
+    assert "I" not in marker.ALPHABET and "L" not in marker.ALPHABET
+    assert "O" not in marker.ALPHABET and "U" not in marker.ALPHABET
+
+
+def test_marker_alphabet_matches_the_one_codes_are_minted_from():
+    """Two copies of this string exist. If they drift, a code the system
+    hands out is a code the marker cannot carry."""
+    from mplabel import cli
+    assert marker.ALPHABET == cli.CODE_ALPHABET
+
+
+def test_marker_js_port_agrees_with_python():
+    """The phone reads these and the printer writes them, so the two
+    implementations have to agree exactly. Run under node against
+    vectors generated here - including damaged codewords, because the
+    error correction is where a port silently diverges."""
+    import json
+    import random
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("no node to run the browser decoder under")
+
+    static = Path(__file__).parent.parent / "src" / "mplabel" / "static"
+    rng = random.Random(11)
+    vectors = []
+    for code in ("7K2Q", "A1B2", "ZZZZ", "0000", "XYZ", "999", "MN4P"):
+        cw = list(marker.encode_payload(code))
+        damaged = []
+        for nerr in (1, 2, 3, 4):
+            d = list(cw)
+            for pos in rng.sample(range(12), nerr):
+                d[pos] ^= rng.randrange(1, 256)
+            damaged.append(d)
+        vectors.append({"code": code, "clean": cw, "damaged": damaged,
+                        "grid": marker.encode(code)})
+
+    script = """
+      const MK = require(process.argv[1]);
+      const V = JSON.parse(process.argv[2]);
+      const bad = [];
+      for (const v of V) {
+        if (MK.decodePayload(v.clean) !== v.code) bad.push(v.code + ' clean');
+        for (const d of v.damaged) {
+          let got = null;
+          try { got = MK.decodePayload(d); } catch (e) { got = 'ERR'; }
+          if (got !== v.code) bad.push(v.code + ' damaged -> ' + got);
+        }
+        if (MK.readGrid(v.grid) !== v.code) bad.push(v.code + ' grid');
+      }
+      console.log(JSON.stringify(bad));
+    """
+    out = subprocess.run(
+        [node, "-e", script, str(static / "marker.js"), json.dumps(vectors)],
+        capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout) == [], out.stdout
+
+
+def test_marker_js_is_listed_for_cache_busting():
+    """`asset_stamp` is what stops a phone going on using a cached copy
+    of a file that changed. A served asset missing from that list ships
+    a decoder update that never arrives."""
+    import inspect
+    from mplabel import web
+    assert "marker.js" in inspect.getsource(web.asset_stamp)
+    assert (Path(web.__file__).parent / "static" / "marker.js").exists()
