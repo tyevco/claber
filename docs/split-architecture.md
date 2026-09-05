@@ -204,8 +204,8 @@ Two more of the same shape: `mplabel selftest` is dispatched **above** `printers
 |---|---|
 | 0 — hygiene | **Done.** One deliberate omission: `print_zpl` got `settle` but not `media`/`gap_in` — ZPL media commands are unverified on any hardware here and that backend has never printed. |
 | 1 — Group A bug fixes | **Done.** The lock is `0666` in `/run/lock` rather than `0660 root:lp`: same goal, without needing root to create it, which a `pi`-user service does not have. |
-| 2 — validate on hardware | **Blocked — needs the printer.** `mplabel status` and `docs/phase2-hardware-checklist.md` are the tooling. **This is the gate.** |
-| 3 — split over loopback | **Code complete, not deployed.** Tested against a fake device only. |
+| 2 — validate on hardware | **Done.** Mostly answered by a week of production parcels rather than by the checklist; three deliberate labels in a row confirmed no creep, and `mplabel status` settled the readback question - the G4 does not answer. |
+| 3 — split over loopback | **Done, on the hardware.** Both printers driven over HTTP from a throwaway client config: a 4x6 label through `/print` and an inventory label through `/print-tag`, both journaled with the right `kind` and `outcome`. The printed 4x6 is indistinguishable from a `tspl` one. |
 | 4 — printd off loopback | **Prerequisites done** (C3, C7, installer). The move itself is a config change, still gated on phase 2. |
 | 5 — order side to k3s | Not started, and not recommended until the phase-5 precondition exists. |
 
@@ -286,7 +286,7 @@ In CLAUDE.md's style. Add these rows when the work lands; do not promote any of 
 | `render_bitmap` has no print-head width check | **Verified** — no such comparison exists anywhere in printers.py. |
 | `probe` runs `sudo lpinfo -v` unconditionally | **Verified** at printers.py:420-422. |
 | `print_lock` falls back to a `PrivateTmp` namespace and only warns | **Verified** at cli.py:464-481 plus `PrivateTmp=true` in the unit. |
-| `printd` HTTP round trip does not perturb the printed output | **ASSUMED.** Verify in Phase 3 by printing the same archived label through `tspl` and through `pi-http` and comparing the paper: same code, same position, same darkness, one die-cut advance. |
+| `printd` HTTP round trip does not perturb the printed output | **Verified on the hardware.** The same label printed through `tspl` and through `pi-http` is indistinguishable on paper - same code, same position, same darkness, one die-cut advance. |
 | Does the G4 answer a TSPL status query? | **Answered: no.** `mplabel status` on the real unit got no reply within 0.5s to either query. A2's ambiguity is therefore irreducible: printing is at-least-once and the journal is the recovery, not a status check. The only thing that could still change this is a retest with the roll *out* - a printer that is silent when healthy and talkative when faulted would be unusual - and it is not worth blocking on. |
 | A wedged `os.write` leaves `/healthz` answering | **ASSUMED.** Verify by holding the lid open mid-job and curling `/healthz` from another host. This is the whole justification for threading `printd`. |
 | The deadline check actually prevents a backlogged late print | **ASSUMED.** Verify by wedging the printer, firing two prints, clearing the wedge, and confirming the second returns 410 and no second label emerges. |
