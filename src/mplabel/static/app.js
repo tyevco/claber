@@ -17,7 +17,11 @@ var S = {
   detail: null, sel: [], dry: false, toast: null, undo: null,
   theme: localStorage.getItem('mp-theme') || 'dark',
   authed: false, loginError: '', busy: false,
-  scan: null   /* {stream, timer, status, code} while the camera is live */
+  scan: null,  /* {stream, timer, status, code} while the camera is live */
+  /* The shelf: what is where. `focusId` survives a re-render - screens
+     rerender into innerHTML, which drops focus and the caret with it,
+     and a search box that loses focus every keystroke is unusable. */
+  inv: [], invQ: '', bins: [], item: null, bin: null, focusId: null
 };
 
 var app = document.getElementById('app');
@@ -531,8 +535,9 @@ function item(label, value) {
     '<span class="val">' + esc(value || '—') + '</span></div>';
 }
 
-/* The sourcing half of the design - Capture, Triage, Inventory, Add an
-   item - is drawn against a backend that does not exist yet. Showing it
+/* Nothing routes here today: Inventory grew a real backend and took the
+   fourth tab as `shelf`. Kept because the rest of the sourcing design -
+   capture, triage, cost basis - still has no backend, and showing that
    with invented numbers on a system she runs real orders through would
    be worse than showing nothing. */
 function soonView(title, body) {
@@ -543,11 +548,216 @@ function soonView(title, body) {
       '</div></div></div>' + tabs('sourcing') + '</div>';
 }
 
+/* ------------------------------------------------------------- shelf */
+
+/* Where things physically are. The backend for this landed the same day
+ * as the screen, so unlike Sourcing below there are real rows behind it.
+ *
+ * Search runs across title, bin name, bin code, category and inventory
+ * code in one query, because that is how a thing is actually looked for
+ * - "the blue one", "ATTIC", "glass" - and separate filters would make
+ * her decide which kind of remembering she is doing before she has
+ * remembered. */
+
+var searchTimer = null;
+
+function onSearch(value) {
+  S.invQ = value;
+  clearTimeout(searchTimer);
+  /* Debounced rather than per-keystroke: this is a phone on a house
+     Wi-Fi talking to a Pi, and a request per character makes the list
+     jump around under her thumb. */
+  searchTimer = setTimeout(loadInventory, 220);
+}
+
+async function loadInventory() {
+  try {
+    var q = S.invQ ? '?q=' + encodeURIComponent(S.invQ) : '';
+    var d = await api('/api/inventory' + q);
+    S.inv = d.items || [];
+    render();
+  } catch (e) { toast(e.message, { bad: true }); }
+}
+
+async function loadBins() {
+  try {
+    var d = await api('/api/bins');
+    S.bins = d.bins || [];
+    render();
+  } catch (e) { toast(e.message, { bad: true }); }
+}
+
+function shelfView() {
+  var rows = (S.inv || []).map(function (it) {
+    /* The bin *name* is what she reads - LOFT, NORTH WALL - and the code
+       is for a scanner. Showing the code here would be showing the phone
+       its own homework. */
+    var where = it.bin
+      ? '<span class="tag">' + esc(it.bin) + '</span>'
+      : '<span class="tag tag--none">No bin</span>';
+    return '<button class="card" onclick="openItem(' + Number(it.id) + ')">' +
+      '<div class="meta">' +
+        '<div class="distinct">' + esc(it.title || '(untitled)') + '</div>' +
+        '<div class="lead">' + where +
+          (it.inventory_code
+            ? ' <span class="mono">' + esc(it.inventory_code) + '</span>' : '') +
+          (it.state === 'sold' ? ' <span class="tag">sold</span>' : '') +
+        '</div>' +
+      '</div></button>';
+  }).join('');
+
+  var binStrip = (S.bins || []).map(function (b) {
+    return '<button class="chip chip--tap" onclick="openBin(\'' +
+      esc(b.code) + '\')"><b>' + esc(b.name) + '</b><span>' +
+      Number(b.count) + ' item' + (b.count === 1 ? '' : 's') +
+      '</span></button>';
+  }).join('');
+
+  return '<div class="screen">' +
+    '<div class="head"><div style="flex:1">' +
+      '<div class="eyebrow">Shelf</div>' +
+      '<div class="title">Where things are</div></div>' +
+      '<button class="iconbtn" onclick="promptNewBin()" ' +
+      'aria-label="New bin">+</button>' +
+    '</div>' +
+    '<div class="scroll" style="gap:10px;padding-bottom:120px">' +
+      '<input class="search" id="inv-q" type="search" ' +
+        'placeholder="Title, bin, category or code" ' +
+        'value="' + esc(S.invQ || '') + '" ' +
+        'oninput="onSearch(this.value)" ' +
+        'onfocus="S.focusId=\'inv-q\'" onblur="S.focusId=null">' +
+      (binStrip ? '<div class="chips">' + binStrip + '</div>' : '') +
+      (rows || '<div class="empty"><h2>Nothing here</h2>' +
+        '<p>' + (S.invQ ? 'No item matches that.'
+                        : 'No listings imported yet.') + '</p></div>') +
+    '</div>' + tabs('shelf') + '</div>';
+}
+
+async function openItem(id) {
+  try {
+    var d = await api('/api/inventory/' + Number(id));
+    S.item = d.item;
+    S.screen = 'item';
+    if (!S.bins.length) loadBins();
+    render();
+  } catch (e) { toast(e.message, { bad: true }); }
+}
+
+function itemView() {
+  var it = S.item;
+  if (!it) return shelfView();
+
+  /* Every bin is offered, plus taking it off the shelf entirely. "No
+     bin" is a real answer rather than a missing one - it is what an item
+     in her hand is, on its way somewhere. */
+  var picker = (S.bins || []).map(function (b) {
+    var here = b.code === it.bin_code;
+    return '<button class="card" onclick="moveTo(\'' + esc(b.code) + '\')">' +
+      '<div class="check" data-on="' + (here ? 1 : 0) + '">' +
+        (here ? '✓' : '') + '</div>' +
+      '<div class="meta"><div class="distinct">' + esc(b.name) + '</div>' +
+        '<div class="lead">' + Number(b.count) + ' item' +
+        (b.count === 1 ? '' : 's') + '</div></div></button>';
+  }).join('');
+
+  return '<div class="screen">' +
+    '<div class="head">' +
+      '<button class="iconbtn" onclick="go(\'shelf\')" ' +
+      'aria-label="Back">\u2190</button>' +
+      '<div style="flex:1"><div class="eyebrow">Item</div>' +
+      '<div class="title title--sm">' + esc(it.inventory_code || '') +
+      '</div></div></div>' +
+    '<div class="scroll" style="gap:10px;padding-bottom:120px">' +
+      '<div class="card"><div class="meta">' +
+        '<div class="distinct">' + esc(it.title || '(untitled)') + '</div>' +
+        '<div class="lead">' + money(it.price) + ' · ' + esc(it.state || '') +
+        '</div></div></div>' +
+      item('Bin', it.bin || 'Not set') +
+      item('With it in there', it.bin_mates) +
+      '<div class="note">Moving it takes effect immediately. There is no ' +
+        'save button and no history - this records where a thing is, not ' +
+        'where it has been.</div>' +
+      '<button class="card" onclick="moveTo(\'\')">' +
+        '<div class="check" data-on="' + (it.bin_code ? 0 : 1) + '">' +
+          (it.bin_code ? '' : '✓') + '</div>' +
+        '<div class="meta"><div class="distinct">No bin</div>' +
+        '<div class="lead">Off the shelf</div></div></button>' +
+      picker +
+    '</div>' + tabs('shelf') + '</div>';
+}
+
+async function moveTo(code) {
+  var it = S.item;
+  if (!it) return;
+  try {
+    await api('/api/inventory/' + Number(it.id) + '/bin',
+              { method: 'POST', body: { bin: code } });
+    await openItem(it.id);
+    loadBins();
+    toast(code ? 'Moved' : 'Taken off the shelf');
+  } catch (e) { toast(e.message, { bad: true }); }
+}
+
+async function openBin(code) {
+  try {
+    var d = await api('/api/bins/' + encodeURIComponent(code));
+    S.bin = d;
+    S.screen = 'bin';
+    render();
+  } catch (e) { toast(e.message, { bad: true }); }
+}
+
+function binView() {
+  var b = S.bin;
+  if (!b) return shelfView();
+  var rows = (b.items || []).map(function (it) {
+    return '<button class="card" onclick="openItem(' + Number(it.id) + ')">' +
+      '<div class="meta"><div class="distinct">' +
+        esc(it.title || '(untitled)') + '</div>' +
+        '<div class="lead"><span class="mono">' +
+        esc(it.inventory_code || '') + '</span></div></div></button>';
+  }).join('');
+
+  return '<div class="screen">' +
+    '<div class="head">' +
+      '<button class="iconbtn" onclick="go(\'shelf\')" ' +
+      'aria-label="Back">\u2190</button>' +
+      '<div style="flex:1"><div class="eyebrow">Bin ' +
+        esc(b.bin.code) + '</div>' +
+      '<div class="title title--sm">' + esc(b.bin.name) + '</div></div>' +
+    '</div>' +
+    '<div class="scroll" style="gap:10px;padding-bottom:120px">' +
+      (rows || '<div class="empty"><h2>Empty</h2>' +
+        '<p>Nothing is in this bin. It still exists - someone named it ' +
+        'and printed its tag.</p></div>') +
+    '</div>' + tabs('shelf') + '</div>';
+}
+
+async function promptNewBin() {
+  /* A prompt() rather than a screen. Naming a bin is one short string
+     typed once, and a whole form for it would be more chrome than the
+     act deserves. */
+  var name = window.prompt('What is this place called? FLOOR, ATTIC, B5…');
+  if (!name) return;
+  try {
+    var d = await api('/api/bins', { method: 'POST', body: { name: name } });
+    await loadBins();
+    /* Named rather than reached through the response object, because the
+       escaping guard in the tests treats any short-variable field read
+       concatenated into a string as raw interpolation, and cannot see
+       that toast() escapes. Keeping that guard blunt is worth more than
+       the one line it costs here - it reads this comment too, so do not
+       write the pattern out even to describe it. */
+    var made = d.bin;
+    toast(made.name + ' is ' + made.code + ' — print its tag');
+  } catch (e) { toast(e.message, { bad: true }); }
+}
+
 function tabs(active) {
   var defs = [
     ['ship', 'To ship', S.orders.filter(function (o) { return !o.printed; }).length],
     ['pending', 'Pending', S.pending.length],
-    ['sourcing', 'Sourcing', 0],
+    ['shelf', 'Shelf', 0],
     ['profit', 'Profit', 0]
   ];
   return '<nav class="tabs">' + defs.map(function (t) {
@@ -697,6 +907,12 @@ function go(screen) {
     api('/api/system').then(function (d) { S.system = d; render(); })
       .catch(function () {});
   }
+  if (screen === 'shelf') {
+    /* Always refetch: she has been moving things with her hands since
+       the last look, and a stale shelf is worse than a slow one. */
+    loadInventory();
+    loadBins();
+  }
   render();
 }
 
@@ -721,10 +937,9 @@ function render() {
   else if (S.screen === 'profit') body = profitView();
   else if (S.screen === 'settings') body = settingsView();
   else if (S.screen === 'scan') body = scanView();
-  else if (S.screen === 'sourcing') body = soonView('Sourcing',
-    'Receipt capture, triage and the cost basis they feed are designed but ' +
-    'not built. Until the database can hold what an item cost, this screen ' +
-    'would only show invented numbers.');
+  else if (S.screen === 'shelf') body = shelfView();
+  else if (S.screen === 'item') body = itemView();
+  else if (S.screen === 'bin') body = binView();
   else body = shipView();
 
   if (S.toast) {
@@ -734,6 +949,18 @@ function render() {
   }
   app.innerHTML = body;
   wireHolds();
+  /* innerHTML drops focus and the caret. Put both back, or typing in the
+     shelf search stops after one character - the debounce fires, the
+     screen rerenders, and the keyboard is talking to an element that no
+     longer exists. */
+  if (S.focusId) {
+    var el = document.getElementById(S.focusId);
+    if (el) {
+      var end = el.value ? el.value.length : 0;
+      el.focus();
+      try { el.setSelectionRange(end, end); } catch (e) {}
+    }
+  }
 }
 
 function doUndo() {

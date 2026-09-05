@@ -129,6 +129,40 @@ a { color: var(--ac); }
 .chip--alert b, .chip--alert span { color: var(--al); }
 .chip--money b { color: var(--ac); }
 
+/* ------------------------------------------------------------- shelf */
+
+/* A tappable stat chip. Same box as .chip so the bin strip matches the
+   numbers above the queue; the reset is only because it is a <button>. */
+.chip--tap {
+  appearance: none; cursor: pointer; text-align: left;
+  font: inherit; color: inherit;
+}
+.chip--tap:active { background: var(--bd); }
+
+/* An inline label, not a stat block: this one sits in a line of text
+   saying where a thing is, so it is a pill rather than a card. */
+.tag {
+  display: inline-block; padding: 2px 7px; border-radius: 6px;
+  background: var(--rai); border: 1px solid var(--bd);
+  font-size: 10.5px; font-weight: 600; letter-spacing: .01em;
+  vertical-align: baseline;
+}
+/* "No bin" is a real state, not a missing value - it is what a thing in
+   her hand is on its way somewhere. Muted, but present. */
+.tag--none { background: transparent; color: var(--mut); font-weight: 500; }
+
+.search {
+  flex: none; width: 100%; box-sizing: border-box;
+  padding: 12px 14px; border-radius: 12px;
+  border: 1px solid var(--bd); background: var(--rai); color: inherit;
+  font: inherit; font-size: 16px;   /* 16px or iOS zooms the page on focus */
+  -webkit-appearance: none;
+}
+.search::placeholder { color: var(--mut); }
+.search:focus { outline: 2px solid var(--ac); outline-offset: -1px; }
+
+.mono { font-family: var(--mv-font-mono); font-size: 11px; color: var(--mut); }
+
 /* --------------------------------------------------------- queue rows */
 
 .row { display: flex; gap: 7px; align-items: stretch; }

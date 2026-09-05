@@ -1910,6 +1910,58 @@ def test_the_app_shell_is_served(app):
         assert needle in body, path
 
 
+def test_every_endpoint_the_client_calls_exists_on_the_server():
+    """The two halves ship together and there is no build step, so a
+    renamed route fails silently on a phone that has already cached the
+    old JavaScript - it is a screen that stays empty, not an error
+    anyone sees. Cheap to pin: read the paths out of app.js and check
+    the routing table answers each one."""
+    import re as _re
+
+    from mplabel import web
+
+    js = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
+          / "app.js").read_text(encoding="utf-8")
+
+    # `api('/api/thing/' + id + '/bin')` -> the literal head is enough to
+    # find the route; the variable parts are what the regexes match.
+    called = {m.rstrip("/") for m in
+              _re.findall(r"api\('(/api/[a-z0-9/_-]*)", js)}
+    assert called, "no API calls found - has the helper been renamed?"
+
+    for path in sorted(called):
+        probe = path
+        # Stand in for whatever the client concatenates on.
+        if path.rstrip("/") in ("/api/orders", "/api/inventory", "/api/bins",
+                                "/api/lookup"):
+            candidates = [path, path + "/1", path + "/AAA", path + "/1/bin"]
+        else:
+            candidates = [probe]
+        assert any(
+            any(rx.match(c) for _m, rx, _h, _a in web.Handler._COMPILED)
+            for c in candidates), f"app.js calls {path}, which no route serves"
+
+
+def test_the_shelf_tab_is_wired_to_a_backend_that_exists():
+    """It replaced a `soonView` placeholder the day its API landed. The
+    thing that would quietly undo that is the tab pointing at a screen
+    name nothing renders - the tab bar highlights, the body falls
+    through to the queue, and it reads as a tap that did not register."""
+    js = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
+          / "app.js").read_text(encoding="utf-8")
+
+    assert "['shelf', 'Shelf'" in js, "no Shelf tab in the tab bar"
+    for screen, fn in (("shelf", "shelfView"), ("item", "itemView"),
+                       ("bin", "binView")):
+        assert f"S.screen === '{screen}'" in js, f"nothing renders '{screen}'"
+        assert f"function {fn}(" in js, f"{fn} is missing"
+
+    # The search box rerenders the screen on every keystroke, and
+    # innerHTML drops focus with it. Without the restore, typing stops
+    # after one character - which looks like a broken keyboard.
+    assert "S.focusId" in js, "the search box will lose focus on rerender"
+
+
 def test_the_client_escapes_what_facebook_sends():
     """Item titles come from Marketplace listings, so their text is chosen
     by someone else. app.js must route every one through esc()."""
