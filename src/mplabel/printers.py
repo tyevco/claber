@@ -1041,11 +1041,28 @@ def printd_printed(cfg, since=None, timeout=10.0):
     url = cfg.get("printd_url")
     if not url:
         raise PrinterUnavailable("printd_url is not set")
-    q = "?" + urllib.parse.urlencode({"since": since}) if since else ""
+    query = urllib.parse.urlencode({"since": since}) if since else ""
+    # Signed like a print is. A GET has no body, so the query string
+    # stands in its place - it is the only caller-controlled part of the
+    # request, and leaving this open hands out live parcel codes.
+    job = f"printed-{os.urandom(8).hex()}"
+    req = urllib.request.Request(
+        url.rstrip("/") + "/printed" + (f"?{query}" if query else ""),
+        headers={
+            "X-MPLabel-Protocol": "1",
+            "X-MPLabel-Job": job,
+            "X-MPLabel-Sig": _sign_job(cfg.get("printd_secret"), job,
+                                       query.encode()),
+        })
     try:
-        with urllib.request.urlopen(url.rstrip("/") + "/printed" + q,
-                                    timeout=timeout) as res:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
             return json.loads(res.read() or b"{}").get("printed", [])
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise PrinterUnavailable(
+                f"printd at {url} rejected the signature on /printed - the "
+                f"printd_secret here does not match the one there")
+        raise PrinterUnavailable(f"printd said {exc.code} to /printed")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise PrinterUnavailable(f"could not reach printd at {url}: {exc}")
 

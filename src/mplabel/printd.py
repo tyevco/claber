@@ -208,6 +208,13 @@ class Handler(BaseHTTPRequestHandler):
         filename below, and it arrives from the wire. A `..` or a `/` in
         it writes outside the spool directory. Holding the secret is not
         a licence to choose paths on this host."""
+        # No mplabel headers at all is not a protocol mismatch, it is an
+        # unsigned request - most likely a browser or a curl. Saying
+        # "unsupported protocol; this printd speaks 1" to that sends the
+        # reader looking for a version problem they do not have.
+        if not self.headers.get("X-MPLabel-Protocol")                 and not self.headers.get("X-MPLabel-Sig"):
+            self.fail(401, "this endpoint needs a signed request")
+            return None
         if self.headers.get("X-MPLabel-Protocol") != PROTOCOL:
             self.fail(400, f"unsupported protocol; this printd speaks {PROTOCOL}")
             return None
@@ -341,7 +348,21 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def h_printed(self):
-        qs = parse_qs(urlparse(self.path).query)
+        """The done journal. Signed, unlike /healthz.
+
+        Job ids are `{code}-{hex}`, so an open endpoint here hands out
+        live parcel codes - and a parcel code is a handle: `mplabel
+        reprint <code>` and `mplabel ship <code>` both take one. Harmless
+        on loopback and not harmless the moment printd is on a network.
+
+        A GET has no body, so the signature covers the **query string**
+        in the body's place. `sign` is unchanged: it hashes whatever it
+        is given, and what it is given here is the only caller-controlled
+        part of the request."""
+        query = urlparse(self.path).query
+        if self._check(query.encode()) is None:
+            return
+        qs = parse_qs(query)
         after = (qs.get("since") or [None])[0]
         self._send(200, {"printed": self.server.journal.since(after)})
 

@@ -153,6 +153,9 @@ printd_port     = 9101
 # Both sides need the SAME secret. printd refuses to start without one
 # rather than accept unsigned jobs - a print request is a physical action.
 #   python3 -c "import secrets; print(secrets.token_hex(32))"
+# Both /print and /printed are signed with it. /healthz is not - it is
+# the triage endpoint and has to answer when everything else is
+# wrong, so it says nothing about any order.
 printd_secret   =
 
 # Spool and the done journal. Defaults to <home>/printd.

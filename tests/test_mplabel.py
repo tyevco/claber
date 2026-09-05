@@ -3694,6 +3694,94 @@ def test_a_dry_run_takes_no_device_lock_at_all(printd, monkeypatch):
     assert status == 200, result
     assert taken == []
 
+def test_printed_is_signed_because_it_enumerates_parcel_codes(printd):
+    """Job ids are `{code}-{hex}`, so an open journal hands out live
+    parcel codes - and a parcel code is a handle: `mplabel reprint
+    <code>` and `mplabel ship <code>` both take one. Harmless on
+    loopback, not harmless the moment printd is on a network."""
+    import urllib.error
+    import urllib.request
+    from mplabel import printd as printd_mod
+
+    base, _sent, srv = printd
+    srv.journal.record("W7X-aaaabbbbccccdddd", 10, "d" * 64)
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(f"{base}/printed", timeout=5)
+    assert exc.value.code == 401
+    assert "W7X" not in exc.value.read().decode()
+
+    # And a wrong secret is refused rather than answered.
+    job = "printed-0011223344556677"
+    bad = urllib.request.Request(f"{base}/printed", headers={
+        "X-MPLabel-Protocol": "1", "X-MPLabel-Job": job,
+        "X-MPLabel-Sig": printd_mod.sign("wrong", job, b"")})
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(bad, timeout=5)
+    assert exc.value.code == 401
+
+
+def test_a_signed_printed_request_still_works(printd):
+    """Including the query string, which the signature covers in the
+    body's place - a GET has no body, and the query is the only
+    caller-controlled part of the request."""
+    import urllib.request
+    from mplabel import printd as printd_mod
+
+    base, _sent, srv = printd
+    srv.journal.record("AAA-1111", 10, "a" * 64)
+    srv.journal.record("BBB-2222", 10, "b" * 64)
+
+    def ask(query):
+        job = "printed-0011223344556677"
+        req = urllib.request.Request(
+            f"{base}/printed" + (f"?{query}" if query else ""),
+            headers={"X-MPLabel-Protocol": "1", "X-MPLabel-Job": job,
+                     "X-MPLabel-Sig": printd_mod.sign("s3cret", job,
+                                                      query.encode())})
+        with urllib.request.urlopen(req, timeout=5) as res:
+            return json.loads(res.read())["printed"]
+
+    assert [r["job"] for r in ask("")] == ["AAA-1111", "BBB-2222"]
+    assert [r["job"] for r in ask("since=AAA-1111")] == ["BBB-2222"]
+
+
+def test_healthz_stays_open(printd):
+    """It is the triage endpoint. It must answer when everything else is
+    wrong, including when the secret is wrong, and it says nothing about
+    any order."""
+    import urllib.request
+
+    base, _sent, _srv = printd
+    with urllib.request.urlopen(f"{base}/healthz", timeout=5) as res:
+        payload = json.loads(res.read())
+    assert payload["ok"] is True
+    # Not a bare substring sweep: `media_tracking` is a printer setting
+    # and would trip a search for "tracking". What must not be here is
+    # anything about an order or a credential.
+    blob = json.dumps(payload).lower()
+    for leak in ("buyer", "ship_to", "secret", "printd_secret", "9400"):
+        assert leak not in blob
+    assert "printed" not in payload, "the journal does not belong on an open endpoint"
+
+
+def test_the_reconcile_client_signs_and_says_so_when_it_cannot(printd,
+                                                               monkeypatch):
+    """`printd_printed` is what `mplabel reconcile` calls. A mismatched
+    secret has to say *that*, not 'could not reach' - the two look
+    identical from the command line and lead opposite ways."""
+    from mplabel import printers
+
+    base, _sent, srv = printd
+    srv.journal.record("W7X-aaaa", 10, "d" * 64)
+
+    cfg = {"printd_url": base, "printd_secret": "s3cret"}
+    assert [r["job"] for r in printers.printd_printed(cfg)] == ["W7X-aaaa"]
+
+    cfg["printd_secret"] = "not-the-one"
+    with pytest.raises(printers.PrinterUnavailable, match="does not match"):
+        printers.printd_printed(cfg)
+
 def test_the_two_endpoints_refuse_each_others_bodies(printd):
     """kind rides inside the signed body, so routing cannot be moved by
     an unsigned header. Cross-posting then fails on body validation
