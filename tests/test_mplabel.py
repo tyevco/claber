@@ -3347,6 +3347,32 @@ def test_the_feed_length_is_reported_before_anything_prints(monkeypatch,
 
 # --- phase 1: correctness fixes the wire would amplify -------------------
 
+def test_a_config_refusal_exits_so_systemd_stops_retrying(tmp_path, capsys):
+    """`Restart=always` plus a permanent config error is a unit that flaps
+    every ten seconds for ever. Observed at restart counter 11, with the
+    one line saying what was wrong buried under systemd noise - the
+    opposite of what a refusal is for.
+
+    78 is EX_CONFIG, paired with RestartPreventExitStatus in the unit."""
+    from mplabel import cli, printd as printd_mod
+
+    cfg = dict(cli.DEFAULTS, printd_secret="", home=str(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        printd_mod.serve(cfg)
+    assert exc.value.code == printd_mod.EX_CONFIG == 78
+    assert "printd_secret is not set" in capsys.readouterr().err
+
+    cfg = dict(cli.DEFAULTS, printd_secret="s" * 8, home=str(tmp_path),
+               printer_backend="pi-http")
+    with pytest.raises(SystemExit) as exc:
+        printd_mod.serve(cfg)
+    assert exc.value.code == 78
+
+    unit = (Path(__file__).parent.parent / "systemd"
+            / "mplabel-printd.service").read_text()
+    assert "RestartPreventExitStatus=78" in unit,         "the exit code is only half of it; the unit has to honour it"
+
+
 def test_printd_refuses_to_print_to_itself(tmp_path):
     """`printer_backend = pi-http` on the printd host makes printd POST to
     printd_url - itself. The inner request finds the gate held, burns the
@@ -3362,8 +3388,9 @@ def test_printd_refuses_to_print_to_itself(tmp_path):
     cfg.update({"printd_secret": "s" * 8, "home": str(tmp_path),
                 "printer_backend": "pi-http",
                 "printd_url": "http://127.0.0.1:9101"})
-    with pytest.raises(SystemExit, match="print to itself"):
+    with pytest.raises(SystemExit) as exc:
         printd_mod.serve(cfg)
+    assert exc.value.code == printd_mod.EX_CONFIG
 
     # A local backend still starts far enough to bind, so the guard is
     # not just rejecting everything.

@@ -338,6 +338,16 @@ commands now print the feed length **in millimetres**, because that is
 the number that has to match the paper, and the default is the stock that
 is actually loaded.
 
+**A configuration refusal must not be retried.** `printd` will not start
+without `printd_secret` - a print request is a physical action and it
+will not accept unsigned jobs - but `Restart=always` turned that into a
+unit flapping every ten seconds for ever, with the one line saying what
+was wrong buried under systemd noise. Observed at restart counter 11.
+Config refusals now exit **78** (`EX_CONFIG`), and the unit carries
+`RestartPreventExitStatus=78`, so a permanent error stays dead where it
+can be seen. Both halves are needed: the exit code alone does nothing
+without the unit honouring it, and a test asserts the unit still does.
+
 **The G4 is write-only, so `printd` must never claim a print it cannot
 confirm.** No readback means no paper-out pre-check and no way to tell a
 timed-out request from a printed label. Everything downstream follows

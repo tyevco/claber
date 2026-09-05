@@ -11,6 +11,11 @@ WorkingDirectory=/opt/mplabel
 ExecStart=/opt/mplabel/venv/bin/python -m mplabel printd
 Restart=always
 RestartSec=10
+# A configuration refusal is permanent: the next start reads the same
+# file and reaches the same conclusion. Without this the unit flaps
+# every ten seconds for ever and buries the one line saying what is
+# wrong. 78 is EX_CONFIG, raised by printd._refuse.
+RestartPreventExitStatus=78
 
 # printd_secret belongs here or in /etc/mplabel.conf, not in the unit.
 EnvironmentFile=-/etc/mplabel.env

@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,6 +71,15 @@ SAFE_JOB = re.compile(r"[A-Za-z0-9._-]{1,128}")
 # restarted.
 ENDPOINTS = ("/healthz", "/printed", "/tag-status", "/print",
              "/print-tag", "/selftest")
+
+# sysexits.h EX_CONFIG. A configuration refusal is permanent - the
+# next restart in ten seconds will read the same file and reach the
+# same conclusion - so the unit pairs this with
+# RestartPreventExitStatus and stays dead where it can be seen.
+# Flapping buries the one line that says what is wrong under an
+# endless scroll of systemd noise, which is the opposite of what a
+# refusal is for.
+EX_CONFIG = 78
 
 
 def sign(secret, job, body):
@@ -586,6 +596,12 @@ class _Device:
         return False
 
 
+def _refuse(message):
+    """Say why, once, and exit in a way systemd will not retry."""
+    print(message, file=sys.stderr)
+    raise SystemExit(EX_CONFIG)
+
+
 def serve(cfg, bind=None, port=None):
     bind = bind or cfg.get("printd_bind", "127.0.0.1")
     port = int(port or cfg.get("printd_port", DEFAULT_PORT))
@@ -596,14 +612,14 @@ def serve(cfg, bind=None, port=None):
     # phase 3 used to instruct precisely this config, and the tests never
     # caught it because they give printd and the client separate dicts.
     if cfg.get("printer_backend") in printers.REMOTE_BACKENDS:
-        raise SystemExit(
+        return _refuse(
             f"printer_backend is {cfg['printer_backend']!r}, which sends "
             f"jobs to another printd - and this *is* one, so it would "
             f"print to itself and time out.\nThe host with the printer "
             f"needs a local backend (tspl, zpl, escpos, cups-pdf, "
             f"cups-raster). pi-http belongs on the host with the orders.")
     if not cfg.get("printd_secret"):
-        raise SystemExit(
+        return _refuse(
             "printd_secret is not set, and this refuses to accept unsigned "
             "print jobs.\nGenerate one with `python3 -c \"import secrets; "
             "print(secrets.token_hex(32))\"` and put the same value in the "
