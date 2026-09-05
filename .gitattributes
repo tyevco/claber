@@ -1,0 +1,8 @@
+# Anything the Pi executes or parses must arrive with LF endings,
+# whatever the machine that edited it. A shell script checked out with
+# CRLF fails as `bad interpreter: /bin/bash^M`, and a systemd unit picks
+# up a trailing \r on every value - ExecStart included. Both present as
+# a file that looks perfect when you cat it.
+*.sh        text eol=lf
+*.service   text eol=lf
+*.rules     text eol=lf
