@@ -70,6 +70,7 @@ run against a real database.
 | Database only | |
 |---|---|
 | `list` / `stats` / `ship <ref>` | outstanding orders, analytics, mark shipped |
+| `bin new\|ls\|show\|rename\|put\|rm` | the places things live. `new` mints the code and `--print` puts its tag on the shelf; `put` takes the 4-char inventory code off the item's own label |
 | `cancel <ref>` | the buyer pulled out; not a sale, and the parcel code is freed |
 | `verify` | do archived labels still match their sales |
 | `import <path> --format dyi\|csv\|saved [--state ...]` | listings from a file |
@@ -146,9 +147,25 @@ install_pi.sh     Pi bootstrap
 ## Data model
 
 One SQLite file, two schemas declared in two modules: `cli.SCHEMA`
-owns `sales`; `listings.SCHEMA` owns `listings` and `mail_events`.
-Nothing joins them at write time - `listings.link_sales()` reconciles
-afterwards.
+owns `sales`; `listings.SCHEMA` owns `listings`, `mail_events` and
+`bins`. Nothing joins `sales` to `listings` at write time -
+`listings.link_sales()` reconciles afterwards.
+
+**One foreign key, deliberately, and `PRAGMA foreign_keys=ON` in
+`connect_db` so it is a constraint rather than a comment.** The key is
+`listings.bin_code -> bins.code`, and it is there because a bin's
+identity is *minted by this system*: there is a real key to point at.
+`sales -> listings` has no key and gets none - a saved-page import
+carries no Facebook listing id at all, so an FK there would mean
+inventing a key the source data does not have, which is exactly the
+failure `title_key` exists to avoid. Normalise where there is a genuine
+key; do not pretend elsewhere.
+
+Note the pragma is per *connection* and off by default. Anything that
+opens the database without it - a test fixture, a one-off script - runs
+against a schema where `REFERENCES` does nothing, and a dangling-bin bug
+would pass there and fail on the Pi. The `db` fixture sets it for that
+reason.
 
 **Reconciliation is by title as often as by id.** A saved-page import has
 no Facebook listing id to work with (the cards do not carry one), and
@@ -166,7 +183,7 @@ one, quietly shrinking the denominator sell-through is measured against.
 
 **An index on a migrated column needs one too.** `executescript(SCHEMA)`
 runs *before* the `ALTER TABLE` loop, so a `CREATE INDEX ... ON
-listings(bin)` sitting in `SCHEMA` fails on any database that predates
+listings(bin_code)` sitting in `SCHEMA` fails on any database that predates
 the column - and it fails inside `connect_db`, so it takes down every
 command rather than just the new feature. `listings.POST_MIGRATION_INDEXES`
 runs after the loop. Caught by the migration test, which is why that test
@@ -469,14 +486,27 @@ the drawing is a marker that reads as noise however good the decoder is.
 the raster's row `margin_top` - indexing it in raster coordinates reads
 eight rows low and looks like a marker that does not match.
 
-**Two codes, two lifetimes - do not merge them.** The **parcel** code
-(`sales.code`, 3 chars) is about the boxes waiting to go out, so it is
-released for reuse the moment a parcel ships. The **inventory** code
+**Three codes, three lifetimes - do not merge them.** The **parcel**
+code (`sales.code`, 3 chars) is about the boxes waiting to go out, so it
+is released for reuse the moment a parcel ships. The **inventory** code
 (`listings.inventory_code`, 4 chars) is stuck to a thing on a shelf and is
 never reused, including after the item sells - recycling it would leave the
-label on a box in the loft naming something else. Same alphabet, different
-rules; `ensure_inventory_codes` deliberately does not scope its `taken` set
-by state, where `allocate_code` deliberately does.
+label on a box in the loft naming something else. The **bin** code
+(`bins.code`, 3 chars) is on a tag stuck to the shelf itself and follows
+the inventory rule: `allocate_bin_code` checks against every bin *ever*,
+not the ones in use, because the tag outlives the row. Same alphabet,
+three sets of rules; `ensure_inventory_codes` and `allocate_bin_code`
+deliberately do not scope their `taken` set by state, where
+`allocate_code` deliberately does.
+
+A bin is a **name and a code**, and the split is the design. The name -
+`FLOOR`, `ATTIC`, `LOFT, NORTH WALL` - is read across a room and can
+change; the code is what the tag carries and a phone reads. `rename_bin`
+leaves the code alone, so renaming a shelf does not mean reprinting its
+tag, and everything in the bin follows the new name for free because the
+listings reference the code. Deleting a bin is `ON DELETE SET NULL`, not
+a cascade: the shelf being cleared is the reason the things exist, so
+they come back out onto no shelf rather than going with it.
 
 **The device can stop answering entirely, mid-job.** After the last
 buffer of a four-buffer job it went silent - no error flag, no reply at

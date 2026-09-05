@@ -184,7 +184,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_order
 MIGRATIONS = [
     ("sales", "code", "TEXT"),
     ("listings", "inventory_code", "TEXT"),
-    ("listings", "bin", "TEXT"),
+    ("listings", "bin_code", "TEXT"),
 ]
 
 
@@ -238,6 +238,13 @@ def connect_db(home):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # Off by default, per connection, so a declared REFERENCES is
+        # documentation until this runs. Safe to switch on: nothing in
+        # this schema declared one before `bins`, so it constrains only
+        # the relation that actually has a key. sales -> listings stays
+        # matched on title in `link_sales`, because the source data has
+        # no shared id to key on - see the note there.
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(SCHEMA)
         # listings owns its own tables, but the poll loop writes mail_events
         # as it goes, so they have to exist from the start. Both scripts are
@@ -885,6 +892,92 @@ def cmd_shelf_tag(cfg, args):
         print(f"name   : {args.name}")
     return _emit_tag(cfg, args, spec)
 
+
+
+def cmd_bin(conn, cfg, args):
+    """Make, list and fill the places things live.
+
+    Needs the database, so unlike `shelf-tag` it sits below connect_db.
+    That is the split: `shelf-tag` draws a tag for a code you already
+    have, and this is where the code comes from.
+
+    `new --print` does both in one go, because a bin whose tag never got
+    printed is a code nobody can read off the shelf."""
+    action = args.action
+    if action == "new":
+        row = listings_mod.create_bin(conn, args.name, notes=args.notes)
+        print(f"bin    : {row['name']}")
+        print(f"code   : {row['code']}")
+        if args.print or args.preview:
+            # The tag carries the code, and the name under it: the code
+            # is what a scanner reads and the name is what she does.
+            spec = {"kind": "shelf-tag", "code": row["code"],
+                    "name": row["name"], "qr": bool(args.qr),
+                    "marker": not args.qr, "ecl": "M"}
+            _emit_tag(cfg, args, spec)
+        return
+
+    if action == "ls":
+        rows = listings_mod.bins_in_use(conn, include_sold=args.all)
+        if not rows:
+            print("no bins yet - `mplabel bin new \"ATTIC\"` makes one")
+            return
+        for r in rows:
+            print(f"{r['code']}  {r['name']:<24} {r['count']:>4} item"
+                  f"{'' if r['count'] == 1 else 's'}")
+        return
+
+    if action == "show":
+        found = listings_mod.bin_contents(conn, args.bin,
+                                          include_sold=args.all)
+        print(f"{found['bin']['code']}  {found['bin']['name']}")
+        for item in found["items"]:
+            print(f"  {item['inventory_code'] or '----'}  "
+                  f"{(item['title'] or '')[:56]}")
+        if not found["items"]:
+            print("  (empty)")
+        return
+
+    if action == "rename":
+        row = listings_mod.rename_bin(
+            conn, (listings_mod.find_bin(conn, args.bin) or {}).get("code"),
+            args.name)
+        # The code deliberately does not move, so the tag already stuck
+        # to the shelf is still right - say so, because the obvious
+        # worry after a rename is whether it needs reprinting.
+        print(f"{row['code']}  {row['name']}  (code unchanged - the tag on "
+              f"the shelf is still correct)")
+        return
+
+    if action == "put":
+        row = conn.execute(
+            "SELECT id, title FROM listings WHERE UPPER(inventory_code)=? "
+            "OR id=?", (str(args.item).upper(), _as_int(args.item))).fetchone()
+        if row is None:
+            raise SystemExit(f"no item {args.item!r} - that is an inventory "
+                             f"code off the label, or a listing id")
+        code = listings_mod.set_bin(conn, row["id"], args.bin)
+        where = listings_mod.find_bin(conn, code) if code else None
+        print(f"{row['title'][:56]} -> "
+              + (f"{where['name']} ({where['code']})" if where
+                 else "no bin"))
+        return
+
+    if action == "rm":
+        row = listings_mod.delete_bin(conn, args.bin)
+        # Not a cascade: the things come back out onto no shelf rather
+        # than disappearing with the bin.
+        print(f"removed {row['name']} ({row['code']}); anything in it is "
+              f"now in no bin")
+        return
+
+
+def _as_int(value):
+    """`put` takes an inventory code or a row id and does not ask which."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
 
 
 def _tag_spec(args, kind):
@@ -1876,6 +1969,50 @@ def _main():
     p.add_argument("--print", action="store_true", help="actually send it")
     p.add_argument("--device", help="hidraw node, default supvan_device")
 
+    p = sub.add_parser("bin", help="the places things live: make one, see "
+                                   "what is in it, put something in it")
+    bsub = p.add_subparsers(dest="action", required=True)
+
+    b = bsub.add_parser("new", help="name a place; the code is minted here")
+    b.add_argument("name", help="what it is called - FLOOR, ATTIC, B5. "
+                                "Read across a room, so it is a name and "
+                                "not a code")
+    b.add_argument("--notes")
+    b.add_argument("--print", action="store_true",
+                   help="print its shelf tag straight away, which is the "
+                        "only way the code gets onto the shelf")
+    b.add_argument("--qr", action="store_true",
+                   help="carry the code as a QR instead of the marker")
+    b.add_argument("--preview", metavar="PNG",
+                   help="write what the tag decodes back to")
+    b.add_argument("--scale", type=int, default=2)
+    b.add_argument("--size", default=None, metavar="WxH")
+    b.add_argument("--density", type=int, default=None)
+    b.add_argument("--device")
+
+    b = bsub.add_parser("ls", help="every bin and how much is in it")
+    b.add_argument("--all", action="store_true",
+                   help="count sold items too, i.e. what *was* there")
+
+    b = bsub.add_parser("show", help="what is in one bin")
+    b.add_argument("bin", help="its code or its name; either will do")
+    b.add_argument("--all", action="store_true")
+
+    b = bsub.add_parser("rename", help="change what a bin is called")
+    b.add_argument("bin", help="its code or its current name")
+    b.add_argument("name", help="the new name. The code does not move, so "
+                                "the tag on the shelf stays correct")
+
+    b = bsub.add_parser("put", help="put one thing in a bin")
+    b.add_argument("item", help="the 4-character inventory code off the "
+                                "label, or a listing id")
+    b.add_argument("bin", help="the bin's code or name; empty takes the "
+                               "thing off the shelf entirely")
+
+    b = bsub.add_parser("rm", help="retire a bin; its contents come back "
+                                   "out rather than going with it")
+    b.add_argument("bin")
+
     p = sub.add_parser("supvan-probe",
                        help="status of the 48mm inventory label maker; "
                             "prints nothing and moves no paper")
@@ -2168,6 +2305,8 @@ def _main():
         listings_mod.refresh(conn)
     elif args.cmd == "pending":
         cmd_pending(cfg, conn, args)
+    elif args.cmd == "bin":
+        cmd_bin(conn, cfg, args)
     elif args.cmd == "stats":
         cmd_stats(cfg, conn, args)
     elif args.cmd == "reconcile":

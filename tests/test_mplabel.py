@@ -43,6 +43,11 @@ def db():
     from mplabel import cli
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
+    # Same reason, one layer down: `connect_db` turns foreign keys on and
+    # SQLite has them off per connection, so a fixture without this runs
+    # every test against a database where `REFERENCES` is a comment. The
+    # dangling-bin bug would pass here and fail on the Pi.
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(cli.SCHEMA)
     conn.executescript(listings.SCHEMA)
     return conn
@@ -3966,91 +3971,273 @@ def test_the_versioned_prefix_keeps_the_csrf_header_rule(app):
                            "POST", {}, cookie=cookie)
     assert status == 400
 
+CSRF = {"X-Mplabel": "1"}
+
+
+def test_the_phone_can_make_a_bin_and_fill_it(app):
+    """The round trip the shelf screen actually does: name a place, put a
+    thing in it by name, then read it back by the code the tag carries.
+    Making the bin returns the code so the app can print its tag without
+    a second request."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (title, state) "
+                 "VALUES ('Hobnail milk glass vase', 'active')")
+    conn.commit()
+    lid = conn.execute("SELECT id FROM listings").fetchone()["id"]
+
+    status, _h, body = _http(f"{base}/api/bins", "POST",
+                             {"name": "loft, north wall"}, cookie=cookie, headers=CSRF)
+    assert status == 200
+    code = json.loads(body)["bin"]["code"]
+    assert len(code) == 3
+
+    status, _h, _b = _http(f"{base}/api/inventory/{lid}/bin", "POST",
+                           {"bin": "LOFT, NORTH WALL"}, cookie=cookie, headers=CSRF)
+    assert status == 200
+
+    status, _h, body = _http(f"{base}/api/bins/{code}", cookie=cookie)
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["bin"]["name"] == "LOFT, NORTH WALL"
+    assert [i["title"] for i in payload["items"]] == \
+        ["Hobnail milk glass vase"]
+
+
+def test_the_item_view_carries_the_bin_name_not_just_its_code(app):
+    """The phone shows "LOFT, NORTH WALL", not a three-character code -
+    the code is for scanning. One join here rather than a second request
+    per row on the shelf screen."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (title, state) "
+                 "VALUES ('Pressed glass tumblers', 'active')")
+    conn.commit()
+    lid = conn.execute("SELECT id FROM listings").fetchone()["id"]
+
+    _http(f"{base}/api/bins", "POST", {"name": "B5"}, cookie=cookie, headers=CSRF)
+    _http(f"{base}/api/inventory/{lid}/bin", "POST", {"bin": "b5"},
+          cookie=cookie, headers=CSRF)
+
+    status, _h, body = _http(f"{base}/api/inventory/{lid}", cookie=cookie)
+    assert status == 200
+    item = json.loads(body)["item"]
+    assert item["bin"] == "B5"
+    assert item["bin_mates"] == 0
+
+    # And search finds it by the name, which is what she would type.
+    status, _h, body = _http(f"{base}/api/inventory?q=B5", cookie=cookie)
+    assert [i["title"] for i in json.loads(body)["items"]] == \
+        ["Pressed glass tumblers"]
+
+
+def test_renaming_a_bin_over_the_wire_keeps_its_code(app):
+    """Which is what makes the tag already on the shelf still correct."""
+    base, conn = app
+    _status, cookie = _login(base)
+
+    _s, _h, body = _http(f"{base}/api/bins", "POST", {"name": "FLOOR"},
+                         cookie=cookie, headers=CSRF)
+    code = json.loads(body)["bin"]["code"]
+
+    status, _h, body = _http(f"{base}/api/bins/{code}/name", "POST",
+                             {"name": "front room"}, cookie=cookie, headers=CSRF)
+    assert status == 200
+    row = json.loads(body)["bin"]
+    assert (row["code"], row["name"]) == (code, "FRONT ROOM")
+
+
+def test_the_phone_cannot_invent_a_bin_by_moving_something_into_it(app):
+    """A typo used to make a shelf. Now it is a 400 with a sentence,
+    because the reference is real and a thing cannot be somewhere that
+    was never named."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (title, state) VALUES ('x', 'active')")
+    conn.commit()
+    lid = conn.execute("SELECT id FROM listings").fetchone()["id"]
+
+    status, _h, body = _http(f"{base}/api/inventory/{lid}/bin", "POST",
+                             {"bin": "FLOOR "}, cookie=cookie, headers=CSRF)
+    assert status == 400
+    assert b"Make it first" in body
+
+
 # --- bins: where a thing physically is ----------------------------------
 
 def _stock(db):
-    rows = [("Oil portrait, unsigned", "B5", "active"),
-            ("Pressed glass tumblers", "B5", "active"),
-            ("Hobnail milk glass vase", "FLOOR", "active"),
-            ("Chenille bedspread", "FLOOR", "sold"),
+    """Two bins and five things, one of them on no shelf at all."""
+    from mplabel import listings
+
+    b5 = listings.create_bin(db, "B5")["code"]
+    floor = listings.create_bin(db, "floor")["code"]
+    rows = [("Oil portrait, unsigned", b5, "active"),
+            ("Pressed glass tumblers", b5, "active"),
+            ("Hobnail milk glass vase", floor, "active"),
+            ("Chenille bedspread", floor, "sold"),
             ("Enamel bread bin", None, "active")]
-    for title, bin_name, state in rows:
-        db.execute("INSERT INTO listings (title, bin, state) VALUES (?,?,?)",
-                   (title, bin_name, state))
+    for title, code, state in rows:
+        db.execute(
+            "INSERT INTO listings (title, bin_code, state) VALUES (?,?,?)",
+            (title, code, state))
     db.commit()
+    return b5, floor
 
 
-def test_a_bin_name_is_folded_because_the_list_is_derived(db):
-    """`b5`, `B5 ` and `B5` are one shelf in the room and three rows in a
-    GROUP BY. That matters more here than it usually would: the bin list
-    is derived from what is in use, so every variant spelling invents a
-    bin that shows up in the picker beside the real one."""
+def test_a_bin_name_is_folded_because_two_spellings_is_two_shelves(db):
+    """`b5`, `B5 ` and `B 5` are one shelf in the room. Unfolded they are
+    three rows in the picker, and the second one gets used."""
     from mplabel import listings
 
-    assert listings.normalise_bin("b5") == "B5"
-    assert listings.normalise_bin("  B5  ") == "B5"
-    assert listings.normalise_bin("floor") == "FLOOR"
-    assert listings.normalise_bin("") is None
-    assert listings.normalise_bin(None) is None
+    assert listings.normalise_bin_name("b5") == "B5"
+    assert listings.normalise_bin_name("  B5  ") == "B5"
+    assert listings.normalise_bin_name("at  tic") == "AT TIC"
+    with pytest.raises(ValueError, match="needs a name"):
+        listings.normalise_bin_name("")
     with pytest.raises(ValueError, match="at most"):
-        listings.normalise_bin("x" * 40)
+        listings.normalise_bin_name("x" * 40)
 
 
-def test_a_bin_is_not_a_location_code(db):
-    """Deliberately a different thing from `shelf-tag`'s codes. A
-    location code is 3 characters from an alphabet with no I, L, O or U,
-    so a scanner can tell a place from a thing. A bin is what someone
-    writes on a shelf - FLOOR and ATTIC are real answers, both longer
-    than a code and both containing letters the code alphabet leaves
-    out. Nothing scans a bin; a person reads it and types it."""
-    from mplabel import inventory, listings
+def test_a_bin_has_both_halves_and_they_do_different_jobs(db):
+    """The name is read across the room, so `FLOOR` and `ATTIC` are right
+    answers even though neither could be a code - both are longer than
+    three characters and both contain letters the code alphabet leaves
+    out. The code is what a tag carries and a phone reads, so it is
+    minted from that alphabet rather than typed."""
+    from mplabel import inventory, listings, marker
 
-    assert listings.normalise_bin("FLOOR") == "FLOOR"
-    assert listings.normalise_bin("ATTIC") == "ATTIC"
-    # ...and neither could ever be a location code.
-    for name in ("FLOOR", "ATTIC"):
-        with pytest.raises(ValueError):
-            inventory.normalise_location_code(name)
+    row = listings.create_bin(db, "attic")
+    assert row["name"] == "ATTIC"
+    assert len(row["code"]) == listings.BIN_CODE_LENGTH
+    assert all(ch in marker.ALPHABET for ch in row["code"])
+    # ...and the name could never have served as the code.
+    with pytest.raises(ValueError):
+        inventory.normalise_location_code("ATTIC")
 
 
-def test_bins_are_derived_from_what_is_in_use(db):
-    """No `locations` table, which is the whole point: naming a bin is
-    typing it, and retiring one is moving the last thing out."""
+def test_a_bin_answers_to_either_half(db):
+    """The phone has scanned the code and a person has typed the name,
+    and neither should have to know which the other used."""
     from mplabel import listings
 
-    _stock(db)
-    got = {b["bin"]: b["count"] for b in listings.bins_in_use(db)}
-    # FLOOR has two things in it but one of them is sold, and a bin's
-    # useful count is what is still on the shelf.
-    assert got == {"B5": 2, "FLOOR": 1}
+    row = listings.create_bin(db, "Loft, north wall")
+    assert listings.find_bin(db, row["code"])["name"] == "LOFT, NORTH WALL"
+    assert listings.find_bin(db, "loft, north wall")["code"] == row["code"]
+    assert listings.find_bin(db, "nowhere") is None
 
-    with_sold = {b["bin"]: b["count"]
+
+def test_renaming_a_bin_leaves_the_tag_on_the_shelf_valid(db):
+    """This is the whole reason the two halves are separate. The tag is
+    already stuck to the shelf; if renaming moved the code, every rename
+    would mean reprinting it - and everything in the bin follows the new
+    name for free because the listings reference the code."""
+    from mplabel import listings
+
+    b5, _floor = _stock(db)
+    listings.rename_bin(db, b5, "front room, left")
+    assert listings.find_bin(db, b5)["name"] == "FRONT ROOM, LEFT"
+    contents = listings.bin_contents(db, b5)
+    assert len(contents["items"]) == 2
+    assert contents["bin"]["name"] == "FRONT ROOM, LEFT"
+    # And the old name is gone rather than pointing anywhere.
+    assert listings.find_bin(db, "B5") is None
+
+
+def test_two_shelves_cannot_share_a_name(db):
+    from mplabel import listings
+
+    listings.create_bin(db, "ATTIC")
+    with pytest.raises(ValueError, match="already a bin"):
+        listings.create_bin(db, "attic")
+
+
+def test_a_bin_code_is_never_reused(db):
+    """Same rule as an inventory code and for the same reason: the code
+    is printed on a tag stuck to a shelf, and that tag outlives the row.
+    Checked against every bin ever, not the ones in use - the opposite of
+    a parcel code, freed the moment the parcel ships."""
+    from mplabel import listings
+
+    seen = {listings.create_bin(db, "SHELF %d" % n)["code"] for n in range(40)}
+    assert len(seen) == 40
+    for _ in range(20):
+        assert listings.allocate_bin_code(db) not in seen
+
+
+def test_an_empty_bin_still_appears(db):
+    """The difference the table buys over deriving the list from the
+    items. A bin exists because someone named it and printed a tag for
+    it; a shelf just cleared is still a shelf, and it has to be in the
+    picker for the next thing to go on it."""
+    from mplabel import listings
+
+    _b5, _floor = _stock(db)
+    listings.create_bin(db, "ATTIC")
+    got = {b["name"]: b["count"] for b in listings.bins_in_use(db)}
+    # FLOOR holds two things but one is sold, and a bin's useful count is
+    # what is still on the shelf.
+    assert got == {"B5": 2, "FLOOR": 1, "ATTIC": 0}
+
+    with_sold = {b["name"]: b["count"]
                  for b in listings.bins_in_use(db, include_sold=True)}
-    assert with_sold == {"B5": 2, "FLOOR": 2}
+    assert with_sold == {"B5": 2, "FLOOR": 2, "ATTIC": 0}
 
 
-def test_moving_something_out_retires_its_bin(db):
-    """The other half of derived: a bin stops existing when it empties,
-    with nothing to delete."""
+def test_moving_something_takes_a_code_or_a_name(db):
+    from mplabel import listings
+
+    b5, _floor = _stock(db)
+    vase = db.execute("SELECT id FROM listings WHERE title LIKE 'Hobnail%'"
+                      ).fetchone()["id"]
+    assert listings.set_bin(db, vase, "b5") == b5
+    assert len(listings.bin_contents(db, b5)["items"]) == 3
+
+    assert listings.set_bin(db, vase, "") is None
+    assert len(listings.bin_contents(db, b5)["items"]) == 2
+
+
+def test_a_thing_cannot_go_somewhere_that_does_not_exist(db):
+    """The reference is real now, so this is refused with a sentence
+    rather than accepted and left dangling."""
     from mplabel import listings
 
     _stock(db)
-    vase = db.execute(
-        "SELECT id FROM listings WHERE title LIKE 'Hobnail%'").fetchone()["id"]
-    listings.set_bin(db, vase, "b5")
-    assert [b["bin"] for b in listings.bins_in_use(db)] == ["B5"]
-    assert listings.bins_in_use(db)[0]["count"] == 3
-
-    # And clearing it takes the thing off the shelf entirely.
-    assert listings.set_bin(db, vase, "") is None
-    assert listings.bins_in_use(db)[0]["count"] == 2
+    with pytest.raises(ValueError, match="Make it first"):
+        listings.set_bin(db, 1, "NOWHERE")
 
 
 def test_setting_a_bin_on_nothing_says_so(db):
     from mplabel import listings
 
+    b5, _floor = _stock(db)
     with pytest.raises(ValueError, match="no listing"):
-        listings.set_bin(db, 9999, "B5")
+        listings.set_bin(db, 9999, b5)
+
+
+def test_deleting_a_bin_empties_the_shelf_rather_than_dangling(db):
+    """`ON DELETE SET NULL`, and it only fires because `connect_db` turns
+    foreign keys on - SQLite ignores a declared REFERENCES otherwise, so
+    without the pragma this would leave two listings pointing at a bin
+    that is gone and still pass everything else."""
+    from mplabel import listings
+
+    b5, _floor = _stock(db)
+    listings.delete_bin(db, "B5")
+    assert listings.find_bin(db, b5) is None
+    orphans = db.execute("SELECT COUNT(*) c FROM listings WHERE bin_code=?",
+                         (b5,)).fetchone()["c"]
+    assert orphans == 0
+    assert db.execute("SELECT COUNT(*) c FROM listings").fetchone()["c"] == 5
+
+
+def test_foreign_keys_are_actually_enforced(db):
+    """Off by default, per connection. A declared reference without the
+    pragma is documentation, and the bug it exists to catch - a listing
+    in a bin that was never made - would sail straight through."""
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO listings (title, bin_code) "
+                   "VALUES ('nowhere', 'ZZZ')")
+        db.commit()
 
 
 def test_the_bin_column_reaches_a_database_that_predates_it(tmp_path):
@@ -4062,11 +4249,16 @@ def test_the_bin_column_reaches_a_database_that_predates_it(tmp_path):
     home = tmp_path / "marketplace"
     (home / "labels").mkdir(parents=True)
     old = sqlite3.connect(home / "sales.db")
-    # The schema as it was before the column: the index goes too, or it
-    # references a column that is not there yet.
-    before = "\n".join(
-        line for line in listings.SCHEMA.splitlines()
-        if "bin" not in line.lower())
+    # The schema as it was before bins: the whole `bins` statement goes,
+    # and the referencing column comes out of `listings` by line. Doing
+    # it all by statement would take `listings` with it (its body names
+    # bin_code); doing it all by line would leave the bins table's body
+    # behind as loose SQL.
+    before = ";".join(
+        "\n".join(line for line in stmt.splitlines()
+                  if "bin_code" not in line)
+        for stmt in listings.SCHEMA.split(";")
+        if "CREATE TABLE IF NOT EXISTS bins" not in stmt) + ";"
     old.executescript(before)
     old.execute("INSERT INTO listings (title) VALUES ('before the column')")
     old.commit()
@@ -4074,8 +4266,50 @@ def test_the_bin_column_reaches_a_database_that_predates_it(tmp_path):
 
     conn = cli.connect_db(home)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(listings)")}
-    assert "bin" in cols
+    assert "bin_code" in cols
     assert conn.execute("SELECT COUNT(*) c FROM listings").fetchone()["c"] == 1
+    # And the table itself arrives, which no ALTER TABLE would do.
+    listings.create_bin(conn, "ATTIC")
+
+
+def test_bin_put_takes_the_code_off_the_label(db):
+    """The four-character code printed on the item's own label is what is
+    to hand when you are stood at the shelf with the thing in one hand -
+    not a row id, which is never printed on anything."""
+    from mplabel import cli, listings
+
+    listings.create_bin(db, "ATTIC")
+    db.execute("INSERT INTO listings (title, inventory_code, state) "
+               "VALUES ('Hobnail vase', '7K2M', 'active')")
+    db.commit()
+
+    args = argparse.Namespace(action="put", item="7k2m", bin="attic")
+    cli.cmd_bin(db, {}, args)
+    assert len(listings.bin_contents(db, "ATTIC")["items"]) == 1
+
+    args = argparse.Namespace(action="put", item="NOPE", bin="ATTIC")
+    with pytest.raises(SystemExit, match="inventory code"):
+        cli.cmd_bin(db, {}, args)
+
+
+def test_retiring_a_bin_does_not_take_its_contents_with_it(db):
+    """`rm` is not a cascade. The point of a bin going away is that the
+    shelf is being cleared, and the things were the reason for clearing
+    it - deleting them would be the one unrecoverable outcome here."""
+    from mplabel import cli, listings
+
+    listings.create_bin(db, "ATTIC")
+    db.execute("INSERT INTO listings (title, inventory_code, state) "
+               "VALUES ('Hobnail vase', '7K2M', 'active')")
+    db.commit()
+    cli.cmd_bin(db, {}, argparse.Namespace(action="put", item="7K2M",
+                                           bin="ATTIC"))
+    cli.cmd_bin(db, {}, argparse.Namespace(action="rm", bin="ATTIC"))
+
+    row = db.execute("SELECT title, bin_code FROM listings").fetchone()
+    assert row["title"] == "Hobnail vase"
+    assert row["bin_code"] is None
+
 
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
