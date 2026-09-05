@@ -40,7 +40,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 from . import listings as listings_mod
 from . import build as build_mod
@@ -309,6 +309,11 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", r"^/api/orders/(?P<sid>\d+)/label$", "h_label", True),
         ("GET", r"^/api/lookup/(?P<code>[0-9A-Za-z]{3,4})$", "h_lookup", True),
         ("GET", r"^/api/pending$", "h_pending", True),
+        ("GET", r"^/api/bins$", "h_bins", True),
+        ("GET", r"^/api/bins/(?P<name>[^/]{1,64})$", "h_bin", True),
+        ("GET", r"^/api/inventory$", "h_inventory", True),
+        ("GET", r"^/api/inventory/(?P<lid>\d+)$", "h_item", True),
+        ("POST", r"^/api/inventory/(?P<lid>\d+)/bin$", "h_move_bin", True),
         ("GET", r"^/api/stats$", "h_stats", True),
         ("GET", r"^/api/system$", "h_system", True),
         ("POST", r"^/api/orders/(?P<sid>\d+)/ship$", "h_ship", True),
@@ -499,6 +504,85 @@ class Handler(BaseHTTPRequestHandler):
         self.json({"authenticated": self.authed(),
                    "api_version": API_VERSION,
                    "api_prefix": API_PREFIX})
+
+    def h_bins(self):
+        """Every bin with something in it, and how much.
+
+        Derived from what is in use rather than read from a table, which
+        is what makes naming a bin the same act as typing it. The app's
+        bin picker is this list plus a free-text field."""
+        return self.json({"bins": listings_mod.bins_in_use(self.db())})
+
+    def h_bin(self, name):
+        """What is in one bin."""
+        name = unquote(name)
+        try:
+            contents = listings_mod.bin_contents(self.db(), name)
+        except ValueError as exc:
+            raise ValueError(str(exc))
+        return self.json({"bin": listings_mod.normalise_bin(name),
+                          "items": contents})
+
+    def h_inventory(self):
+        """The shelf, searchable.
+
+        One query across title, bin and category, because that is how the
+        thing is actually looked for - "the blue one", "B5", "glass" -
+        and three separate filters would make her choose which kind of
+        remembering she is doing before she has remembered."""
+        qs = parse_qs(urlparse(self.path).query)
+        q = (qs.get("q") or [""])[0].strip()
+        state = (qs.get("state") or [""])[0].strip()
+        limit = min(int((qs.get("limit") or ["200"])[0] or 200), 500)
+
+        sql = ("SELECT id, listing_id, title, price, state, category, "
+               "inventory_code, bin, listed_at, sold_at "
+               "FROM listings WHERE 1=1")
+        args = []
+        if state:
+            sql += " AND state=?"
+            args.append(state)
+        if q:
+            sql += (" AND (title LIKE ? OR bin LIKE ? OR category LIKE ? "
+                    "OR inventory_code LIKE ?)")
+            args += [f"%{q}%"] * 4
+        sql += " ORDER BY COALESCE(sold_at, listed_at, title) DESC LIMIT ?"
+        args.append(limit)
+
+        rows = [dict(r) for r in self.db().execute(sql, args).fetchall()]
+        return self.json({"items": rows, "count": len(rows)})
+
+    def h_item(self, lid):
+        """One thing, plus what else is in its bin.
+
+        `bin_mates` is the number the shelf view needs and the client
+        should not have to derive with a second request."""
+        row = self.db().execute(
+            "SELECT id, listing_id, title, price, state, category, "
+            "condition, inventory_code, bin, listed_at, sold_at, notes "
+            "FROM listings WHERE id=?", (int(lid),)).fetchone()
+        if row is None:
+            return self.fail(404, "no such item")
+        item = dict(row)
+        mates = 0
+        if item.get("bin"):
+            mates = max(0, len(listings_mod.bin_contents(
+                self.db(), item["bin"])) - 1)
+        item["bin_mates"] = mates
+        return self.json({"item": item})
+
+    def h_move_bin(self, lid):
+        """Put one thing in a bin, or take it out of one.
+
+        An empty or missing name clears it, which is what "not set" means
+        on the shelf screen - there is no separate delete."""
+        body = self.body() or {}
+        try:
+            name = listings_mod.set_bin(self.db(), int(lid),
+                                        body.get("bin"))
+        except ValueError as exc:
+            raise ValueError(str(exc))
+        return self.json({"ok": True, "id": int(lid), "bin": name})
 
     def h_orders(self):
         # CLOSED_STATUSES, not `!= 'shipped'` - a cancelled order is closed

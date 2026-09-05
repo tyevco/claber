@@ -184,6 +184,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_order
 MIGRATIONS = [
     ("sales", "code", "TEXT"),
     ("listings", "inventory_code", "TEXT"),
+    ("listings", "bin", "TEXT"),
 ]
 
 
@@ -256,6 +257,12 @@ def connect_db(home):
                         f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
                     log.info("added %s.%s to the existing database",
                              table, column)
+
+        # Only now: an index on a migrated column has to wait for the
+        # column. In SCHEMA it would run first and fail on every existing
+        # database, taking every command down with it.
+        for stmt in listings_mod.POST_MIGRATION_INDEXES:
+            conn.execute(stmt)
 
         # idx_listing used to be UNIQUE, which made a second sale of the
         # same listing impossible - and a cancel-and-rebuy is exactly that.

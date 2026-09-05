@@ -3966,6 +3966,117 @@ def test_the_versioned_prefix_keeps_the_csrf_header_rule(app):
                            "POST", {}, cookie=cookie)
     assert status == 400
 
+# --- bins: where a thing physically is ----------------------------------
+
+def _stock(db):
+    rows = [("Oil portrait, unsigned", "B5", "active"),
+            ("Pressed glass tumblers", "B5", "active"),
+            ("Hobnail milk glass vase", "FLOOR", "active"),
+            ("Chenille bedspread", "FLOOR", "sold"),
+            ("Enamel bread bin", None, "active")]
+    for title, bin_name, state in rows:
+        db.execute("INSERT INTO listings (title, bin, state) VALUES (?,?,?)",
+                   (title, bin_name, state))
+    db.commit()
+
+
+def test_a_bin_name_is_folded_because_the_list_is_derived(db):
+    """`b5`, `B5 ` and `B5` are one shelf in the room and three rows in a
+    GROUP BY. That matters more here than it usually would: the bin list
+    is derived from what is in use, so every variant spelling invents a
+    bin that shows up in the picker beside the real one."""
+    from mplabel import listings
+
+    assert listings.normalise_bin("b5") == "B5"
+    assert listings.normalise_bin("  B5  ") == "B5"
+    assert listings.normalise_bin("floor") == "FLOOR"
+    assert listings.normalise_bin("") is None
+    assert listings.normalise_bin(None) is None
+    with pytest.raises(ValueError, match="at most"):
+        listings.normalise_bin("x" * 40)
+
+
+def test_a_bin_is_not_a_location_code(db):
+    """Deliberately a different thing from `shelf-tag`'s codes. A
+    location code is 3 characters from an alphabet with no I, L, O or U,
+    so a scanner can tell a place from a thing. A bin is what someone
+    writes on a shelf - FLOOR and ATTIC are real answers, both longer
+    than a code and both containing letters the code alphabet leaves
+    out. Nothing scans a bin; a person reads it and types it."""
+    from mplabel import inventory, listings
+
+    assert listings.normalise_bin("FLOOR") == "FLOOR"
+    assert listings.normalise_bin("ATTIC") == "ATTIC"
+    # ...and neither could ever be a location code.
+    for name in ("FLOOR", "ATTIC"):
+        with pytest.raises(ValueError):
+            inventory.normalise_location_code(name)
+
+
+def test_bins_are_derived_from_what_is_in_use(db):
+    """No `locations` table, which is the whole point: naming a bin is
+    typing it, and retiring one is moving the last thing out."""
+    from mplabel import listings
+
+    _stock(db)
+    got = {b["bin"]: b["count"] for b in listings.bins_in_use(db)}
+    # FLOOR has two things in it but one of them is sold, and a bin's
+    # useful count is what is still on the shelf.
+    assert got == {"B5": 2, "FLOOR": 1}
+
+    with_sold = {b["bin"]: b["count"]
+                 for b in listings.bins_in_use(db, include_sold=True)}
+    assert with_sold == {"B5": 2, "FLOOR": 2}
+
+
+def test_moving_something_out_retires_its_bin(db):
+    """The other half of derived: a bin stops existing when it empties,
+    with nothing to delete."""
+    from mplabel import listings
+
+    _stock(db)
+    vase = db.execute(
+        "SELECT id FROM listings WHERE title LIKE 'Hobnail%'").fetchone()["id"]
+    listings.set_bin(db, vase, "b5")
+    assert [b["bin"] for b in listings.bins_in_use(db)] == ["B5"]
+    assert listings.bins_in_use(db)[0]["count"] == 3
+
+    # And clearing it takes the thing off the shelf entirely.
+    assert listings.set_bin(db, vase, "") is None
+    assert listings.bins_in_use(db)[0]["count"] == 2
+
+
+def test_setting_a_bin_on_nothing_says_so(db):
+    from mplabel import listings
+
+    with pytest.raises(ValueError, match="no listing"):
+        listings.set_bin(db, 9999, "B5")
+
+
+def test_the_bin_column_reaches_a_database_that_predates_it(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` will not touch a database that holds
+    real listings, so the column has to be in MIGRATIONS as well as in
+    SCHEMA - or it exists only on fresh installs."""
+    from mplabel import cli, listings
+
+    home = tmp_path / "marketplace"
+    (home / "labels").mkdir(parents=True)
+    old = sqlite3.connect(home / "sales.db")
+    # The schema as it was before the column: the index goes too, or it
+    # references a column that is not there yet.
+    before = "\n".join(
+        line for line in listings.SCHEMA.splitlines()
+        if "bin" not in line.lower())
+    old.executescript(before)
+    old.execute("INSERT INTO listings (title) VALUES ('before the column')")
+    old.commit()
+    old.close()
+
+    conn = cli.connect_db(home)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(listings)")}
+    assert "bin" in cols
+    assert conn.execute("SELECT COUNT(*) c FROM listings").fetchone()["c"] == 1
+
 def test_ruler_is_asymmetric_in_both_axes():
     """A mirror or a feed flip has to be obvious by looking, not by
     measuring - the first printed label was mirrored and the only reason

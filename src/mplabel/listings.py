@@ -25,6 +25,15 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+# Indexes on columns that arrived by migration. They cannot live in
+# SCHEMA: `executescript(SCHEMA)` runs *before* the ALTER TABLE loop, so
+# on a database that predates the column the CREATE INDEX fails and takes
+# `connect_db` down with it - every command, not just the new feature.
+# CLAUDE.md says a new column needs a migration; the index needs one too.
+POST_MIGRATION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_listing_bin ON listings(bin)",
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
     id            INTEGER PRIMARY KEY,
@@ -43,6 +52,20 @@ CREATE TABLE IF NOT EXISTS listings (
     first_seen    TEXT,
     last_seen     TEXT,
     inventory_code TEXT,
+    -- Where the thing physically is. A short free-text name the seller
+    -- chooses - B5, FLOOR, ATTIC - not a code and not a foreign key.
+    --
+    -- Deliberately a column and not a `locations` table: the bin list is
+    -- derived from what is in use (`bins_in_use`), so naming a new one is
+    -- typing it, and retiring one is moving the last thing out. A table
+    -- would add a second place to keep in step for no answer it can give
+    -- that this cannot.
+    --
+    -- No move history either. It records where a thing *is*, which is the
+    -- question being asked - "where is this?" and "what is in B5?". If
+    -- "where has this been?" ever becomes a real question, that is a new
+    -- table beside this column rather than a different shape of it.
+    bin           TEXT,
     notes         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_listing_state ON listings(state);
@@ -181,6 +204,74 @@ def upsert_listing(conn, listing_id, source, **fields):
         conn.execute(f"UPDATE listings SET {sets} WHERE listing_id=?",
                      list(updates.values()) + [listing_id])
 
+
+# A bin name is what a person writes on a shelf, so it is kept short and
+# case-folded rather than validated into a code. `FLOOR` and `ATTIC` are
+# real answers, and both are longer than a location code and contain
+# letters the code alphabet leaves out - which is the tell that this is a
+# different thing from `shelf-tag`'s 3-character codes, not a variant of
+# them. Nothing scans a bin; a person reads it and types it.
+BIN_MAX = 24
+
+
+def normalise_bin(name):
+    """Fold a typed bin name, or None to clear it.
+
+    Upper-cased and collapsed because `b5`, `B5 ` and `B 5` are one shelf
+    in the room and three rows in a GROUP BY. That matters more than it
+    looks: the bin list is derived from what is in use, so every variant
+    spelling invents a bin that appears in the picker beside the real
+    one."""
+    if name is None:
+        return None
+    folded = " ".join(str(name).split()).upper()
+    if not folded:
+        return None
+    if len(folded) > BIN_MAX:
+        raise ValueError(
+            f"{folded!r} is {len(folded)} characters; a bin name is at most "
+            f"{BIN_MAX}. It goes on a shelf and gets read across a room")
+    return folded
+
+
+def set_bin(conn, listing_id, name):
+    """Put one listing in a bin, or take it out of one. Returns the name."""
+    folded = normalise_bin(name)
+    cur = conn.execute("UPDATE listings SET bin=? WHERE id=?",
+                       (folded, listing_id))
+    conn.commit()
+    if not cur.rowcount:
+        raise ValueError(f"no listing {listing_id}")
+    return folded
+
+
+def bins_in_use(conn, include_sold=False):
+    """Every bin that has something in it, with how much.
+
+    Derived rather than stored - that is the whole reason there is no
+    `locations` table. Naming a new bin is typing it, and retiring one is
+    moving the last thing out of it.
+
+    Sold items are excluded by default: a bin's useful count is what is
+    still on the shelf. `include_sold` answers the other question, which
+    is what *was* there."""
+    where = "" if include_sold else " AND state != 'sold'"
+    rows = conn.execute(
+        f"SELECT bin, COUNT(*) AS n FROM listings "
+        f"WHERE bin IS NOT NULL AND bin != ''{where} "
+        f"GROUP BY bin ORDER BY bin").fetchall()
+    return [{"bin": r["bin"], "count": r["n"]} for r in rows]
+
+
+def bin_contents(conn, name, include_sold=False):
+    """What is in one bin."""
+    folded = normalise_bin(name)
+    where = "" if include_sold else " AND state != 'sold'"
+    rows = conn.execute(
+        f"SELECT id, title, price, state, inventory_code, bin "
+        f"FROM listings WHERE bin=?{where} ORDER BY title", (folded,)
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 def title_key(title):
     """Stable id for a listing we only know by name.

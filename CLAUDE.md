@@ -164,6 +164,14 @@ sixty characters ("Antique 1900-1915 American Edwardian / Late
 Victorian..."), and a plain truncated slug merged two real listings into
 one, quietly shrinking the denominator sell-through is measured against.
 
+**An index on a migrated column needs one too.** `executescript(SCHEMA)`
+runs *before* the `ALTER TABLE` loop, so a `CREATE INDEX ... ON
+listings(bin)` sitting in `SCHEMA` fails on any database that predates
+the column - and it fails inside `connect_db`, so it takes down every
+command rather than just the new feature. `listings.POST_MIGRATION_INDEXES`
+runs after the loop. Caught by the migration test, which is why that test
+exists.
+
 **Adding a column needs a migration.** `CREATE TABLE IF NOT EXISTS` will
 not touch a database that already holds real sales, so `connect_db` carries
 a small `PRAGMA table_info` / `ALTER TABLE` loop. Add to that list, not
@@ -424,6 +432,22 @@ printd's catch-all turns that into a 503 - so a label that printed
 perfectly is reported as a failure and the caller prints it again. Same
 shape as the fsync/EINVAL incident: the print worked, the bookkeeping
 said otherwise. `printers._jsonable_status` hexes anything bytes-shaped.
+
+**A bin is not a location code, and nothing scans a bin.** `listings.bin`
+is a short free-text name someone writes on a shelf - `B5`, `FLOOR`,
+`ATTIC` - upper-cased and space-collapsed, because `b5` and `B5 ` are one
+shelf in the room and two rows in a `GROUP BY`, and the bin list is
+*derived* from what is in use rather than stored. That is the whole
+reason there is no `locations` table: naming a bin is typing it, and
+retiring one is moving the last thing out.
+
+It is deliberately a different thing from `shelf-tag`'s 3-character
+location codes. `FLOOR` and `ATTIC` are both longer than a code and both
+contain letters the code alphabet leaves out (I, L, O, U are excluded as
+misreadable on thermal), so neither could ever be one. The design this
+came from has **no scanner at all** - the camera is for photographing
+items, and bins are read and typed. Whether a shelf tag should therefore
+print a bin *name* rather than a code is open.
 
 **Three characters means a place, four means a thing.** A location code
 is 3 and an inventory code is 4, and that is load bearing: the marker's
