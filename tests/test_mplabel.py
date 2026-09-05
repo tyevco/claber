@@ -1962,6 +1962,112 @@ def test_the_shelf_tab_is_wired_to_a_backend_that_exists():
     assert "S.focusId" in js, "the search box will lose focus on rerender"
 
 
+# ------------------------------------------------ the native iOS client
+
+# The Swift is written on a machine that cannot compile it, and it ships
+# separately from the server it talks to - so the compiler catches none
+# of the drift that matters here. These read the Swift as text and check
+# it against the routes and payloads this repo actually serves. They are
+# cheap, and they cover the two failures that would otherwise be found by
+# her, on a phone, holding a box.
+
+IOS = Path(__file__).parent.parent / "ios" / "MPLabel"
+
+
+def _swift(name):
+    return (IOS / name).read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(not IOS.exists(), reason="the iOS client is not checked out")
+def test_every_path_the_swift_client_calls_is_a_real_route():
+    """A renamed route reaches an installed app as a screen that stays
+    empty. The app cannot be redeployed in the same commit as the server
+    the way the PWA can, which is the whole reason /api/v1 exists - and
+    that prefix only helps if the client is actually calling routes that
+    are there."""
+    from mplabel import web
+
+    js = _swift("APIClient.swift")
+    # `request("/orders/\(id)/ship", method: "POST")` - take the literal
+    # head and stand a plausible value in for each interpolation.
+    paths = set(re.findall(r'request\("([^"]+)"', js))
+    assert paths, "no request() calls found - has the helper been renamed?"
+
+    # The client must send the versioned prefix - that is the whole
+    # point of it existing - but the dispatcher strips it before
+    # matching, so the routing table holds unversioned patterns. Assert
+    # both halves rather than conflating them.
+    assert '"/api/v1" + path' in js, \
+        "APIClient must call the versioned prefix, not /api"
+
+    for path in sorted(paths):
+        # "123" and not "1": /lookup takes 3-4 characters, because a
+        # parcel code is 3 and an inventory code is 4, so a one-digit
+        # stand-in fails a route that is perfectly correct.
+        probe = re.sub(r"\\\((?:[^()]|\([^()]*\))*\)", "123", path)
+        probe = "/api" + probe.split("?")[0]
+        assert any(rx.match(probe) for _m, rx, _h, _a in web.Handler._COMPILED), \
+            f"APIClient calls {probe}, which no route serves"
+
+
+@pytest.mark.skipif(not IOS.exists(), reason="the iOS client is not checked out")
+def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
+    """CodingKeys are strings, so a renamed field is not a Swift error -
+    it is a nil, and a nil in an Optional model is a blank row rather
+    than a crash. That is the quiet failure this catches: the app would
+    look like it worked and show her nothing."""
+    from mplabel import web as web_mod
+
+    base, conn = app
+    _status, cookie = _login(base)
+    from mplabel import listings as listings_mod
+
+    conn.execute("INSERT INTO listings (title, state, inventory_code) "
+                 "VALUES ('Hobnail vase', 'active', '7K2M')")
+    conn.commit()
+    # A bin, or /bins answers with an empty list and `created_at` looks
+    # like a key the server does not send.
+    listings_mod.create_bin(conn, "ATTIC")
+
+    swift = _swift("Models.swift")
+    # Only the remapped ones: `case shipBy = "ship_by"`. A key that
+    # matches its Swift name needs no mapping and cannot be misspelled
+    # in one place only.
+    mapped = set(re.findall(r'case\s+\w+\s*=\s*"([a-z_]+)"', swift))
+    assert mapped, "no CodingKeys found - has Models.swift been rewritten?"
+
+    served = set()
+    for path in ("/orders", "/inventory", "/bins", "/pending"):
+        _s, _h, body = _http(base + web_mod.API_PREFIX + path, cookie=cookie)
+        payload = json.loads(body)
+        for rows in payload.values():
+            if isinstance(rows, list):
+                for row in rows:
+                    served |= set(row)
+    # The detail and item payloads carry the rest.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/inventory/1",
+                         cookie=cookie)
+    served |= set(json.loads(body)["item"])
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/orders/1", cookie=cookie)
+    served |= set(json.loads(body))
+    # `expires_in` only appears on login, which the fixture did above.
+    served.add("expires_in")
+
+    missing = sorted(k for k in mapped if k not in served)
+    assert not missing, (
+        f"Models.swift maps keys the server never sends: {missing}. "
+        f"Each one decodes as nil and shows as a blank row.")
+
+
+@pytest.mark.skipif(not IOS.exists(), reason="the iOS client is not checked out")
+def test_the_camera_string_is_present_because_its_absence_is_silent():
+    """No NSCameraUsageDescription and iOS kills the app the instant the
+    Scan tab opens - no dialog, no log she would see, just a crash on the
+    one screen this target exists for."""
+    spec = (IOS.parent / "project.yml").read_text(encoding="utf-8")
+    assert "NSCameraUsageDescription" in spec
+
+
 def test_the_client_escapes_what_facebook_sends():
     """Item titles come from Marketplace listings, so their text is chosen
     by someone else. app.js must route every one through esc()."""

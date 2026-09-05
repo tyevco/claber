@@ -1,0 +1,47 @@
+# XcodeGen spec. `brew install xcodegen && xcodegen generate` in this
+# directory writes MPLabel.xcodeproj.
+#
+# The project file is generated rather than committed on purpose: a
+# .pbxproj is a wall of UUIDs that conflicts on every branch and cannot
+# be reviewed, and this repo has one developer working from two machines.
+# Twenty lines that can be read beats four hundred that cannot.
+
+name: MPLabel
+options:
+  bundleIdPrefix: com.tyevco
+  deploymentTarget:
+    # DataScannerViewController is iOS 16. 17 is the floor anyway for
+    # ContentUnavailableView and `.task(id:)` behaving as written.
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+targets:
+  MPLabel:
+    type: application
+    platform: iOS
+    sources:
+      - path: MPLabel
+    info:
+      path: MPLabel/Info.plist
+      properties:
+        CFBundleDisplayName: mplabel
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # Required, and the string is shown to her verbatim the first
+        # time the Scan tab opens. Say what it is for, not that the app
+        # would like access.
+        NSCameraUsageDescription:
+          Reads the QR code on a printed label so you do not have to type
+          the code underneath it.
+        # No ATS exception. The intended route in is a tunnel with real
+        # TLS; a plain-http LAN address is a development convenience and
+        # having to notice that it does not work is the point.
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1"    # iPhone. There is no iPad layout.
+        SWIFT_VERSION: "5.9"
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        # Set these on the Mac, or in Xcode's Signing pane:
+        # DEVELOPMENT_TEAM: XXXXXXXXXX
+        CODE_SIGN_STYLE: Automatic
