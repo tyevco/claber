@@ -450,21 +450,26 @@ perfectly is reported as a failure and the caller prints it again. Same
 shape as the fsync/EINVAL incident: the print worked, the bookkeeping
 said otherwise. `printers._jsonable_status` hexes anything bytes-shaped.
 
-**A bin is not a location code, and nothing scans a bin.** `listings.bin`
-is a short free-text name someone writes on a shelf - `B5`, `FLOOR`,
-`ATTIC` - upper-cased and space-collapsed, because `b5` and `B5 ` are one
-shelf in the room and two rows in a `GROUP BY`, and the bin list is
-*derived* from what is in use rather than stored. That is the whole
-reason there is no `locations` table: naming a bin is typing it, and
-retiring one is moving the last thing out.
+**A bin's name is not its code, and only the code is scannable.** The
+name is what someone writes on a shelf and reads across a room - `B5`,
+`FLOOR`, `LOFT, NORTH WALL` - upper-cased and space-collapsed, because
+`b5` and `B5 ` are one shelf in the room and two rows in a `GROUP BY`.
+It could never *be* a code: those names are longer than three characters
+and contain letters the code alphabet leaves out (I, L, O, U, as
+misreadable on thermal). So `bins` carries both, and `find_bin` takes
+either, because the phone has scanned one and a person has typed the
+other.
 
-It is deliberately a different thing from `shelf-tag`'s 3-character
-location codes. `FLOOR` and `ATTIC` are both longer than a code and both
-contain letters the code alphabet leaves out (I, L, O, U are excluded as
-misreadable on thermal), so neither could ever be one. The design this
-came from has **no scanner at all** - the camera is for photographing
-items, and bins are read and typed. Whether a shelf tag should therefore
-print a bin *name* rather than a code is open.
+An earlier version had a free-text `listings.bin` and no table at all,
+on the reasoning that naming a bin is typing it. That was wrong in one
+specific way: a typo made a shelf, silently, and nothing could tell you
+it had. It is now a real reference with `ON DELETE SET NULL` behind an
+enforced pragma - see the Data model section.
+
+The design this came from has **no scanner at all** - the camera is for
+photographing items. The code is on the tag anyway because it costs
+nothing to print and is what an app would read; whether anything ever
+reads it is #16/#17's question, not this table's.
 
 **Three characters means a place, four means a thing.** A location code
 is 3 and an inventory code is 4, and that is load bearing: the marker's
@@ -934,11 +939,13 @@ What is left is physical and needs a camera, not a test:
 
 ### What the tags are for
 
-#19. Shelf tags print but record nothing: no location on a listing, no
-table of places. Needs a schema decision first, and the honest advice is
-to use the printed tags with pencil for a week - how the binning actually
-goes decides whether it wants one location per item or a move history,
-and that is the expensive thing to get wrong.
+#19, largely landed. `bins` exists, `listings.bin_code` references it,
+and `mplabel bin` and `/api/bins` both drive it. What is deliberately
+*not* built is move history: this records where a thing **is**, which is
+the question being asked. If "where has this been?" turns out to be a
+real question, that is a new table beside this one rather than a
+different shape of it - and a week of using the printed tags is still
+the cheapest way to find out which.
 
 ### Moving the order side off the Pi
 
