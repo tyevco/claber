@@ -1,0 +1,244 @@
+//  APIClient.swift
+//
+//  One place that knows how to talk to `mplabel serve`.
+//
+//  Three things this has to get right, all of them learned on the server
+//  side already:
+//
+//  * `/api/v1`. The versioned prefix exists precisely because the PWA
+//    ships with the server and can change in the same commit as a route,
+//    where an app on a phone cannot. Never call the unversioned path.
+//  * `Authorization: Bearer`. The session token was always a stateless
+//    signed token; a cookie was just how a browser carried one. Cookie
+//    handling outside a browser is the sort of thing that works until it
+//    silently does not.
+//  * `X-Mplabel: 1` on mutating requests, or the server answers 400
+//    "missing X-Mplabel header".
+
+import Foundation
+
+actor APIClient {
+    static let shared = APIClient()
+
+    private let session: URLSession
+
+    init(session: URLSession = .shared) {
+        self.session = session
+    }
+
+    // MARK: - where and who
+
+    /// The host is configuration, not a constant: it is loopback in
+    /// development, a tunnel hostname in the house, and it will move
+    /// again when the order side goes to the cluster. Baking it in would
+    /// mean a rebuild to follow a DNS change.
+    private var baseURL: URL? {
+        guard let s = Settings.serverURL, let u = URL(string: s) else { return nil }
+        return u
+    }
+
+    private func request(_ path: String,
+                         method: String = "GET",
+                         body: (any Encodable)? = nil,
+                         authorised: Bool = true) throws -> URLRequest {
+        guard let base = baseURL else { throw APIError.noServerConfigured }
+        guard let url = URL(string: "/api/v1" + path, relativeTo: base) else {
+            throw APIError.badPath(path)
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        // 20s rather than the 60s default. Every call here is a small
+        // query against SQLite on a Pi; a minute of a spinner tells her
+        // nothing she cannot learn in twenty seconds.
+        req.timeoutInterval = 20
+        req.setValue("1", forHTTPHeaderField: "X-Mplabel")
+        if authorised, let token = Keychain.token {
+            req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        }
+        if let body {
+            req.httpBody = try JSONEncoder().encode(AnyEncodable(body))
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        return req
+    }
+
+    private func send<T: Decodable>(_ req: URLRequest, as: T.Type) async throws -> T {
+        let (data, response) = try await session.data(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport("no HTTP response")
+        }
+        if http.statusCode == 401 {
+            // The token has expired or the password changed - both mean
+            // the same thing to her, and both are fixed the same way.
+            // Clear it here so the next call cannot loop, and let the UI
+            // hear about it rather than reaching into a @MainActor type
+            // from inside this actor.
+            Keychain.token = nil
+            NotificationCenter.default.post(name: .mplabelSignedOut, object: nil)
+            throw APIError.unauthorised
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            // The server's refusals are written to be read by a person.
+            // Prefer its sentence over anything invented here.
+            if let e = try? JSONDecoder().decode(ServerError.self, from: data) {
+                throw APIError.server(e.error, http.statusCode)
+            }
+            throw APIError.server("HTTP \(http.statusCode)", http.statusCode)
+        }
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw APIError.decoding(String(describing: error))
+        }
+    }
+
+    // MARK: - session
+
+    func logIn(password: String) async throws {
+        struct Body: Encodable { let password: String }
+        let req = try request("/login", method: "POST",
+                              body: Body(password: password),
+                              authorised: false)
+        let out = try await send(req, as: LoginResponse.self)
+        Keychain.token = out.token
+    }
+
+    /// Cheap authenticated call, used to decide whether a stored token is
+    /// still good before showing her a screen that will 401.
+    func checkSession() async -> Bool {
+        guard Keychain.token != nil else { return false }
+        guard let req = try? request("/orders") else { return false }
+        return (try? await send(req, as: OrdersResponse.self)) != nil
+    }
+
+    // MARK: - orders
+
+    func orders() async throws -> [Order] {
+        try await send(request("/orders"), as: OrdersResponse.self).orders
+    }
+
+    func pending() async throws -> [Order] {
+        try await send(request("/pending"), as: PendingResponse.self).pending
+    }
+
+    func order(_ id: Int) async throws -> OrderDetail {
+        try await send(request("/orders/\(id)"), as: OrderDetail.self)
+    }
+
+    func markShipped(_ id: Int) async throws {
+        _ = try await send(request("/orders/\(id)/ship", method: "POST"),
+                           as: EmptyResponse.self)
+    }
+
+    func unship(_ id: Int) async throws {
+        _ = try await send(request("/orders/\(id)/unship", method: "POST"),
+                           as: EmptyResponse.self)
+    }
+
+    /// Reprint. Note the server refuses if the archived label no longer
+    /// matches the sale it is filed against - that check is the backstop
+    /// between a reprint and a parcel posted to a stranger, so surface
+    /// its message rather than retrying.
+    func printLabel(_ id: Int) async throws -> String? {
+        struct Out: Decodable { let code: String? }
+        return try await send(request("/orders/\(id)/print", method: "POST"),
+                              as: Out.self).code
+    }
+
+    // MARK: - the shelf
+
+    func inventory(query: String = "") async throws -> [InventoryItem] {
+        var path = "/inventory"
+        if !query.isEmpty {
+            let q = query.addingPercentEncoding(
+                withAllowedCharacters: .urlQueryAllowed) ?? ""
+            path += "?q=" + q
+        }
+        return try await send(request(path), as: InventoryResponse.self).items
+    }
+
+    func item(_ id: Int) async throws -> InventoryItem {
+        try await send(request("/inventory/\(id)"), as: ItemResponse.self).item
+    }
+
+    func bins() async throws -> [Bin] {
+        try await send(request("/bins"), as: BinsResponse.self).bins
+    }
+
+    func binContents(_ codeOrName: String) async throws -> BinContents {
+        let e = codeOrName.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed) ?? codeOrName
+        return try await send(request("/bins/\(e)"), as: BinContents.self)
+    }
+
+    func makeBin(name: String) async throws -> Bin {
+        struct Body: Encodable { let name: String }
+        return try await send(request("/bins", method: "POST",
+                                      body: Body(name: name)),
+                              as: BinResponse.self).bin
+    }
+
+    /// An empty `bin` takes the thing off the shelf. That is a real
+    /// answer - it is what an item in her hand is, on its way somewhere -
+    /// so there is no separate delete.
+    func move(item id: Int, toBin code: String) async throws {
+        struct Body: Encodable { let bin: String }
+        _ = try await send(request("/inventory/\(id)/bin", method: "POST",
+                                   body: Body(bin: code)),
+                           as: EmptyResponse.self)
+    }
+
+    // MARK: - scanning
+
+    func lookUp(code: String) async throws -> Lookup {
+        let e = code.uppercased().addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed) ?? code
+        return try await send(request("/lookup/\(e)"), as: Lookup.self)
+    }
+}
+
+// MARK: - plumbing
+
+/// The server answers mutations with `{"ok": true, ...}` and varying
+/// extra fields. Nothing here needs them, and decoding into a shape that
+/// ignores them means a new field server-side is not a client crash.
+struct EmptyResponse: Decodable {}
+
+enum APIError: LocalizedError {
+    case noServerConfigured
+    case badPath(String)
+    case unauthorised
+    case transport(String)
+    case server(String, Int)
+    case decoding(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noServerConfigured:
+            return "No server set yet. Add the address in Settings."
+        case .badPath(let p):
+            return "Bad path \(p)"
+        case .unauthorised:
+            return "Signed out. Sign in again."
+        case .transport(let m):
+            return m
+        case .server(let m, _):
+            return m
+        case .decoding(let m):
+            // Shown rather than swallowed: the client and server ship
+            // separately now, so a shape change is a real possibility and
+            // "something went wrong" would hide exactly the detail that
+            // identifies it.
+            return "The server sent something unexpected. \(m)"
+        }
+    }
+}
+
+/// `any Encodable` cannot be handed to JSONEncoder directly.
+private struct AnyEncodable: Encodable {
+    private let encodeIt: (Encoder) throws -> Void
+    init(_ wrapped: any Encodable) {
+        encodeIt = { try wrapped.encode(to: $0) }
+    }
+    func encode(to encoder: Encoder) throws { try encodeIt(encoder) }
+}
