@@ -165,6 +165,27 @@ extension Lookup: Decodable {
 
 // MARK: - envelopes
 
+/// `/print/pending` answers in one of two shapes depending on
+/// `dry_run`, and never both. Optionals rather than two types, because
+/// the caller already knows which it asked for.
+struct BatchResult: Codable {
+    let printed: [Order]?
+    let failed: [BatchFailure]?
+    let wouldPrint: [Order]?
+
+    enum CodingKeys: String, CodingKey {
+        case printed, failed
+        case wouldPrint = "would_print"
+    }
+}
+
+/// Failures are per row: one bad label must not abandon the rest of the
+/// batch, which is the whole reason the Pending screen exists.
+struct BatchFailure: Codable, Identifiable {
+    let id: Int
+    let error: String
+}
+
 struct OrdersResponse: Codable { let orders: [Order] }
 struct PendingResponse: Codable { let pending: [Order] }
 struct InventoryResponse: Codable { let items: [InventoryItem]; let count: Int }

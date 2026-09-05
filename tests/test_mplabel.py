@@ -2050,6 +2050,14 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
     served |= set(json.loads(body)["item"])
     _s, _h, body = _http(base + web_mod.API_PREFIX + "/orders/1", cookie=cookie)
     served |= set(json.loads(body))
+    # The batch shape is only visible on a POST. A dry run with no ids
+    # prints nothing and uses no labels, which is the whole point of the
+    # flag, so it is safe to ask here - and without it `would_print`
+    # looks like a key the server never sends.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/print/pending", "POST",
+                         {"ids": [], "dry_run": True}, cookie=cookie,
+                         headers={"X-Mplabel": "1"})
+    served |= set(json.loads(body))
     # `expires_in` only appears on login, which the fixture did above.
     served.add("expires_in")
 
