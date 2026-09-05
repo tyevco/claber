@@ -1726,14 +1726,19 @@ def test_login_locks_out_after_repeated_failures():
     assert not t.locked("1.2.3.4", now=time.time() + 61)
 
 
-def test_serve_refuses_to_run_without_a_password():
+def test_serve_refuses_to_run_without_a_password(capsys):
     """Better to fail loudly at startup than to publish customer addresses
-    to the internet because a config key was missed on an upgrade."""
-    from mplabel import web
+    to the internet because a config key was missed on an upgrade.
+
+    The message goes to stderr and the code is EX_CONFIG rather than 1,
+    so systemd stops retrying instead of flapping - see
+    `test_the_phone_app_refuses_the_same_way_printd_does`."""
+    from mplabel import printd, web
 
     with pytest.raises(SystemExit) as exc:
         web.serve({"home": "/tmp", "web_password_hash": ""})
-    assert "passwd" in str(exc.value)
+    assert exc.value.code == printd.EX_CONFIG
+    assert "passwd" in capsys.readouterr().err
 
 
 def test_head_is_answered_not_501(app):
@@ -3376,6 +3381,53 @@ def test_a_config_refusal_exits_so_systemd_stops_retrying(tmp_path, capsys):
     unit = (Path(__file__).parent.parent / "systemd"
             / "mplabel-printd.service").read_text()
     assert "RestartPreventExitStatus=78" in unit,         "the exit code is only half of it; the unit has to honour it"
+
+
+def test_the_phone_app_refuses_the_same_way_printd_does(tmp_path):
+    """Serving the database unauthenticated is not an option, and the
+    refusal is permanent - the next start reads the same config file. So
+    it exits 78 rather than 1, and the unit honours it. printd already
+    paid for this lesson at restart counter 11; there is no reason for
+    the second service to relearn it on her phone."""
+    from mplabel import cli, printd as printd_mod, web as web_mod
+
+    cfg = dict(cli.DEFAULTS, web_password_hash="", home=str(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        web_mod.serve(cfg)
+    assert exc.value.code == printd_mod.EX_CONFIG == 78
+
+    unit = (Path(__file__).parent.parent / "systemd"
+            / "mplabel-web.service").read_text()
+    assert "RestartPreventExitStatus=78" in unit, \
+        "the exit code is only half of it; the unit has to honour it"
+
+
+def test_the_phone_app_unit_can_reach_the_printer_and_the_lock():
+    """It prints - `/api/orders/{id}/print` calls the same `printers.send`
+    the poller does - so with a raw backend it writes to the device node
+    and takes the flock. A unit without the `lp` group serves the whole
+    app perfectly and fails only on the one button that matters, and a
+    PrivateTmp of its own would silently stop the fallback lock path
+    interlocking with the poller or a hand-run reprint over ssh."""
+    unit = (Path(__file__).parent.parent / "systemd"
+            / "mplabel-web.service").read_text()
+    assert "Group=lp" in unit
+    assert "/run/lock" in unit
+    assert not re.search(r"(?m)^PrivateTmp=", unit)
+
+
+def test_every_unit_in_the_repo_is_installed_by_the_installer():
+    """A unit that exists in the repo and not in `install_pi.sh` never
+    reaches the Pi: the documented update path is a git pull and a pip
+    install, and neither writes a unit file. That failure presents as
+    `Failed to enable unit: ... does not exist`, which reads like a
+    missing file in the repo rather than a step nobody ran - and it cost
+    a deployment once already."""
+    root = Path(__file__).parent.parent
+    installer = (root / "install_pi.sh").read_text()
+    for unit in sorted((root / "systemd").glob("*.service")):
+        assert unit.name in installer, \
+            f"{unit.name} is in the repo but install_pi.sh never writes it"
 
 
 def test_printd_refuses_to_print_to_itself(tmp_path):

@@ -34,6 +34,7 @@ import logging
 import mimetypes
 import re
 import secrets
+import sys
 import threading
 import time
 from datetime import datetime
@@ -41,6 +42,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import urlparse, unquote, parse_qs
+
+# For EX_CONFIG only. printd owns that constant because it learned
+# why it is needed; duplicating the number here would let the two
+# drift apart from the unit files that honour it.
+from . import printd as printd_mod
 
 from . import listings as listings_mod
 from . import build as build_mod
@@ -970,10 +976,17 @@ def serve(cfg, bind=None, port=None):
     bind = bind or cfg.get("web_bind", "127.0.0.1")
     port = int(port or cfg.get("web_port", 8080))
     if not cfg.get("web_password_hash"):
-        raise SystemExit(
-            "web_password_hash is not set, and this refuses to serve the "
-            "database unauthenticated.\nRun `mplabel passwd`, put the line "
-            "it prints into /etc/mplabel.conf, and start it again.")
+        # EX_CONFIG, not 1, and the unit carries RestartPreventExitStatus
+        # for it. printd learned this the expensive way: `Restart=always`
+        # against a permanent refusal flapped every ten seconds and buried
+        # the one line saying what was wrong. The next start reads the same
+        # file and reaches the same conclusion, so staying dead where it
+        # can be seen is the only useful behaviour.
+        print("web_password_hash is not set, and this refuses to serve the "
+              "database unauthenticated.\nRun `mplabel passwd`, put the line "
+              "it prints into /etc/mplabel.conf, and start it again.",
+              file=sys.stderr)
+        raise SystemExit(printd_mod.EX_CONFIG)
     httpd = Server((bind, port), cfg)
     log.info("serving on http://%s:%d", bind, port)
     if bind not in ("127.0.0.1", "localhost", "::1"):

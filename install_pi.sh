@@ -77,6 +77,18 @@ sed -e "s|^User=.*|User=$RUN_USER|" \
     -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA_DIR /run/lock|" \
     systemd/mplabel-printd.service > /etc/systemd/system/mplabel-printd.service
 
+# The phone app. Installed but deliberately NOT enabled, like printd:
+# it refuses to start until web_password_hash is set, and enabling it
+# here would mean a fresh install boots straight into a flapping unit
+# whose journal says nothing about what to do. Set the password, then
+# `systemctl enable --now mplabel-web`.
+sed -e "s|^User=.*|User=$RUN_USER|" \
+    -e "s|^WorkingDirectory=.*|WorkingDirectory=$DEST|" \
+    -e "s|^ExecStart=.*|ExecStart=$DEST/venv/bin/python -m mplabel serve|" \
+    -e "s|^ProtectHome=.*|ProtectHome=false|" \
+    -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA_DIR /run/lock|" \
+    systemd/mplabel-web.service > /etc/systemd/system/mplabel-web.service
+
 systemctl daemon-reload
 
 # The raw backends (escpos, tspl, zpl) need usblp, which CUPS unbinds when

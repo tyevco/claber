@@ -1,0 +1,42 @@
+[Unit]
+Description=Marketplace phone app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+# `lp` because this process prints. `/api/orders/{id}/print` and
+# `/api/print/pending` call the same `printers.send` the poller does, so
+# with a raw backend it writes to /dev/usb/lp0 directly and needs the
+# group for it. With printer_backend = pi-http it does not, but the group
+# costs nothing and a unit that only works on one of the two backends is
+# a trap for whoever switches.
+Group=lp
+WorkingDirectory=/opt/mplabel
+ExecStart=/opt/mplabel/venv/bin/python -m mplabel serve
+Restart=always
+RestartSec=10
+# Same reasoning as printd, and the same number. `web_password_hash` not
+# being set is a permanent condition: the next start in ten seconds reads
+# the same config file and refuses again. Without this the unit flaps and
+# buries the one line saying what is wrong. 78 is EX_CONFIG.
+RestartPreventExitStatus=78
+
+EnvironmentFile=-/etc/mplabel.env
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+# The database, the label archive, and the print lock. /run/lock is shared
+# deliberately: this process, the poller and a hand-run `mplabel reprint`
+# over ssh all reach the same printer and must contend for it. So
+# PrivateTmp is NOT set - it would give this unit its own /tmp and
+# silently stop the fallback lock path interlocking with anything else.
+ReadWritePaths=/home/pi/marketplace /run/lock
+
+[Install]
+WantedBy=multi-user.target
