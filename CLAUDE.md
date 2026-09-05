@@ -223,7 +223,7 @@ hardware or a real Facebook account.
 | The shelf marker | **Round-trips in software, never printed or photographed.** 6x24 modules - one by four - carrying 4 data bytes and 7 Reed-Solomon parity, so any 3 of the 11 can be wrong. The interior is 4x22 = 88 modules and the codeword is exactly 88 bits, so nothing is spare. Reads back clean at all four rotations, under a 2.5px blur, scaled to 40%, with 4% salt-and-pepper noise, and out of the decoded print-buffer payload of a real label at both sizes. **Never read off thermal paper by a real camera**, which is the only test that counts - bleed closes modules up and a phone adds glare, motion and a lens. |
 | The browser decoder | **Agrees with the Python reference; never run against a real camera.** `static/marker.js` matches `marker.py` byte for byte on clean and damaged codewords under node. What is untested is everything a phone does: exposure, focus, rolling shutter, and whether the aiming reticle is a usable way to hold a box. |
 | The inventory label | **Prints, and the printable window is measured.** `--style edges` settled it: the left **40** dots and the right **32** never reach the paper, leaving **312 (39mm), not 384**, and the window is **not centred** - unequal insets mean the media sits off-centre under the head rather than the head being narrow. Top and bottom lose nothing. The layout was a symmetric 12-dot guess before, and it cost a real failure: the QR was drawn from x=22, lost its left finder column, and **did not scan** while looking intact in a photograph. `_geometry` now lays out inside the measured window. Measured on one roll; other stock will differ and the edge test is how to find out. **Not yet reprinted against the new window.** |
-| TSPL gap value 0.12in | **ASSUMED.** Typical for 4x6 die-cut; not measured on their stock. |
+| TSPL gap value 0.12in | **Verified on the hardware and on the stock.** A week of production parcels, plus three deliberate labels in a row landing in the same place on their die-cut - no creep, no blank label between them, one job one label. The value was a guess taken from typical 4x6 die-cut; it happens to be right for this roll. A different roll is a different number, and the three-in-a-row print is how to check. |
 | Facebook subject patterns | **Partly verified** against a real mailbox survey. Seen and handled: `Shipping label for your Marketplace order`, `New Marketplace order for <item>` (the sale itself, arriving before the label), and messages as `<emoji> <name> sent you a message`. The rest of `EVENT_PATTERNS` (listed / renewed / expired / payout / rating) is still **ASSUMED** - none has been seen. |
 | The mailbox mixes buying and selling | **Verified.** `You placed an order: <item>`, `Offer submitted: <item>` and `Confirm if you received your order: <item>` are *her purchases*. They carry the **seller's** listing id, so they are classified `purchase`, kept out of the listings table by `BUYER_KINDS`, and their listing id is dropped at record time. Counting them would invent listings that were never for sale and drag sell-through down. |
 | DYI export schema | **ASSUMED.** Undocumented and reshuffled by Meta; importer walks for shape rather than assuming paths. |
@@ -811,8 +811,11 @@ things came out of settling the rest:
   status` got no reply to either query. A failed print cannot be detected
   in software, so printing is at-least-once and the paper is the only
   source of truth. Everything about the journal follows from this.
-- **Creep across a batch is the one untested case** (#9). It only shows
-  on three or more in a row, and it gates the printd deployment.
+- **Creep across a batch: none** (#9, closed). Three in a row landed in
+  the same place. Note this was already answered by a week of production
+  parcels before anyone printed a test - when the hardware has been in
+  daily use, ask what that use has already proved before designing an
+  experiment for it.
 
 Then the split, in order: #10 loopback, #11 off-loopback over a mesh VPN.
 Both are deployment of code that already exists and is tested against a
