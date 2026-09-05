@@ -16,6 +16,8 @@
 
 import AVFoundation
 import SwiftUI
+import UIKit
+import Vision
 import VisionKit
 
 struct ScanView: View {
@@ -160,8 +162,10 @@ struct CodeScanner: UIViewControllerRepresentable {
     }
 }
 
-/// `navigationDestination(item:)` needs Hashable, and an enum of two
-/// payloads gets it for free once both cases are.
+/// `navigationDestination(item:)` needs Hashable and Identifiable. The
+/// Hashable half is synthesised only because `OrderDetail` and
+/// `InventoryItem` both declare it in Models.swift - drop it from either
+/// and the error surfaces here, three files away from the cause.
 extension Lookup: Hashable, Identifiable {
     var id: String {
         switch self {
