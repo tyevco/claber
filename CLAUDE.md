@@ -98,6 +98,22 @@ means a re-run of `install_pi.sh` used to leave the old code in place while
 looking like it had worked. `--no-deps` stops it re-downloading Pillow and
 friends.
 
+**That route updates the package and nothing else.** systemd units and
+udev rules are written by `install_pi.sh`, so a unit added to the repo -
+`mplabel-printd.service` was the first - never reaches the Pi through a
+pull and a pip install. It presents as `Failed to enable unit:
+mplabel-printd.service does not exist`, which reads like a missing file in
+the repo rather than a deployment step nobody ran.
+
+Re-run the installer when anything outside `src/` changes:
+
+```bash
+cd ~/claber && sudo ./install_pi.sh
+```
+
+It is safe to re-run: it does not overwrite `/etc/mplabel.conf`, does not
+enable or start anything, and the apt and venv steps are idempotent.
+
 `/etc/mplabel.conf` is never overwritten by the installer, so after an
 update check by hand that any new key is set. The file beats the built-in
 default.
