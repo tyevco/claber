@@ -31,10 +31,26 @@ from pathlib import Path
 # `connect_db` down with it - every command, not just the new feature.
 # CLAUDE.md says a new column needs a migration; the index needs one too.
 POST_MIGRATION_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_listing_bin ON listings(bin)",
+    "CREATE INDEX IF NOT EXISTS idx_listing_bin ON listings(bin_code)",
 )
 
 SCHEMA = """
+-- A place something can be. The first real relation in this schema, and
+-- it earns one: unlike a listing_id, a bin's identity is minted here, so
+-- there is an actual key to point at rather than a title to match on.
+--
+-- Two halves on purpose. `name` is what is written on the shelf and read
+-- across the room - FLOOR, ATTIC - and it can change without anything
+-- following it. `code` is three characters from the code alphabet, minted
+-- rather than typed, and is what a tag carries and a phone reads. Renaming
+-- a bin moves neither the tag nor the things in it.
+CREATE TABLE IF NOT EXISTS bins (
+    code       TEXT PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT,
+    notes      TEXT
+);
+
 CREATE TABLE IF NOT EXISTS listings (
     id            INTEGER PRIMARY KEY,
     listing_id    TEXT UNIQUE,
@@ -52,20 +68,20 @@ CREATE TABLE IF NOT EXISTS listings (
     first_seen    TEXT,
     last_seen     TEXT,
     inventory_code TEXT,
-    -- Where the thing physically is. A short free-text name the seller
-    -- chooses - B5, FLOOR, ATTIC - not a code and not a foreign key.
+    -- Where the thing physically is. ON DELETE SET NULL because deleting
+    -- a bin should put its contents back on no shelf, not leave them
+    -- pointing at one that is gone - and a dangling code is the failure
+    -- this table exists to make impossible.
     --
-    -- Deliberately a column and not a `locations` table: the bin list is
-    -- derived from what is in use (`bins_in_use`), so naming a new one is
-    -- typing it, and retiring one is moving the last thing out. A table
-    -- would add a second place to keep in step for no answer it can give
-    -- that this cannot.
+    -- Enforced: `connect_db` turns foreign keys on. SQLite has them off
+    -- per connection by default, so a declared reference without that
+    -- pragma is documentation, not a constraint.
     --
-    -- No move history either. It records where a thing *is*, which is the
-    -- question being asked - "where is this?" and "what is in B5?". If
-    -- "where has this been?" ever becomes a real question, that is a new
-    -- table beside this column rather than a different shape of it.
-    bin           TEXT,
+    -- Still no move history. This records where a thing *is*, which is
+    -- what is being asked - "where is this?", "what is in ATTIC?". If
+    -- "where has this been?" becomes a real question it is a new table
+    -- beside this, not a different shape of it.
+    bin_code      TEXT REFERENCES bins(code) ON DELETE SET NULL,
     notes         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_listing_state ON listings(state);
@@ -205,73 +221,181 @@ def upsert_listing(conn, listing_id, source, **fields):
                      list(updates.values()) + [listing_id])
 
 
-# A bin name is what a person writes on a shelf, so it is kept short and
-# case-folded rather than validated into a code. `FLOOR` and `ATTIC` are
-# real answers, and both are longer than a location code and contain
-# letters the code alphabet leaves out - which is the tell that this is a
-# different thing from `shelf-tag`'s 3-character codes, not a variant of
-# them. Nothing scans a bin; a person reads it and types it.
-BIN_MAX = 24
+# A bin is a place something is. Two halves on purpose, and the split is
+# the whole design:
+#
+# `name` is what is written on the shelf and read across the room -
+# `FLOOR`, `ATTIC`, `B5`. It is folded rather than validated into a code
+# because those are real answers, and it can change without anything
+# having to follow it.
+#
+# `code` is the machine half: three characters from the same alphabet as
+# a parcel code, minted rather than typed, and what a shelf tag carries.
+# Renaming a bin moves neither the tag on the shelf nor the things in it.
+BIN_NAME_MAX = 24
+BIN_CODE_LENGTH = 3
 
 
-def normalise_bin(name):
-    """Fold a typed bin name, or None to clear it.
+def normalise_bin_name(name):
+    """Fold a typed bin name.
 
-    Upper-cased and collapsed because `b5`, `B5 ` and `B 5` are one shelf
-    in the room and three rows in a GROUP BY. That matters more than it
-    looks: the bin list is derived from what is in use, so every variant
-    spelling invents a bin that appears in the picker beside the real
-    one."""
-    if name is None:
-        return None
-    folded = " ".join(str(name).split()).upper()
+    Upper-cased and space-collapsed because `attic`, `ATTIC ` and
+    `AT TIC` are one shelf in the room, and a name is how a person finds
+    a thing - two spellings of one shelf is two shelves on the screen."""
+    folded = " ".join(str(name or "").split()).upper()
     if not folded:
-        return None
-    if len(folded) > BIN_MAX:
+        raise ValueError("a bin needs a name - it is what you read across "
+                         "the room; the code is for the phone")
+    if len(folded) > BIN_NAME_MAX:
         raise ValueError(
             f"{folded!r} is {len(folded)} characters; a bin name is at most "
-            f"{BIN_MAX}. It goes on a shelf and gets read across a room")
+            f"{BIN_NAME_MAX}. It goes on a shelf and gets read across a room")
     return folded
 
 
-def set_bin(conn, listing_id, name):
-    """Put one listing in a bin, or take it out of one. Returns the name."""
-    folded = normalise_bin(name)
-    cur = conn.execute("UPDATE listings SET bin=? WHERE id=?",
-                       (folded, listing_id))
+def allocate_bin_code(conn):
+    """Mint a code no bin has ever had.
+
+    Checked against every bin *ever*, not the ones in use - the same rule
+    as an inventory code and for the same reason. A bin's code is printed
+    on a tag stuck to a shelf, and that tag outlives the row: recycling
+    the code leaves a label in the loft naming somewhere else. Which is
+    the opposite of a parcel code, released the moment the parcel ships.
+    Three code spaces, three lifetimes; do not merge them."""
+    import random
+
+    from .marker import ALPHABET
+
+    taken = {r[0] for r in conn.execute("SELECT code FROM bins")}
+    for _ in range(2000):
+        code = "".join(random.choice(ALPHABET)
+                       for _ in range(BIN_CODE_LENGTH))
+        if code not in taken:
+            return code
+    raise ValueError("no free bin code; every combination is taken")
+
+
+def create_bin(conn, name, code=None, notes=None):
+    """Name a place. Returns the row.
+
+    The code is minted here rather than typed, because it exists to be
+    printed and scanned and nobody should have to invent one."""
+    name = normalise_bin_name(name)
+    clash = conn.execute("SELECT code FROM bins WHERE name=?",
+                         (name,)).fetchone()
+    if clash:
+        raise ValueError(
+            f"there is already a bin called {name} ({clash['code']}). "
+            f"Two shelves with one name is how a thing gets lost")
+    code = (code or allocate_bin_code(conn)).upper()
+    conn.execute(
+        "INSERT INTO bins (code, name, created_at, notes) VALUES (?,?,?,?)",
+        (code, name, datetime.now().isoformat(timespec="seconds"), notes))
+    conn.commit()
+    return dict(conn.execute("SELECT * FROM bins WHERE code=?",
+                             (code,)).fetchone())
+
+
+def rename_bin(conn, code, name):
+    """Change what a bin is called. The code does not move.
+
+    This is the whole reason the two are separate: the tag already stuck
+    to the shelf stays valid, and everything in the bin follows the
+    rename for free because it references the code."""
+    name = normalise_bin_name(name)
+    code = (code or "").upper()
+    cur = conn.execute("UPDATE bins SET name=? WHERE code=?", (name, code))
+    conn.commit()
+    if not cur.rowcount:
+        raise ValueError(f"no bin {code}")
+    return dict(conn.execute("SELECT * FROM bins WHERE code=?",
+                             (code,)).fetchone())
+
+
+def find_bin(conn, needle):
+    """A bin by code or by name, whichever was typed.
+
+    The phone has the code and a person has the name, and neither should
+    have to know which one the other used."""
+    needle = " ".join(str(needle or "").split()).upper()
+    if not needle:
+        return None
+    row = conn.execute("SELECT * FROM bins WHERE code=? OR name=?",
+                       (needle, needle)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_bin(conn, needle):
+    """Retire a bin. Whatever was in it goes back on no shelf.
+
+    That last part is the foreign key doing the work: `ON DELETE SET
+    NULL` empties the reference rather than leaving rows pointing at a
+    bin that is gone. It only fires because `connect_db` turns foreign
+    keys on - SQLite ignores a declared reference otherwise."""
+    found = find_bin(conn, needle)
+    if not found:
+        raise ValueError(f"no bin {needle!r}")
+    conn.execute("DELETE FROM bins WHERE code=?", (found["code"],))
+    conn.commit()
+    return found
+
+
+def set_bin(conn, listing_id, needle):
+    """Put one thing in a bin, or take it out of one.
+
+    Takes a code or a name. An empty value clears it - "not set" on the
+    shelf screen is the absence of a bin, not a bin called nothing."""
+    if needle in (None, ""):
+        code = None
+    else:
+        found = find_bin(conn, needle)
+        if not found:
+            raise ValueError(
+                f"no bin {needle!r}. Make it first - a thing cannot be "
+                f"somewhere that has no name")
+        code = found["code"]
+    cur = conn.execute("UPDATE listings SET bin_code=? WHERE id=?",
+                       (code, listing_id))
     conn.commit()
     if not cur.rowcount:
         raise ValueError(f"no listing {listing_id}")
-    return folded
+    return code
 
 
 def bins_in_use(conn, include_sold=False):
-    """Every bin that has something in it, with how much.
+    """Every bin, with what is in it.
 
-    Derived rather than stored - that is the whole reason there is no
-    `locations` table. Naming a new bin is typing it, and retiring one is
-    moving the last thing out of it.
+    A LEFT JOIN, so a bin that has just been made or has just emptied
+    still appears: it exists because someone named it and printed a tag
+    for it, not because something is in it. That is the difference the
+    table buys over deriving the list from the items.
 
-    Sold items are excluded by default: a bin's useful count is what is
-    still on the shelf. `include_sold` answers the other question, which
-    is what *was* there."""
+    Sold items are excluded by default - a bin's useful count is what is
+    still on the shelf. `include_sold` answers what *was* there."""
+    where = "" if include_sold else " AND l.state != 'sold'"
+    rows = conn.execute(
+        f"SELECT b.code, b.name, b.created_at, b.notes, "
+        f"       COUNT(l.id) AS n "
+        f"FROM bins b LEFT JOIN listings l "
+        f"  ON l.bin_code = b.code{where} "
+        f"GROUP BY b.code, b.name, b.created_at, b.notes "
+        f"ORDER BY b.name").fetchall()
+    return [{"code": r["code"], "name": r["name"], "notes": r["notes"],
+             "created_at": r["created_at"], "count": r["n"]} for r in rows]
+
+
+def bin_contents(conn, needle, include_sold=False):
+    """What is in one bin, by code or by name."""
+    found = find_bin(conn, needle)
+    if not found:
+        raise ValueError(f"no bin {needle!r}")
     where = "" if include_sold else " AND state != 'sold'"
     rows = conn.execute(
-        f"SELECT bin, COUNT(*) AS n FROM listings "
-        f"WHERE bin IS NOT NULL AND bin != ''{where} "
-        f"GROUP BY bin ORDER BY bin").fetchall()
-    return [{"bin": r["bin"], "count": r["n"]} for r in rows]
+        f"SELECT id, listing_id, title, price, state, inventory_code, "
+        f"bin_code FROM listings WHERE bin_code=?{where} ORDER BY title",
+        (found["code"],)).fetchall()
+    return {"bin": found, "items": [dict(r) for r in rows]}
 
-
-def bin_contents(conn, name, include_sold=False):
-    """What is in one bin."""
-    folded = normalise_bin(name)
-    where = "" if include_sold else " AND state != 'sold'"
-    rows = conn.execute(
-        f"SELECT id, title, price, state, inventory_code, bin "
-        f"FROM listings WHERE bin=?{where} ORDER BY title", (folded,)
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 def title_key(title):
     """Stable id for a listing we only know by name.
