@@ -432,8 +432,11 @@ class Handler(BaseHTTPRequestHandler):
                     "error": f"could not reach the label maker within "
                              f"{deadline}s; another job was ahead of it"})
             try:
+                # lock=False: `tag_device` above already holds the
+                # flock for this node, and taking it twice deadlocks
+                # against itself - see print_tag_local's docstring.
                 result = printers.print_tag_local(
-                    spec, self.server.cfg, job=job)
+                    spec, self.server.cfg, job=job, lock=False)
             except ValueError as exc:
                 return self.fail(400, str(exc))
             except printers.PrinterUnavailable as exc:

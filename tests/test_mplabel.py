@@ -3636,6 +3636,64 @@ def test_a_stalled_tag_is_not_reported_as_printed(printd, monkeypatch):
     assert again == 409
 
 
+def test_a_tag_print_takes_the_device_lock_exactly_once(printd, monkeypatch):
+    """It took it twice, and the second one deadlocked against the first.
+
+    `print_lock` opens the lock file fresh on every call, so the second
+    is a different open file description - and `flock` conflicts between
+    descriptions even inside one process. printd held the hidraw node via
+    its own `_Device`, then `print_tag_local` blocked for ever trying to
+    take the same lock. Observed on the Pi: `tag_printing: true`,
+    `tag_printing_for: 77.8`, no response, on a printer that answered
+    `supvan-probe` immediately.
+
+    The 4x6 path already knew this - `cli.print_label` skips the flock
+    for `pi-http` because holding it on both sides deadlocked on a
+    same-Pi loopback deployment - and the tag path reintroduced it.
+
+    Counted rather than reproduced, because there is no `flock` on the
+    platform these tests run on, so the deadlock itself cannot be made to
+    happen here. One acquisition is the invariant either way."""
+    import contextlib
+    from mplabel import printers, supvan
+
+    base, _sent, _srv = printd
+    taken = []
+    real_lock = printers.print_lock
+
+    def counting_lock(cfg=None, device=None, required=False):
+        taken.append(device)
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(printers, "print_lock", counting_lock)
+    monkeypatch.setattr(supvan, "print_job",
+                        lambda *a, **k: {"pages_printed": 1, "errors": [],
+                                         "stalled": False})
+
+    status, result = _tag_req(base, SHELF_SPEC)
+    assert status == 200, result
+    assert result["printed"] is True
+    assert len(taken) == 1, f"the device lock was taken {len(taken)} times"
+    assert real_lock is not counting_lock
+
+
+def test_a_dry_run_takes_no_device_lock_at_all(printd, monkeypatch):
+    """It renders and builds and opens nothing, so it must not serialise
+    against a real print either - a preview should never be able to make
+    somebody wait for the printer."""
+    import contextlib
+    from mplabel import printers
+
+    base, _sent, _srv = printd
+    taken = []
+    monkeypatch.setattr(printers, "print_lock",
+                        lambda *a, **k: taken.append(1)
+                        or contextlib.nullcontext())
+
+    status, result = _tag_req(base, dict(SHELF_SPEC, dry_run=True))
+    assert status == 200, result
+    assert taken == []
+
 def test_the_two_endpoints_refuse_each_others_bodies(printd):
     """kind rides inside the signed body, so routing cannot be moved by
     an unsigned header. Cross-posting then fails on body validation

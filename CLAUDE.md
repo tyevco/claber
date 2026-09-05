@@ -338,6 +338,22 @@ commands now print the feed length **in millimetres**, because that is
 the number that has to match the paper, and the default is the stock that
 is actually loaded.
 
+**Taking the print lock twice deadlocks against itself.** `print_lock`
+opens the lock file fresh on every call, so a second call is a different
+open file description - and `flock` conflicts between descriptions **even
+inside one process**. printd held the hidraw node via its own `_Device`,
+`print_tag_local` took the same lock again, and the request blocked for
+ever with the device held and the tag gate shut: `tag_printing_for: 77.8`
+on a printer that answered `supvan-probe` immediately.
+
+The 4x6 path already knew this - `cli.print_label` skips the flock when
+the backend is in `REMOTE_BACKENDS`, because holding it on both sides
+deadlocked on a same-Pi loopback deployment. The tag path reintroduced
+the same bug against the second device. **Exactly one thing takes the
+lock per job**, and a test counts it, because there is no `flock` on the
+platform the tests run on and the deadlock itself cannot be reproduced
+there.
+
 **A configuration refusal must not be retried.** `printd` will not start
 without `printd_secret` - a print request is a physical action and it
 will not accept unsigned jobs - but `Restart=always` turned that into a

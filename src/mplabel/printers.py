@@ -823,8 +823,21 @@ def assemble_tag(spec, cfg):
     return job, result
 
 
-def print_tag_local(spec, cfg=None, device=None, dry_run=False, job=None):
-    """Render and print a tag on a label maker attached to this host."""
+def print_tag_local(spec, cfg=None, device=None, dry_run=False, job=None,
+                    lock=True):
+    """Render and print a tag on a label maker attached to this host.
+
+    `lock=False` for a caller that already holds the device - printd does,
+    via its own `_Device`. Taking it twice is not a no-op: `print_lock`
+    opens the lock file fresh each call, so the second is a different
+    open file description, and `flock` conflicts between descriptions
+    **even inside one process**. It deadlocks against itself and blocks
+    for ever, with the device held and the tag gate shut.
+
+    This is the same trap `REMOTE_BACKENDS` exists for on the 4x6 path -
+    `cli.print_label` skips the flock for `pi-http` because holding it on
+    both sides deadlocked on a same-Pi loopback deployment. Same lesson,
+    second device."""
     from . import supvan as supvan_mod
 
     cfg = cfg or {}
@@ -844,10 +857,13 @@ def print_tag_local(spec, cfg=None, device=None, dry_run=False, job=None):
 
     # The tag printer gets its own lock file - `lock_path` is keyed on
     # the device name, so this is `mplabel-hidraw0.lock` and not the
-    # 4x6 printer's. Today the local tag path takes no lock at all, so a
-    # hand-run `inventory-label --print` over ssh and a daemon would
-    # collide on the hidraw node with nothing to serialise them.
-    with print_lock(cfg, device=device, required=False):
+    # 4x6 printer's. Without it a hand-run `inventory-label --print` over
+    # ssh and a daemon would collide on the hidraw node with nothing to
+    # serialise them.
+    import contextlib
+    held = (print_lock(cfg, device=device, required=False) if lock
+            else contextlib.nullcontext())
+    with held:
         final = supvan_mod.print_job(built, path=device, on_step=step)
 
     result["final"] = _jsonable_status(final)
