@@ -260,8 +260,8 @@ hardware or a real Facebook account.
 | The raw data path works | **Verified on the hardware:** bytes reach `/dev/usb/lp0`, usblp is loaded, the `lp` group permissions are right, paper feeds and marks. If a label comes out wrong from here, suspect the raster or the geometry, not the transport. |
 | `fsync` on `/dev/usb/lp0` fails | **Verified on the hardware.** It returns `EINVAL`; the write itself succeeds and the label prints. `_write_raw` treats fsync as best effort — see the note below on why raising there corrupted the printed/not-printed record. |
 | `escpos` backend | **UNUSED and unproven.** Written while the id was believed, kept because the job structure is unit-tested and some sibling models really do speak ESC/POS. Nothing it produces has ever printed. Its banding size and trailing form feed are guesses. |
-| The QR encoder | **Verified against two independent oracles, never printed.** `qr.py` is hand-written to keep the Pi dependency list short. Its codeword stream is identical to `segno`'s for every version, level and mode in range; all 350 symbols in the sweep decoded correctly through `zxing-cpp`; the Reed-Solomon matches the specification's worked example and the format bits match its published table. Neither library is a dependency - they were the oracle, and pinned matrix digests are what is left of them. **Never read off thermal paper**, where the module size and the burn darkness both matter. |
-| The shelf marker | **Round-trips in software, never printed or photographed.** 6x24 modules - one by four - carrying 4 data bytes and 7 Reed-Solomon parity, so any 3 of the 11 can be wrong. The interior is 4x22 = 88 modules and the codeword is exactly 88 bits, so nothing is spare. Reads back clean at all four rotations, under a 2.5px blur, scaled to 40%, with 4% salt-and-pepper noise, and out of the decoded print-buffer payload of a real label at both sizes. **Never read off thermal paper by a real camera**, which is the only test that counts - bleed closes modules up and a phone adds glare, motion and a lens. |
+| The QR encoder | **Verified in software and now off thermal paper.** `qr.py` is hand-written to keep the Pi dependency list short. Its codeword stream is identical to `segno`'s for every version, level and mode in range; all 350 symbols in the sweep decoded correctly through `zxing-cpp`; the Reed-Solomon matches the specification's worked example and the format bits match its published table. Neither library is a dependency - they were the oracle, and pinned matrix digests are what is left of them. **A printed `inventory-label --qr` then read first time in the iPhone's own Camera app** - so the module size at 5 dots survives thermal bleed, and Apple's decoder accepts what this encoder emits. That was the open physical question and it is closed. Measured on the loaded roll at the default size and density; a much smaller label or a lighter burn is a new question. |
+| The shelf marker | **Round-trips in software, never printed or photographed - and now largely moot.** 6x24 modules - one by four - carrying 4 data bytes and 7 Reed-Solomon parity, so any 3 of the 11 can be wrong. The interior is 4x22 = 88 modules and the codeword is exactly 88 bits, so nothing is spare. Reads back clean at all four rotations, under a 2.5px blur, scaled to 40%, with 4% salt-and-pepper noise, and out of the decoded print-buffer payload of a real label at both sizes. It exists because a QR at this size might not have read off thermal. **It did read**, so the marker's reason for existing is gone: it buys bigger modules at the cost of being readable by nothing but our own decoder. Do not port it to Swift; see the note below. |
 | The browser decoder | **Agrees with the Python reference; never run against a real camera.** `static/marker.js` matches `marker.py` byte for byte on clean and damaged codewords under node. What is untested is everything a phone does: exposure, focus, rolling shutter, and whether the aiming reticle is a usable way to hold a box. |
 | The inventory label | **Prints, and the printable window is measured.** `--style edges` settled it: the left **40** dots and the right **32** never reach the paper, leaving **312 (39mm), not 384**, and the window is **not centred** - unequal insets mean the media sits off-centre under the head rather than the head being narrow. Top and bottom lose nothing. The layout was a symmetric 12-dot guess before, and it cost a real failure: the QR was drawn from x=22, lost its left finder column, and **did not scan** while looking intact in a photograph. `_geometry` now lays out inside the measured window. Measured on one roll; other stock will differ and the edge test is how to find out. **Not yet reprinted against the new window.** |
 | TSPL gap value 0.12in | **Verified on the hardware and on the stock.** A week of production parcels, plus three deliberate labels in a row landing in the same place on their die-cut - no creep, no blank label between them, one job one label. The value was a guess taken from typical 4x6 die-cut; it happens to be right for this roll. A different roll is a different number, and the three-in-a-row print is how to check. |
@@ -408,12 +408,18 @@ dispatcher, auth and CSRF header rule included; the PWA ships with this
 server and can change in the same commit as a route, an app on a phone
 cannot.
 
-**A Swift marker decoder would be a third implementation.** `marker.py`
-and `marker.js` are pinned byte-for-byte by a node test and 137
-assertions; Swift would get none of that. `VNDetectBarcodesRequest` reads
-QR with Apple's own decoder for free, so if the QR scans off thermal at 5
-dots per module the marker becomes deletable rather than portable. That
-is one scan of a printed label, and it has not been done.
+**The native app reads QR and nothing else.** `marker.py` and
+`marker.js` are pinned byte-for-byte by a node test and 137 assertions;
+a Swift port would get none of that harness, and it would be a third
+implementation of a format only we can read. The question was whether a
+QR survives thermal at 5 dots per module, because
+`VNDetectBarcodesRequest` reads those with Apple's own decoder for free.
+**It does** - a printed label read first time in the stock Camera app.
+So the marker does not go to iOS. It stays in the PWA, which already
+has a working decoder and costs nothing to leave alone, and
+`inventory-label --marker` stays for the same reason; but nothing new
+should be built on it, and printing `--qr` is the default worth
+preferring on anything a phone is meant to read.
 
 **Both printers are behind `printd`, and the label maker sends a *spec*
 not a raster.** `tag_backend` picks `supvan` (the local hidraw node) or
@@ -930,10 +936,11 @@ It prints correctly. The encoder, the line order, the printable window
 and the bit polarity are all settled on hardware - see the table above.
 What is left is physical and needs a camera, not a test:
 
-- #16 does the QR scan off thermal at 5 dots per module, and #17 does the
-  shelf marker. **These two decide the shape of the iPhone app** (#20):
-  VisionKit reads QR for free, where the marker would be a third
-  decoder implementation with no parity harness.
+- #16 is **answered: the QR reads off thermal**, first time, in the stock
+  iPhone Camera app. That settles the shape of the iPhone app (#20) -
+  VisionKit reads QR for free, so no marker decoder goes to Swift. #17
+  (does the marker survive a camera) is now a curiosity rather than a
+  blocker and can be closed unread.
 - #18 row order and feed origin. Low priority - labels come out right
   today - but it is the difference between knowing and having been lucky.
 
