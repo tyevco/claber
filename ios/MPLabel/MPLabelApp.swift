@@ -8,6 +8,7 @@
 import SwiftUI
 
 @main
+@MainActor
 struct MPLabelApp: App {
     @StateObject private var session = Session.shared
 
