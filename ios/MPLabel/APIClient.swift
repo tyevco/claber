@@ -145,6 +145,24 @@ actor APIClient {
                               as: Out.self).code
     }
 
+    /// Batch reprint. `dryRun` asks what would happen and uses no
+    /// labels; without `force` the server drops anything already
+    /// printed, which is what makes a second tap safe after the first
+    /// one timed out.
+    func printPending(ids: [Int], dryRun: Bool) async throws -> BatchResult {
+        struct Body: Encodable {
+            let ids: [Int]
+            let dryRun: Bool
+            enum CodingKeys: String, CodingKey {
+                case ids
+                case dryRun = "dry_run"
+            }
+        }
+        return try await send(request("/print/pending", method: "POST",
+                                      body: Body(ids: ids, dryRun: dryRun)),
+                              as: BatchResult.self)
+    }
+
     // MARK: - the shelf
 
     func inventory(query: String = "") async throws -> [InventoryItem] {

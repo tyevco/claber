@@ -40,6 +40,8 @@ struct MainTabs: View {
         TabView {
             QueueView()
                 .tabItem { Label("To ship", systemImage: "shippingbox") }
+            PendingView()
+                .tabItem { Label("Pending", systemImage: "printer.dotmatrix") }
             ShelfView()
                 .tabItem { Label("Shelf", systemImage: "square.grid.2x2") }
             ScanView()
