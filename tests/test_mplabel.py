@@ -1504,13 +1504,17 @@ def test_print_label_still_prints_when_the_lock_cannot_be_made(
 
 # ------------------------------------------------------------ the web app
 
-def _http(url, method="GET", data=None, cookie=None, headers=None):
-    """One request through the real server. Returns (status, headers, body)."""
+def _http(url, method="GET", data=None, cookie=None, headers=None, raw=None):
+    """One request through the real server. Returns (status, headers, body).
+
+    `raw` sends bytes as they are, for the photo upload - which is
+    deliberately not JSON and not multipart."""
     import json as _json
     import urllib.error
     import urllib.request
 
-    body = _json.dumps(data).encode() if data is not None else None
+    body = raw if raw is not None else (
+        _json.dumps(data).encode() if data is not None else None)
     req = urllib.request.Request(url, data=body, method=method)
     if cookie:
         req.add_header("Cookie", cookie)
@@ -6838,3 +6842,260 @@ def test_the_installer_installs_the_print_service():
     # Installed, not enabled: the switch to pi-http is gated on the label
     # geometry being validated first.
     assert "enable --now mplabel-printd" not in text
+
+
+# ------------------------------------- phase 4: where cost basis comes from
+#
+# The analytics have carried `margin` and `net` since the listings views
+# were written, and both have always been null: nothing could record what
+# a thing cost. These are the endpoints that change that, so the tests
+# below are about the ways the money could go quietly wrong rather than
+# about the HTTP.
+
+
+def _auth(base):
+    """A bearer token and the CSRF header, the way the phone sends them."""
+    import json as _json
+
+    status, _, body = _http(f"{base}/api/login", "POST",
+                            {"password": "hunter2"})
+    assert status == 200
+    token = _json.loads(body)["token"]
+    return {"Authorization": "Bearer " + token, "X-Mplabel": "1"}
+
+
+def _json_of(body):
+    import json as _json
+
+    return _json.loads(body)
+
+
+def test_a_trip_reports_what_is_still_unattributed(app):
+    """The number the triage screen is chasing.
+
+    Deliberately not the sum of the items: a receipt has tax on it and
+    things that never became listings, so the gap is real and worth
+    showing rather than forcing to zero."""
+    base, conn = app
+    head = _auth(base)
+
+    status, _, body = _http(f"{base}/api/v1/trips", "POST",
+                            {"store": "GOODWILL 214", "receipt_total": 29.46},
+                            headers=head)
+    assert status == 200
+    trip = _json_of(body)["trip"]
+    assert trip["unassigned"] == 29.46, "nothing attributed yet"
+
+    _http(f"{base}/api/v1/inventory", "POST",
+          {"title": "Stoneware crock", "paid": 4.99, "price": 38.0,
+           "trip": trip["id"]}, headers=head)
+
+    _, _, body = _http(f"{base}/api/v1/trips/{trip['id']}", headers=head)
+    after = _json_of(body)
+    assert after["trip"]["assigned"] == 4.99
+    assert after["trip"]["unassigned"] == 24.47
+    assert after["trip"]["listed_for"] == 38.0
+    assert [i["title"] for i in after["items"]] == ["Stoneware crock"]
+
+
+def test_a_trip_with_no_receipt_total_says_unknown_not_zero(app):
+    """`None` and `0.00` are different answers and the screen shows one of
+    them as money to go and find."""
+    base, _ = app
+    head = _auth(base)
+    _, _, body = _http(f"{base}/api/v1/trips", "POST",
+                       {"store": "ESTATE SALE"}, headers=head)
+    assert _json_of(body)["trip"]["unassigned"] is None
+
+
+def test_an_item_added_by_hand_is_keyed_so_its_sale_can_find_it(app):
+    """A local pickup produces no label email, so the sale turns up later
+    knowing only the title. `link_sales` matches on `title_key`, so a
+    manual item under any other scheme would sit beside its own sale
+    rather than being it."""
+    from mplabel import listings
+
+    base, conn = app
+    head = _auth(base)
+    title = "Hobnail milk glass vase"
+    status, _, body = _http(f"{base}/api/v1/inventory", "POST",
+                            {"title": title, "paid": 6.0, "price": 28.0},
+                            headers=head)
+    assert status == 200
+    item = _json_of(body)["item"]
+    assert item["listing_id"] == listings.title_key(title)
+    # And it is on a shelf-labelable footing straight away.
+    assert len(item["inventory_code"]) == 4
+
+
+def test_a_manual_item_reconciles_with_the_sale_that_follows_it(app):
+    """The end of the same story: she adds the thing, it sells locally,
+    and the two rows must become one."""
+    from mplabel import listings
+
+    base, conn = app
+    head = _auth(base)
+    _http(f"{base}/api/v1/inventory", "POST",
+          {"title": "Pressed glass tumblers", "paid": 3.0}, headers=head)
+    conn.execute(
+        "INSERT INTO sales (message_id, item, price, code, status) VALUES "
+        "('<local>', 'Pressed glass tumblers', 32.0, 'B4M', 'to_ship')")
+    conn.commit()
+
+    listings.refresh(conn)
+    rows = conn.execute(
+        "SELECT paid, price, state FROM listings WHERE title=?",
+        ("Pressed glass tumblers",)).fetchall()
+    assert len(rows) == 1, "the sale must not create a second listing"
+    assert rows[0]["paid"] == 3.0, "the cost survives reconciliation"
+
+
+def test_cost_reaches_the_margin_view(app):
+    """The whole point of the phase. `v_listing_perf.margin` has existed
+    all along and been null on every row."""
+    from mplabel import listings
+
+    base, conn = app
+    head = _auth(base)
+    _, _, body = _http(f"{base}/api/v1/inventory", "POST",
+                       {"title": "Oil portrait, unsigned", "price": 145.0},
+                       headers=head)
+    item = _json_of(body)["item"]
+    assert item["paid"] is None
+
+    _http(f"{base}/api/v1/inventory/{item['id']}/fields", "POST",
+          {"paid": "12.50"}, headers=head)
+    listings.refresh(conn)
+    # The view is keyed by listing_id, not the row id.
+    row = conn.execute(
+        "SELECT paid, margin FROM v_listing_perf WHERE listing_id=?",
+        (item["listing_id"],)).fetchone()
+    assert row["paid"] == 12.5, "a typed '$' string is still money"
+    assert row["margin"] == 132.5
+
+
+def test_a_price_that_is_not_a_number_is_refused_not_dropped(app):
+    """Silently storing "unknown" for a figure she typed is the same class
+    of quiet loss as reading the offset field as dollars."""
+    base, _ = app
+    head = _auth(base)
+    status, _, body = _http(f"{base}/api/v1/inventory", "POST",
+                            {"title": "A thing", "paid": "no idea"},
+                            headers=head)
+    assert status == 400
+    assert "number" in _json_of(body)["error"]
+
+
+def test_the_same_photo_twice_is_one_row(app):
+    """She is in a shop on one bar of signal and the client retries. A
+    second row would put the same receipt in the triage pile twice."""
+    base, _ = app
+    head = dict(_auth(base), **{"Content-Type": "image/jpeg"})
+    shot = b"\xff\xd8\xff\xe0" + b"not really a jpeg, but the bytes are the id"
+
+    status, _, first = _http(f"{base}/api/v1/photos", "POST", raw=shot,
+                             headers=head)
+    assert status == 200
+    status, _, second = _http(f"{base}/api/v1/photos", "POST", raw=shot,
+                              headers=head)
+    assert status == 200
+    assert _json_of(first)["photo"]["id"] == _json_of(second)["photo"]["id"]
+
+    _, _, body = _http(f"{base}/api/v1/photos", headers=head)
+    assert len(_json_of(body)["photos"]) == 1
+
+
+def test_a_photo_is_stored_under_home_and_served_back(app):
+    base, _ = app
+    head = dict(_auth(base), **{"Content-Type": "image/jpeg"})
+    shot = b"\xff\xd8\xff\xe0 the actual bytes"
+    _, _, body = _http(f"{base}/api/v1/photos", "POST", raw=shot, headers=head)
+    photo = _json_of(body)["photo"]
+
+    stored = Path(photo["path"])
+    assert stored.parent.name == "photos", "beside labels/, not loose in home"
+    assert stored.name.startswith(photo["sha256"]), "named by its digest"
+
+    status, headers, served = _http(f"{base}/api/v1/photos/{photo['id']}",
+                                    headers=head)
+    assert status == 200
+    assert served == shot
+    assert headers["Content-Type"] == "image/jpeg"
+
+
+def test_a_photo_of_the_wrong_kind_is_refused_by_type_not_by_filename(app):
+    """The extension is chosen from the Content-Type, so a client cannot
+    name the file on disk."""
+    base, _ = app
+    head = dict(_auth(base), **{"Content-Type": "application/x-msdownload"})
+    status, _, body = _http(f"{base}/api/v1/photos", "POST", raw=b"MZ...",
+                            headers=head)
+    assert status == 400
+    assert "photo must be" in _json_of(body)["error"]
+
+
+def test_the_triage_pile_is_what_has_no_item_yet(app):
+    """No state column and no captures table - "not yet triaged" is the
+    absence of a listing reference, and a flag would be a second place for
+    it to be wrong."""
+    base, _ = app
+    head = _auth(base)
+    shot_head = dict(head, **{"Content-Type": "image/png"})
+    _, _, body = _http(f"{base}/api/v1/photos", "POST", raw=b"\x89PNG shot",
+                       headers=shot_head)
+    photo = _json_of(body)["photo"]
+
+    _, _, body = _http(f"{base}/api/v1/photos", headers=head)
+    assert len(_json_of(body)["photos"]) == 1
+
+    _, _, body = _http(f"{base}/api/v1/inventory", "POST",
+                       {"title": "Chenille bedspread", "paid": 12.0},
+                       headers=head)
+    item = _json_of(body)["item"]
+    _http(f"{base}/api/v1/photos/{photo['id']}/attach", "POST",
+          {"listing": item["id"]}, headers=head)
+
+    _, _, body = _http(f"{base}/api/v1/photos", headers=head)
+    assert _json_of(body)["photos"] == [], "it is about something now"
+
+
+def test_an_oversized_photo_is_refused_before_it_is_read(app):
+    """MAX_BODY stays small on purpose - reading a hundred megabytes into
+    memory on a Pi is how the OOM killer stops the label printer - so the
+    allowance is raised on this one route and nowhere else.
+
+    The refusal is on Content-Length, before a byte of the body is read,
+    which is the whole point: draining it to be polite about the
+    connection would be doing the thing being refused. The client sees
+    the socket go rather than the message, and what has to be true is
+    that nothing was stored."""
+    import urllib.error
+    from mplabel import web
+
+    assert web.MAX_BODY == 2 * 1024 * 1024
+    assert web.MAX_PHOTO > web.MAX_BODY
+
+    base, conn = app
+    head = dict(_auth(base), **{"Content-Type": "image/jpeg"})
+    try:
+        status, _, body = _http(f"{base}/api/v1/photos", "POST",
+                                raw=b"x" * (web.MAX_PHOTO + 1), headers=head)
+        assert status in (400, 413), body
+    except (urllib.error.URLError, ConnectionError, BrokenPipeError):
+        pass
+
+    assert conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0] == 0
+
+
+def test_the_sourcing_routes_need_authentication(app):
+    """Every one of them, including the ones that only read. The receipts
+    and the cost of everything are as private as the addresses."""
+    base, _ = app
+    for method, path in [("GET", "/api/v1/trips"),
+                         ("POST", "/api/v1/trips"),
+                         ("GET", "/api/v1/photos"),
+                         ("POST", "/api/v1/photos"),
+                         ("POST", "/api/v1/inventory")]:
+        status, _, _ = _http(base + path, method,
+                             {} if method == "POST" else None)
+        assert status == 401, f"{method} {path} answered without a token"

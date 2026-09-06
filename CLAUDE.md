@@ -248,6 +248,20 @@ not touch a database that already holds real sales, so `connect_db` carries
 a small `PRAGMA table_info` / `ALTER TABLE` loop. Add to that list, not
 just to `SCHEMA`, or the column exists only on fresh installs.
 
+**Cost basis enters through the sourcing half, and nowhere else.**
+`trips`, `photos` and `listings.paid` had a schema and no API for a
+while, which is why `v_listing_perf.margin` and `v_monthly.net` have
+always been null: the columns compute correctly and nothing could fill
+them. `/api/trips`, `/api/photos` and `POST /api/inventory` are that
+route now. Two things in it are load bearing. A hand-added item is keyed
+with `listings.title_key(title)`, the same derivation the saved-page
+import uses - a local pickup produces no label email, so the sale
+arrives later knowing only the title, and a manual item under any other
+scheme would sit *beside* its own sale instead of being it. And a trip's
+`unassigned` is null rather than zero when `receipt_total` is unknown,
+because "nothing left to attribute" and "we never recorded what the till
+said" are different answers and triage chases one of them.
+
 `listings.refresh()` is the single rebuild entry point: schema ->
 link_sales -> apply_events -> build_views. Analytics are views, not
 tables: `v_listing_perf` derives days_to_sell / days_listed /
@@ -790,6 +804,23 @@ The server is shared across the file, so a test that changes data puts it
 back in `tearDownWithError` - `/unship` and `/inventory/<id>/bin` both
 exist for that - rather than relying on a name that sorts late.
 
+**The body limit is per route, and the photo route is the only big
+one.** `MAX_BODY` is 2MB because reading a hundred megabytes into memory
+on a Pi is how the OOM killer stops the label printer; `MAX_PHOTO` is
+12MB and applies to `POST /api/photos` alone. That refusal is made on
+`Content-Length` **before** a byte is read, so an oversized upload sees
+the socket close rather than the JSON error - draining it to be polite
+about the connection would be doing the exact thing being refused. What
+the test asserts is that nothing was stored.
+
+**A photo upload is idempotent on its digest, and has to be.** She is in
+a shop on one bar of signal and the client retries; a second row would
+put the same receipt in the triage pile twice. The stored filename *is*
+the sha256, and the extension comes from the `Content-Type` rather than
+from any name the client sent. There is still no state column and no
+`captures` table: "not yet triaged" is `photos.listing_id IS NULL`, and
+a flag saying the same thing would be a second place for it to be wrong.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
@@ -1037,6 +1068,21 @@ to a stranger; #22 the Pi's stale copy will reprint shipped parcels with
 recycled codes if anyone runs the documented recovery command on it; #23
 nothing detects the order side being absent, and a warning inside the
 poller cannot detect its own absence.
+
+### The sourcing half
+
+The design (`docs/ui-design-prompt.md`, and the Claude Design handoff
+built from it) has six screens the app does not: Capture, Triage, Add an
+item, One trip, Notifications, and the corrections/label-PDF affordances
+on order detail. **The API for all of it exists now** - trips, photos,
+attach, create-item and an allow-listed item `fields` that takes `paid`.
+What is left is client work in `ios/`, and it is what makes Profit stop
+saying "gross, not profit": the margin views have been correct and empty
+this whole time.
+
+Note the native app deliberately does not have the PWA's "fix a field"
+form yet, so the two clients are uneven in both directions - the app is
+ahead on design fidelity, the PWA is ahead on corrections.
 
 ### Older, still true
 

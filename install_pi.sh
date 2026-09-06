@@ -20,7 +20,11 @@ apt-get install -y python3 python3-venv python3-pip \
 echo "==> adding $RUN_USER to lp and lpadmin"
 usermod -aG lp,lpadmin "$RUN_USER"
 
-install -d -o "$RUN_USER" -g "$RUN_USER" "$DEST" "$DATA_DIR/labels"
+# photos/ beside labels/: the sourcing capture writes there, and the
+# handler creating it on demand would create it owned by whoever ran
+# the request first rather than by $RUN_USER.
+install -d -o "$RUN_USER" -g "$RUN_USER" "$DEST" "$DATA_DIR/labels" \
+    "$DATA_DIR/photos"
 cp -r src pyproject.toml requirements.txt "$DEST"/
 
 # Stamp what is actually being installed. The version in pyproject.toml
