@@ -165,6 +165,14 @@ struct MPHoldButton: View {
         }
         .frame(height: 52)
         .opacity(enabled ? 1 : 0.5)
+        // It is a GeometryReader with a drag gesture, not a Button, so
+        // nothing tells the accessibility tree it is one. Without these
+        // it is announced as plain content - VoiceOver does not call it
+        // a button, and `app.buttons[...]` in a UI test does not find
+        // it either. The trait is the fix for both, and the first is
+        // the one that matters.
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(.isButton)
         .accessibilityLabel(title)
         .accessibilityHint("Press and hold to confirm")
         // VoiceOver cannot hold a button down, so it gets a plain

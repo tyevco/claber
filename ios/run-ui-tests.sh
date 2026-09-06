@@ -172,11 +172,20 @@ TOKEN="$(curl -fsS -X POST "$BASE/api/login" \
     | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
 
 echo "==> running the UI tests against $BASE on $SIMULATOR"
+# TEST_RUNNER_* has to be in xcodebuild's own *environment*, not among
+# its arguments. A trailing KEY=value on an xcodebuild command line is a
+# build setting override, and build settings do not reach the runner
+# process - so the first version passed them as arguments and all eight
+# tests skipped saying they had no server. Which was true, for a reason
+# the message could not have guessed at.
+#
+# xcodebuild copies variables prefixed TEST_RUNNER_ out of its own
+# environment into the runner's, with the prefix stripped.
+TEST_RUNNER_MPLABEL_UITEST_SERVER="$BASE" \
+TEST_RUNNER_MPLABEL_UITEST_TOKEN="$TOKEN" \
+TEST_RUNNER_MPLABEL_UITEST_PASSWORD="$PASSWORD" \
 xcodebuild test \
     -project "$REPO/ios/MPLabel.xcodeproj" \
     -scheme MPLabel \
     -destination "platform=iOS Simulator,name=$SIMULATOR" \
-    -only-testing:MPLabelUITests \
-    TEST_RUNNER_MPLABEL_UITEST_SERVER="$BASE" \
-    TEST_RUNNER_MPLABEL_UITEST_TOKEN="$TOKEN" \
-    TEST_RUNNER_MPLABEL_UITEST_PASSWORD="$PASSWORD"
+    -only-testing:MPLabelUITests
