@@ -2201,6 +2201,103 @@ def test_sold_agrees_with_the_view_the_spreadsheet_uses(app):
     assert from_api == from_view == 28
 
 
+# Not `FIXTURES` - that name is already the synthetic label
+# fixtures at the top of this file, and shadowing it broke
+# seven unrelated tests.
+IOS_FIXTURES = IOS.parent / "MPLabelTests" / "Fixtures"
+
+
+@pytest.mark.skipif(not IOS_FIXTURES.exists(),
+                    reason="the iOS fixtures are not checked out")
+def test_the_ios_fixtures_are_still_what_the_server_sends():
+    """The Swift tests decode committed JSON. That is only worth
+    anything while the JSON is still what this server produces - a
+    fixture that drifts becomes a test asserting the past.
+
+    So: regenerate into a temporary directory and compare the *shapes*
+    against the committed copies. Values are allowed to differ (ids,
+    timestamps, a minted bin code); keys are not.
+
+    Run `python tests/make_ios_fixtures.py` when this fails. The
+    generator starts a real server against a real database and writes
+    what comes back, which is the property a hand-written fixture cannot
+    have - it would carry the same belief as the model it checks."""
+    import importlib.util
+    import shutil
+    import tempfile
+
+    spec = importlib.util.spec_from_file_location(
+        "make_ios_fixtures",
+        Path(__file__).parent / "make_ios_fixtures.py")
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+
+    def shape(node):
+        """Keys all the way down; values discarded. A list contributes
+        the union of its rows' shapes, so a fixture whose first row
+        happens to be complete cannot hide a second row that is not."""
+        if isinstance(node, dict):
+            return {k: shape(v) for k, v in sorted(node.items())}
+        if isinstance(node, list):
+            merged = {}
+            for row in node:
+                sub = shape(row)
+                if isinstance(sub, dict):
+                    merged.update(sub)
+            return [merged] if merged else []
+        return None
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        out = Path(tmp) / "Fixtures"
+        original, gen.OUT = gen.OUT, out
+        try:
+            gen.main()
+        finally:
+            gen.OUT = original
+
+        fresh = {f.stem: json.loads(f.read_text(encoding="utf-8"))
+                 for f in out.glob("*.json")}
+
+    committed = {f.stem: json.loads(f.read_text(encoding="utf-8"))
+                 for f in IOS_FIXTURES.glob("*.json")}
+
+    assert set(committed) == set(fresh), (
+        "the fixture set changed - run python tests/make_ios_fixtures.py")
+
+    drifted = sorted(name for name in fresh
+                     if shape(fresh[name]) != shape(committed[name]))
+    assert not drifted, (
+        f"these payloads no longer match the committed fixtures: {drifted}. "
+        f"Run python tests/make_ios_fixtures.py, and check the Swift models "
+        f"still decode them.")
+
+
+@pytest.mark.skipif(not IOS_FIXTURES.exists(),
+                    reason="the iOS fixtures are not checked out")
+def test_the_fixtures_carry_the_awkward_rows_not_just_the_happy_path():
+    """A fixture where every field is populated proves only that the
+    happy path decodes, and the models are almost entirely Optional
+    precisely because the real database is not like that. Both bugs so
+    far hid in exactly this gap.
+
+    So the generator seeds the awkward shapes on purpose, and this
+    asserts they survived - otherwise a well-meaning tidy-up of the seed
+    data would silently remove the coverage."""
+    orders = json.loads((IOS_FIXTURES / "orders.json").read_text())["orders"]
+    assert any(o["ship_by"] is None for o in orders), \
+        "a local pickup has no ship-by, and that row has to be in here"
+    assert any(not o["has_label"] for o in orders), \
+        "a sale with no label file is a real state, not an error"
+
+    sold = json.loads((IOS_FIXTURES / "sold.json").read_text())["items"]
+    assert any(r["days_to_sell"] is None for r in sold), \
+        "the saved-page import carried no dates; nil is the common case"
+
+    # And no real credential ended up committed.
+    login = json.loads((IOS_FIXTURES / "login.json").read_text())
+    assert login["token"] == "<redacted>"
+
+
 @pytest.mark.skipif(not IOS.exists(), reason="the iOS client is not checked out")
 def test_the_camera_string_is_present_because_its_absence_is_silent():
     """No NSCameraUsageDescription and iOS kills the app the instant the

@@ -1,0 +1,33 @@
+{
+  "count": 2,
+  "items": [
+    {
+      "bin": null,
+      "bin_code": null,
+      "category": null,
+      "days_to_sell": null,
+      "id": 3,
+      "inventory_code": "3XV8",
+      "listed_at": null,
+      "listing_id": null,
+      "price": 145.0,
+      "sold_at": "2026-08-11",
+      "state": "sold",
+      "title": "Oil portrait, unsigned"
+    },
+    {
+      "bin": null,
+      "bin_code": null,
+      "category": "Home",
+      "days_to_sell": 28,
+      "id": 2,
+      "inventory_code": "9QM2",
+      "listed_at": "2026-07-02",
+      "listing_id": null,
+      "price": 60.0,
+      "sold_at": "2026-07-30",
+      "state": "sold",
+      "title": "Chenille bedspread, double"
+    }
+  ]
+}

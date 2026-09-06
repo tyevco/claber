@@ -45,3 +45,25 @@ targets:
         # Set these on the Mac, or in Xcode's Signing pane:
         # DEVELOPMENT_TEAM: XXXXXXXXXX
         CODE_SIGN_STYLE: Automatic
+
+  MPLabelTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: MPLabelTests
+        excludes:
+          - "Fixtures/**"
+      # A folder reference, not a group: the tests look the JSON up by
+      # name in the bundle, and flattening it into individual resources
+      # would work until two fixtures ever shared a name.
+      - path: MPLabelTests/Fixtures
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: MPLabel
+    settings:
+      base:
+        # @testable import needs the app built without optimisation,
+        # which is the default for Debug and worth stating for anyone
+        # who changes the scheme.
+        ENABLE_TESTABILITY: YES
