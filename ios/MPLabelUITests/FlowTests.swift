@@ -219,6 +219,24 @@ final class FlowTests: XCTestCase {
             .waitForExistence(timeout: 10))
     }
 
+    /// A spinner that never stops is how a row pointing at a file that is
+    /// gone used to present - the same failure `mplabel verify` exists to
+    /// catch for labels. The seeded capture has a row and no file on
+    /// disk, which is exactly that case, so the screen has to say so
+    /// rather than wait for a picture that is never going to arrive.
+    func testAPhotographThatCannotLoadSaysSoRatherThanSpinning() throws {
+        let app = try launch()
+        app.buttons["Capture"].tap()
+        XCTAssertTrue(app.staticTexts["No camera here"]
+            .waitForExistence(timeout: 15))
+        app.buttons["Go to triage"].tap()
+
+        XCTAssertTrue(app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS 'did not load'")
+        ).firstMatch.waitForExistence(timeout: 15),
+        "a missing photo file must be reported, not spun on")
+    }
+
     /// Capture took Pending's tab, so the queue's chip is the only way to
     /// the recovery screen. A screen with no route to it is a feature
     /// that does not exist.
