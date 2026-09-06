@@ -907,6 +907,15 @@ button and does not reliably close on `swipeDown()` - the walk drags
 from the top of the card to the bottom of the screen instead, and
 getting that wrong silently took every screen after it.
 
+**Reference goes below the actions, and this has now been got wrong
+twice.** The add-item screen put two optional AI panels between the form
+and its save button; the order screen then put the label and the
+corrections between the order and its print/ship buttons. Both times the
+primary action - the thing the screen exists to do - ended up under a
+fold, and both times a screenshot showed it in a second where the
+assertions had nothing to say. Printing and shipping are what an order
+screen is *for*; the label and a correction are repair.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
@@ -1197,13 +1206,17 @@ trip id is pushed as a `TripRef` rather than an `Int`, because the shelf
 already pushes item ids as `Int` and a tap on a run would otherwise open
 whatever listing shared its number.
 
-Still missing from the design, in rough order of worth:
+**The order-detail affordances are built** - fix a field, a note, and
+the archived label drawn with PDFKit. That closes the last place the PWA
+was ahead of the app. The label is fetched rather than linked: it needs
+the bearer token and a `Link` cannot carry one, so it would open Safari
+to a 401.
 
-- **The order-detail affordances**: fix a field, notes, the label PDF.
-  The PWA has all three and the API has been there all along, so the two
-  clients are uneven in both directions - the app is ahead on design
-  fidelity, the PWA is ahead on corrections.
-- **Notifications**, which needs push and has no backend at all.
+Still missing from the design:
+
+- **Notifications**, which needs push and has no backend at all. The
+  design is clear about the scope - a parcel is due, the printer failed,
+  money has no home, and nothing else earns one.
 
 What is deliberately *not* built: an offline outbox on the phone.
 Uploads go straight up and a failed one keeps its bytes on screen to be

@@ -66,6 +66,13 @@ final class ScreenshotTests: XCTestCase {
         app.staticTexts["7QK"].tap()
         XCTAssertTrue(app.staticTexts["Ships to"].waitForExistence(timeout: 10))
         shot("02-order-detail")
+        app.swipeUp()
+        shot("02b-order-detail-lower")
+        if app.buttons["Edit"].waitForExistence(timeout: 5) {
+            app.buttons["Edit"].tap()
+            sleep(1)
+            shot("02c-order-detail-fixing")
+        }
         app.navigationBars.buttons.firstMatch.tap()
 
         app.buttons["Capture"].tap()

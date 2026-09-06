@@ -7,6 +7,7 @@
 //  These are presentation only. Nothing here talks to APIClient, holds
 //  state that outlives a screen, or knows what a parcel is.
 
+import PDFKit
 import SwiftUI
 
 // MARK: - eyebrow
@@ -349,5 +350,29 @@ struct FlowChips: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+}
+
+/// A PDF, drawn.
+///
+/// PDFKit rather than a `Link` to the endpoint: the label needs the
+/// bearer token to fetch, and a link cannot carry one - it would open
+/// Safari to a 401. So the bytes come through `APIClient` like every
+/// other payload and this only draws them.
+struct PDFPage: UIViewRepresentable {
+    let data: Data
+
+    func makeUIView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.backgroundColor = .clear
+        return view
+    }
+
+    func updateUIView(_ view: PDFView, context: Context) {
+        // Rebuilt each time rather than diffed: a label is a page or two
+        // and the document is cheap, where a stale one is a picture of
+        // somebody else's parcel.
+        view.document = PDFDocument(data: data)
     }
 }
