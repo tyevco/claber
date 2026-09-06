@@ -650,6 +650,15 @@ def _coerce_price(v):
     return float(m.group(1).replace(",", "")) if m else None
 
 
+def parse_money(value):
+    """The importers' price reader, for callers outside this module.
+
+    `web.py` needs exactly this leniency - "$4.99", "4.99" and 4.99 are
+    all things a person types into a phone - and reaching for the private
+    name would make a refactor here a silent break there."""
+    return _coerce_price(value)
+
+
 def _coerce_time(v):
     if v is None:
         return None
@@ -760,3 +769,184 @@ def refresh(conn):
     link_sales(conn)
     apply_events(conn)
     build_views(conn)
+
+
+# ------------------------------------------------------------ the sourcing
+#
+# A trip is one visit to one shop, and it is where cost basis enters the
+# system. Everything else here already knew what a thing *sold* for; this
+# is the half that knows what it cost, and without it every margin in the
+# analytics is null and the profit screen can only report gross.
+#
+# The shape follows the receipt rather than the till. `receipt_total` is
+# what was paid at the counter; `paid` on each listing is what one object
+# is judged to have cost. They do not have to agree - a thrift receipt
+# itemises by department ("HOUSEWARES $4.99"), tax is on it, and some of
+# what came home never becomes a listing. The difference between the two
+# is the unassigned money, and it is worth seeing rather than forcing to
+# zero: a $4 lot of four things is one line on the receipt and four rows
+# here.
+
+
+def create_trip(conn, store, occurred_at=None, receipt_total=None,
+                notes=None):
+    """One shop visit. `store` is the only thing that must be there."""
+    store = (store or "").strip()
+    if not store:
+        raise ValueError("a trip needs a store")
+    now = datetime.now().isoformat(timespec="seconds")
+    cur = conn.execute(
+        "INSERT INTO trips (store, occurred_at, receipt_total, notes, "
+        "created_at) VALUES (?,?,?,?,?)",
+        (store, occurred_at or now[:10], _coerce_price(receipt_total),
+         notes, now))
+    conn.commit()
+    return trip_summary(conn, cur.lastrowid)
+
+
+def trip_summary(conn, trip_id=None):
+    """A trip and what happened to the money.
+
+    `unassigned` is null rather than zero when the receipt total is
+    unknown, because "nothing left to attribute" and "we never recorded
+    what the till said" are different answers and the triage screen shows
+    one of them as a number to chase."""
+    sql = ("SELECT t.*, "
+           "  (SELECT ROUND(SUM(paid), 2) FROM listings "
+           "     WHERE trip_id = t.id) AS assigned, "
+           "  (SELECT ROUND(SUM(price), 2) FROM listings "
+           "     WHERE trip_id = t.id) AS listed_for, "
+           "  (SELECT COUNT(*) FROM listings WHERE trip_id = t.id) AS items "
+           "FROM trips t")
+    args = []
+    if trip_id is not None:
+        sql += " WHERE t.id=?"
+        args.append(int(trip_id))
+    sql += " ORDER BY t.occurred_at DESC, t.id DESC"
+
+    out = []
+    for row in conn.execute(sql, args):
+        trip = dict(row)
+        total, assigned = trip.get("receipt_total"), trip.get("assigned")
+        trip["unassigned"] = (None if total is None
+                              else round(total - (assigned or 0), 2))
+        out.append(trip)
+    if trip_id is not None:
+        return out[0] if out else None
+    return out
+
+
+def create_item(conn, title, **fields):
+    """Add something by hand: a local pickup, or a thing off a shelf.
+
+    Keyed with `title_key`, the same derivation the saved-page import and
+    `link_sales` use. That is not a detail: a local pickup sale produces
+    no label email, so the sale arrives later knowing only the item's
+    name, and a manual item under any other scheme would sit beside its
+    own sale instead of being it."""
+    from . import cli as cli_mod
+
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("an item needs a title")
+
+    allowed = ("price", "paid", "category", "condition", "notes", "state",
+               "listed_at", "trip_id")
+    clean = {k: v for k, v in fields.items() if k in allowed and v not in (None, "")}
+    for money in ("price", "paid"):
+        if money in clean:
+            # Raise rather than drop. `_coerce_price` returns None for
+            # anything it cannot read, and silently storing "unknown"
+            # for a figure she typed is the same class of quiet loss as
+            # reading the offset field as dollars.
+            value = _coerce_price(clean[money])
+            if value is None:
+                raise ValueError(f"{money} must be a number")
+            clean[money] = value
+    if "trip_id" in clean:
+        clean["trip_id"] = int(clean["trip_id"])
+
+    key = title_key(title)
+    upsert_listing(conn, key, "manual", title=title, **clean)
+    # The code is minted here rather than left for the next `refresh`,
+    # because the thing is in her hand now and the label maker is the
+    # next step. `ensure_inventory_codes` never reissues one.
+    cli_mod.ensure_inventory_codes(conn)
+    conn.commit()
+    row = conn.execute("SELECT * FROM listings WHERE listing_id=?",
+                       (key,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_cost(conn, listing_id, paid):
+    """What one object cost. Null clears it back to unknown.
+
+    Deliberately a plain overwrite where `upsert_listing` would not
+    clobber: this is a person answering the question, and correcting a
+    figure she typed yesterday is the normal case."""
+    value = None if paid in (None, "") else _coerce_price(paid)
+    if paid not in (None, "") and value is None:
+        raise ValueError("paid must be a number")
+    conn.execute("UPDATE listings SET paid=? WHERE id=?",
+                 (value, int(listing_id)))
+    conn.commit()
+    return value
+
+
+def add_photo(conn, path, sha256=None, trip_id=None, listing_id=None,
+              taken_at=None):
+    """Record a photograph. The bytes are already on disk.
+
+    Idempotent on the digest, and that is the point rather than a nicety:
+    she is uploading from a shop on a phone with one bar, the client
+    retries, and a second row would put the same receipt in the triage
+    pile twice."""
+    now = datetime.now().isoformat(timespec="seconds")
+    if sha256:
+        row = conn.execute("SELECT * FROM photos WHERE sha256=?",
+                           (sha256,)).fetchone()
+        if row is not None:
+            return dict(row)
+    cur = conn.execute(
+        "INSERT INTO photos (path, sha256, taken_at, created_at, "
+        "listing_id, trip_id) VALUES (?,?,?,?,?,?)",
+        (str(path), sha256, taken_at or now, now,
+         int(listing_id) if listing_id else None,
+         int(trip_id) if trip_id else None))
+    conn.commit()
+    return dict(conn.execute("SELECT * FROM photos WHERE id=?",
+                             (cur.lastrowid,)).fetchone())
+
+
+def attach_photo(conn, photo_id, listing_id=None, trip_id=None):
+    """Point a capture at the thing it turned out to be about."""
+    sets, args = [], []
+    if listing_id is not None:
+        sets.append("listing_id=?")
+        args.append(int(listing_id) if listing_id else None)
+    if trip_id is not None:
+        sets.append("trip_id=?")
+        args.append(int(trip_id) if trip_id else None)
+    if not sets:
+        raise ValueError("nothing to attach")
+    args.append(int(photo_id))
+    conn.execute(f"UPDATE photos SET {', '.join(sets)} WHERE id=?", args)
+    conn.commit()
+    row = conn.execute("SELECT * FROM photos WHERE id=?",
+                       (int(photo_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def untriaged(conn, limit=200):
+    """Captures that are not yet about anything.
+
+    There is no state column and no `captures` table on purpose - the
+    schema note says why. "Not yet turned into an item" is the absence of
+    a listing reference, and a flag saying the same thing would be a
+    second place for it to be wrong."""
+    rows = conn.execute(
+        "SELECT p.*, t.store AS store, t.occurred_at AS trip_date "
+        "FROM photos p LEFT JOIN trips t ON t.id = p.trip_id "
+        "WHERE p.listing_id IS NULL "
+        "ORDER BY p.created_at DESC, p.id DESC LIMIT ?", (int(limit),))
+    return [dict(r) for r in rows]

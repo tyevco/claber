@@ -71,10 +71,28 @@ COOKIE_NAME = "mplabel_session"
 API_VERSION = 1
 API_PREFIX = f"/api/v{API_VERSION}"
 
-# Bodies are small until photos arrive in phase 4; anything larger than
-# this is a mistake or an attack, and reading it into memory on a Pi is
-# how you get the OOM killer to stop the label printer.
+# JSON bodies stay small; anything larger than this is a mistake or an
+# attack, and reading it into memory on a Pi is how you get the OOM
+# killer to stop the label printer.
 MAX_BODY = 2 * 1024 * 1024
+
+# Photographs are the one thing that is legitimately bigger, so the
+# allowance is raised on that route alone rather than globally. An iPhone
+# HEIC is a couple of megabytes and a JPEG from the same camera can be
+# eight; twelve leaves room without letting any other endpoint become a
+# way to hand the Pi a hundred megabytes.
+MAX_PHOTO = 12 * 1024 * 1024
+
+# What the camera roll actually produces, and nothing else. The extension
+# is chosen here rather than taken from the request: a filename from a
+# client is an attacker-controlled string, and this way the stored name
+# cannot be one.
+PHOTO_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/heic": ".heic",
+    "image/heif": ".heic",
+}
 
 # scrypt cost. n=2**14 with r=8 needs ~16MB, which a Pi has and an
 # attacker has to spend per guess.
@@ -229,8 +247,8 @@ def shell_html(path):
     return html
 
 
-def safe_label_path(home, stored):
-    """The archived label for one sale.
+def safe_home_path(home, stored):
+    """A file this server is allowed to hand out: one inside `home`.
 
     The path comes from the database rather than the request, so this is
     belt and braces - but `cmd_file` can write a PDF anywhere, and a row
@@ -244,6 +262,16 @@ def safe_label_path(home, stored):
     except (ValueError, OSError):
         return None
     return target if target.is_file() else None
+
+
+def safe_label_path(home, stored):
+    """The archived label for one sale. See `safe_home_path`."""
+    return safe_home_path(home, stored)
+
+
+def photo_dir(home):
+    """Where photograph bytes live - `home/photos/`, beside `labels/`."""
+    return Path(home) / "photos"
 
 
 # ---------------------------------------------------------- serialisation
@@ -331,6 +359,20 @@ class Handler(BaseHTTPRequestHandler):
         ("POST", r"^/api/orders/(?P<sid>\d+)/fields$", "h_fields", True),
         ("POST", r"^/api/orders/(?P<sid>\d+)/print$", "h_print", True),
         ("POST", r"^/api/print/pending$", "h_print_pending", True),
+        # The sourcing half. Cost basis enters the system here, which is
+        # why every margin in the analytics is null until it does.
+        ("GET", r"^/api/trips$", "h_trips", True),
+        ("POST", r"^/api/trips$", "h_make_trip", True),
+        ("GET", r"^/api/trips/(?P<tid>\d+)$", "h_trip", True),
+        ("POST", r"^/api/trips/(?P<tid>\d+)/fields$", "h_trip_fields", True),
+        ("GET", r"^/api/photos$", "h_photos", True),
+        ("POST", r"^/api/photos$", "h_add_photo", True),
+        ("GET", r"^/api/photos/(?P<pid>\d+)$", "h_photo", True),
+        ("POST", r"^/api/photos/(?P<pid>\d+)/attach$", "h_attach_photo",
+         True),
+        ("POST", r"^/api/inventory$", "h_make_item", True),
+        ("POST", r"^/api/inventory/(?P<lid>\d+)/fields$", "h_item_fields",
+         True),
     ]
     _COMPILED = [(m, re.compile(p), h, a) for m, p, h, a in ROUTES]
 
@@ -596,15 +638,9 @@ class Handler(BaseHTTPRequestHandler):
 
         `bin_mates` is the number the shelf view needs and the client
         should not have to derive with a second request."""
-        row = self.db().execute(
-            "SELECT l.id, l.listing_id, l.title, l.price, l.state, "
-            "l.category, l.condition, l.inventory_code, l.bin_code, "
-            "b.name AS bin, l.listed_at, l.sold_at, l.notes "
-            "FROM listings l LEFT JOIN bins b ON b.code = l.bin_code "
-            "WHERE l.id=?", (int(lid),)).fetchone()
-        if row is None:
+        item = self._item_row(int(lid))
+        if item is None:
             return self.fail(404, "no such item")
-        item = dict(row)
         mates = 0
         if item.get("bin_code"):
             mates = max(0, len(listings_mod.bin_contents(
@@ -622,6 +658,206 @@ class Handler(BaseHTTPRequestHandler):
         body = self.body() or {}
         code = listings_mod.set_bin(self.db(), int(lid), body.get("bin"))
         return self.json({"ok": True, "id": int(lid), "bin_code": code})
+
+    # --- the sourcing half
+    #
+    # What a thing sold for has always been here; what it *cost* arrives
+    # through these. Until it does, `v_listing_perf.margin` is null on
+    # every row and the profit screen can only honestly say "gross".
+
+    def h_trips(self):
+        self.json({"trips": listings_mod.trip_summary(self.db())})
+
+    def h_make_trip(self):
+        body = self.body() or {}
+        trip = listings_mod.create_trip(
+            self.db(), body.get("store"),
+            occurred_at=body.get("occurred_at"),
+            receipt_total=body.get("receipt_total"),
+            notes=body.get("notes"))
+        self.json({"ok": True, "trip": trip})
+
+    def h_trip(self, tid):
+        """One run: the money, what came home, and the receipt shots.
+
+        The receipt's own lines are not in here and there is no table for
+        them. A thrift receipt itemises by department - "HOUSEWARES
+        $4.99" - so a line is not an object and parsing it into rows
+        would invent a precision the paper does not have. The photograph
+        is the record; the attribution is the person's."""
+        trip = listings_mod.trip_summary(self.db(), int(tid))
+        if trip is None:
+            return self.fail(404, "no such trip")
+        items = self.db().execute(
+            "SELECT id, title, price, paid, state, inventory_code, bin_code "
+            "FROM listings WHERE trip_id=? ORDER BY id", (int(tid),))
+        photos = self.db().execute(
+            "SELECT id, taken_at, listing_id FROM photos WHERE trip_id=? "
+            "ORDER BY id", (int(tid),))
+        self.json({"trip": trip,
+                   "items": [dict(r) for r in items],
+                   "photos": [dict(r) for r in photos]})
+
+    def h_trip_fields(self, tid):
+        """Correct a trip. Allow-listed, the same way `h_fields` is."""
+        if listings_mod.trip_summary(self.db(), int(tid)) is None:
+            return self.fail(404, "no such trip")
+        body = self.body() or {}
+        sets, params = [], []
+        for key in ("store", "occurred_at", "receipt_total", "notes"):
+            if key not in body:
+                continue
+            value = body[key]
+            if key == "receipt_total" and value not in (None, ""):
+                value = listings_mod.parse_money(value)
+                if value is None:
+                    raise ValueError("receipt_total must be a number")
+            sets.append(f"{key}=?")
+            params.append(value if value != "" else None)
+        if not sets:
+            raise ValueError("nothing to change")
+        params.append(int(tid))
+        self.db().execute(
+            f"UPDATE trips SET {', '.join(sets)} WHERE id=?", params)
+        self.db().commit()
+        self.json({"ok": True,
+                   "trip": listings_mod.trip_summary(self.db(), int(tid))})
+
+    def h_photos(self):
+        """The triage pile: captures that are not about anything yet."""
+        self.json({"photos": listings_mod.untriaged(self.db())})
+
+    def h_add_photo(self):
+        """One photograph, as raw bytes with a real Content-Type.
+
+        Not multipart. There is exactly one file and no other fields - the
+        trip or listing it belongs to is in the query string - so a
+        multipart parser here would be a dependency and a second thing to
+        get wrong for no gain.
+
+        The stored name is the digest, which is what makes an upload
+        idempotent: she is in a shop on one bar of signal, the client
+        retries, and the same bytes must not become a second row in the
+        triage pile."""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        ext = PHOTO_TYPES.get(ctype.lower())
+        if ext is None:
+            raise ValueError(
+                "a photo must be " + ", ".join(sorted(set(PHOTO_TYPES)))
+                + f" - got {ctype or 'nothing'}")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ValueError("no photo in the body")
+        if length > MAX_PHOTO:
+            raise ValueError("photo too large")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("the upload was cut short")
+
+        digest = hashlib.sha256(raw).hexdigest()
+        directory = photo_dir(self.cfg.get("home"))
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (digest + ext)
+        # Written before the row, and only if it is not already there.
+        # A row pointing at a file that does not exist is the failure
+        # `verify` exists to catch elsewhere; do not create one here.
+        if not path.exists():
+            path.write_bytes(raw)
+
+        qs = parse_qs(urlparse(self.path).query)
+        trip = (qs.get("trip") or [None])[0]
+        listing = (qs.get("listing") or [None])[0]
+        photo = listings_mod.add_photo(
+            self.db(), path, sha256=digest,
+            trip_id=int(trip) if trip else None,
+            listing_id=int(listing) if listing else None)
+        self.json({"ok": True, "photo": photo})
+
+    def h_photo(self, pid):
+        row = self.db().execute("SELECT path FROM photos WHERE id=?",
+                                (int(pid),)).fetchone()
+        if row is None:
+            return self.fail(404, "no such photo")
+        path = safe_home_path(self.cfg.get("home"), row["path"])
+        if path is None:
+            return self.fail(404, "the file is gone")
+        ctype = next((k for k, v in PHOTO_TYPES.items()
+                      if v == path.suffix.lower()), "application/octet-stream")
+        self._send(200, path.read_bytes(), ctype=ctype)
+
+    def h_attach_photo(self, pid):
+        """Say what a capture turned out to be about."""
+        if self.db().execute("SELECT id FROM photos WHERE id=?",
+                             (int(pid),)).fetchone() is None:
+            return self.fail(404, "no such photo")
+        body = self.body() or {}
+        photo = listings_mod.attach_photo(
+            self.db(), int(pid),
+            listing_id=body.get("listing"), trip_id=body.get("trip"))
+        self.json({"ok": True, "photo": photo})
+
+    def h_make_item(self):
+        """Add something by hand.
+
+        Two things arrive this way and neither has an email behind it: a
+        local pickup sale, which Facebook never sends a label for, and a
+        thing off a shelf that is being listed for the first time."""
+        body = self.body() or {}
+        item = listings_mod.create_item(
+            self.db(), body.get("title"),
+            price=body.get("price"), paid=body.get("paid"),
+            category=body.get("category"), condition=body.get("condition"),
+            notes=body.get("notes"), trip_id=body.get("trip"))
+        if item is None:
+            raise ValueError("the item could not be created")
+        if body.get("bin"):
+            listings_mod.set_bin(self.db(), item["id"], body["bin"])
+        for photo_id in body.get("photos") or []:
+            listings_mod.attach_photo(self.db(), int(photo_id),
+                                      listing_id=item["id"])
+        self.json({"ok": True, "item": self._item_row(item["id"])})
+
+    def h_item_fields(self, lid):
+        """Correct a thing on the shelf, cost included.
+
+        `paid` is here rather than on a route of its own because triage
+        is the same operation as a correction: someone is answering "what
+        did this cost" from the receipt in front of them, and answering
+        it twice must be allowed to overwrite."""
+        if self._item_row(int(lid)) is None:
+            return self.fail(404, "no such item")
+        body = self.body() or {}
+        if "paid" in body:
+            listings_mod.set_cost(self.db(), int(lid), body["paid"])
+        sets, params = [], []
+        for key in ("title", "price", "category", "condition", "notes",
+                    "state"):
+            if key not in body:
+                continue
+            value = body[key]
+            if key == "price" and value not in (None, ""):
+                value = listings_mod.parse_money(value)
+                if value is None:
+                    raise ValueError("price must be a number")
+            sets.append(f"{key}=?")
+            params.append(value if value != "" else None)
+        if sets:
+            params.append(int(lid))
+            self.db().execute(
+                f"UPDATE listings SET {', '.join(sets)} WHERE id=?", params)
+            self.db().commit()
+        if "paid" not in body and not sets:
+            raise ValueError("nothing to change")
+        self.json({"ok": True, "item": self._item_row(int(lid))})
+
+    def _item_row(self, lid):
+        row = self.db().execute(
+            "SELECT l.id, l.listing_id, l.title, l.price, l.paid, l.state, "
+            "l.category, l.condition, l.inventory_code, l.bin_code, "
+            "b.name AS bin, l.listed_at, l.sold_at, l.notes, l.trip_id "
+            "FROM listings l LEFT JOIN bins b ON b.code = l.bin_code "
+            "WHERE l.id=?", (int(lid),)).fetchone()
+        return dict(row) if row else None
 
     def h_orders(self):
         # CLOSED_STATUSES, not `!= 'shipped'` - a cancelled order is closed
