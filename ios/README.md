@@ -50,7 +50,7 @@ knowing before it happens on a Saturday.
 
 Without XcodeGen: File > New > Project > iOS App (SwiftUI), then drag
 `MPLabel/` in. The only settings that matter are the deployment target
-(17.0) and `NSCameraUsageDescription` in Info.plist - without that string
+(26.0) and `NSCameraUsageDescription` in Info.plist - without that string
 the app is killed the instant the Scan tab opens, with no message.
 
 ## What is here

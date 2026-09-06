@@ -10,9 +10,22 @@ name: MPLabel
 options:
   bundleIdPrefix: com.tyevco
   deploymentTarget:
-    # DataScannerViewController is iOS 16. 17 is the floor anyway for
-    # ContentUnavailableView and `.task(id:)` behaving as written.
-    iOS: "17.0"
+    # 26, deliberately, and it is a decision rather than drift.
+    #
+    # The old floor was 17 - DataScannerViewController is iOS 16, and 17
+    # is where ContentUnavailableView and `.task(id:)` behave as written.
+    # Nothing needed more than that until `FoundationModels`, which is
+    # iOS 26 and is how a suggestion gets made on the phone rather than
+    # by sending her photographs to somebody's API. Supporting 17 as well
+    # would mean every one of those call sites carrying an `#available`
+    # and a second path that cannot be tested on the only handset there
+    # is, which is a worse trade than dropping OS versions she does not
+    # run.
+    #
+    # Note the image half of that framework is **27**, not 26: passing a
+    # photograph to the model still needs its own `#available` until the
+    # floor moves again.
+    iOS: "26.0"
   createIntermediateGroups: true
 
 targets:

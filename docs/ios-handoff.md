@@ -107,6 +107,20 @@ Once the tests actually ran:
   Pending moved to the queue's "to print" chip and a UI test pins that
   the route exists.
 
+## The floor is iOS 26
+
+Raised from 17 deliberately. Nothing needed more than 17 until
+`FoundationModels` - the on-device model, which is how a suggestion gets
+made on the phone rather than by sending her photographs to somebody's
+API. Supporting 17 as well would put an `#available` on every one of
+those call sites and a second path that cannot be tested on the only
+handset there is.
+
+The image half of that framework is **27**, not 26, so passing a
+photograph to the model still needs its own `#available` until the floor
+moves again. Text in and structured output back (`@Generable`) is
+available at 26.
+
 ## Two open items that are not bugs in the app
 
 **The Pi's `bin_code` has no foreign key.** A column added by `ALTER
