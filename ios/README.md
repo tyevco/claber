@@ -85,15 +85,31 @@ as the models it checks, and that belief has been wrong twice. A pytest
 guard fails if the server's shape drifts from the committed copies.
 
 **`MPLabelUITests`** drives the real app against **the real server**, not
-a mock. `ServerHarness` spawns `mplabel serve` on the Mac (a UI test
-bundle runs on the host, so it can start a process; the simulator shares
-the host's network). Same reasoning: a Swift stub would answer what we
+a mock. Run them with the script, not ⌘U:
+
+```bash
+./ios/run-ui-tests.sh
+SIMULATOR="iPhone 16 Pro" ./ios/run-ui-tests.sh
+MPLABEL_PYTHON=/usr/bin/python3 ./ios/run-ui-tests.sh
+```
+
+The script starts `mplabel serve` against a temporary seeded database,
+passes its address to the runner, and tears it down afterwards.
+
+**The server cannot be started from inside the test bundle**, which is
+worth knowing before trying: an XCUITest runner is an iOS process
+running on the simulator beside the app, so `Process` is not in scope
+there at all. Only the *host* half of the toolchain can spawn anything,
+which is why this is a shell script. What is true is that the simulator
+shares the host's network stack, so a `127.0.0.1` URL in the app reaches
+a server on the Mac.
+
+Still the real server rather than a stub: a stub would answer what we
 *believe* `web.py` answers, so it would have agreed with the models on
 both occasions it mattered and caught neither.
 
-It needs a Python that can import this repo. `python3` on PATH by
-default; `MPLABEL_PYTHON=/path/to/python` overrides, and the failure
-says so rather than surfacing as a connection refusal three layers up.
+⌘U on the UI bundle skips with a sentence saying to run the script,
+rather than failing every test with a connection error.
 
 `TestHooks` is how a test points the app at that server and skips the
 login screen. It is `#if DEBUG` throughout, so on a release build there
