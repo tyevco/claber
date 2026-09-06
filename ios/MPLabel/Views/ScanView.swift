@@ -64,6 +64,19 @@ struct ScanView: View {
                 case .listing(let it):  ItemView(itemID: it.id, preloaded: it)
                 }
             }
+            // Forget the last code when the item screen is dismissed, and
+            // *only* then.
+            //
+            // `scanned` exists to stop one label in front of the lens
+            // firing the same lookup on every delegate callback, so
+            // clearing it on success would defeat it immediately. But
+            // clearing it nowhere is worse: after a scan and a look at
+            // the item, coming back and re-scanning that same label did
+            // nothing, for ever. A new label still worked, which is what
+            // made it read as the camera dying rather than as a bug.
+            .onChange(of: result) { _, now in
+                if now == nil { scanned = nil }
+            }
         }
     }
 
