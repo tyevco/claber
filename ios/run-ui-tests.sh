@@ -69,12 +69,38 @@ EOF
     exit 1
 fi
 
+# Before the server, not after: failing here having already started one
+# leaves a killed background job and a stray temp directory, and the
+# real error scrolls past above the noise.
+if ! xcodebuild -version >/dev/null 2>&1; then
+    cat >&2 <<EOF
+xcodebuild is not usable.
+
+Usually xcode-select is pointing at the Command Line Tools rather than
+at Xcode itself, which is enough to compile but not to drive a
+simulator:
+
+    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    xcodebuild -version
+
+The underlying error:
+EOF
+    xcodebuild -version >&2 || true
+    exit 1
+fi
+
 HOME_DIR="$(mktemp -d)"
 mkdir -p "$HOME_DIR/labels"
 SERVER_PID=""
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        # `wait` rather than letting bash announce "Terminated: 15" on
+        # its own terms - that line looks like a second failure stacked
+        # on the first, and it is only the teardown working.
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
     rm -rf "$HOME_DIR"
 }
 trap cleanup EXIT
