@@ -277,7 +277,18 @@ final class FlowTests: XCTestCase {
         paid.typeText("7.50")
         app.buttons["Done"].firstMatch.tap()
 
-        app.buttons["Hold to save"].press(forDuration: 1.4)
+        // Scroll it into reach first. `press` does not scroll, and a
+        // press on an element that is off screen silently does nothing -
+        // which reads as the save having failed rather than as never
+        // having happened.
+        let save = app.buttons["Hold to save"]
+        XCTAssertTrue(save.waitForExistence(timeout: 10))
+        var swipes = 0
+        while !save.isHittable && swipes < 5 {
+            app.swipeUp()
+            swipes += 1
+        }
+        save.press(forDuration: 1.4)
 
         // Back on the shelf, and the thing is on it.
         XCTAssertTrue(app.staticTexts["Brass candlestick pair"]

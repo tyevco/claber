@@ -311,3 +311,43 @@ struct MPNote: View {
                         in: RoundedRectangle(cornerRadius: MP.R.chip))
     }
 }
+
+/// Chips that wrap onto as many lines as they need.
+///
+/// A horizontal `ScrollView` was the obvious thing and is wrong for
+/// suggestions: a chip that has scrolled off the right edge is one she
+/// will not know was offered, and the whole point of the row is that she
+/// sees every option and picks. Titles here run long, so they wrap.
+struct FlowChips: View {
+    let chips: [(String, String, () -> Void)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: MP.S.x2) {
+            ForEach(Array(chips.enumerated()), id: \.offset) { _, chip in
+                Button(action: chip.2) {
+                    HStack(alignment: .firstTextBaseline, spacing: MP.S.x2) {
+                        Text(chip.0.uppercased())
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .tracking(1)
+                            .foregroundStyle(MP.Palette.muted)
+                            .accessibilityLabel(chip.0)
+                        Text(chip.1)
+                            .font(.system(size: 13.5))
+                            .foregroundStyle(MP.Palette.fg)
+                            .multilineTextAlignment(.leading)
+                        Spacer(minLength: MP.S.x2)
+                        Image(systemName: "plus.circle")
+                            .font(.system(size: 14))
+                            .foregroundStyle(MP.Palette.accent)
+                    }
+                    .padding(.horizontal, MP.S.x3)
+                    .padding(.vertical, MP.S.x2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(MP.Palette.sunken,
+                                in: RoundedRectangle(cornerRadius: MP.R.chip))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
