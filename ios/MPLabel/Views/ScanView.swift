@@ -13,6 +13,13 @@
 //  `marker.py` and `marker.js` are only trustworthy because 137
 //  assertions pin them to each other; a third implementation in Swift
 //  would have none of that harness.
+//
+//  The first version of this screen showed no camera at all, for two
+//  reasons that compounded: nothing ever asked for camera permission,
+//  and `startScanning()` was called as `try?`, so the error explaining
+//  that was discarded. A blank rectangle with an instruction printed
+//  over it is the worst possible way to say "access denied", so both
+//  halves are handled explicitly below and every failure has words.
 
 import AVFoundation
 import SwiftUI
@@ -21,6 +28,16 @@ import Vision
 import VisionKit
 
 struct ScanView: View {
+    /// Permission is a state with four answers, not a Bool. Collapsing
+    /// "not asked yet" into "no" is what produced a blank screen.
+    private enum Access {
+        case checking
+        case granted
+        case denied
+        case unsupported
+    }
+
+    @State private var access: Access = .checking
     @State private var scanned: String?
     @State private var result: Lookup?
     @State private var error: String?
@@ -29,11 +46,15 @@ struct ScanView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if DataScannerViewController.isSupported
-                    && DataScannerViewController.isAvailable {
+                switch access {
+                case .checking:
+                    ProgressView().task { await check() }
+                case .granted:
                     scanner
-                } else {
-                    unavailable
+                case .denied:
+                    denied
+                case .unsupported:
+                    unsupported
                 }
             }
             .navigationTitle("Scan")
@@ -46,19 +67,49 @@ struct ScanView: View {
         }
     }
 
+    // MARK: - permission
+
+    private func check() async {
+        guard DataScannerViewController.isSupported else {
+            access = .unsupported
+            return
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            access = .granted
+        case .notDetermined:
+            // Ask. This is what puts the NSCameraUsageDescription string
+            // in front of her, and until something calls it the status
+            // stays .notDetermined for ever.
+            access = await AVCaptureDevice.requestAccess(for: .video)
+                ? .granted : .denied
+        default:
+            access = .denied
+        }
+    }
+
+    // MARK: - the states
+
     private var scanner: some View {
         ZStack(alignment: .bottom) {
-            CodeScanner(isActive: !busy && result == nil) { code in
-                guard scanned != code else { return }
-                scanned = code
-                look(up: code)
-            }
+            CodeScanner(
+                isActive: !busy && result == nil,
+                onCode: { code in
+                    guard scanned != code else { return }
+                    scanned = code
+                    look(up: code)
+                },
+                onFailure: { message in
+                    // Whatever stopped the scanner starting, say it.
+                    // Silence here is indistinguishable from a camera
+                    // pointed at something unreadable.
+                    error = message
+                })
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .ignoresSafeArea(edges: .bottom)
 
             VStack(spacing: 10) {
-                if let error {
-                    ErrorBanner(message: error)
-                }
+                if let error { ErrorBanner(message: error) }
                 Text("Point at the QR on a label")
                     .font(.footnote)
                     .foregroundStyle(.white)
@@ -70,17 +121,33 @@ struct ScanView: View {
         }
     }
 
-    /// The simulator has no camera and neither does a phone whose owner
-    /// said no. Both are ordinary situations rather than errors, and the
-    /// four-character code is printed on the label in large type for
-    /// exactly this reason.
-    private var unavailable: some View {
+    private var denied: some View {
+        ContentUnavailableView {
+            Label("No camera access", systemImage: "camera.slash")
+        } description: {
+            Text("Scanning needs the camera. Turn it on in Settings, or "
+                 + "type the code from the label on the Shelf tab.")
+        } actions: {
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+        }
+    }
+
+    /// The simulator has no camera, and neither do some devices. Both are
+    /// ordinary situations rather than errors - the four-character code
+    /// is printed on the label in large type for exactly this reason.
+    private var unsupported: some View {
         ContentUnavailableView {
             Label("No camera here", systemImage: "camera.slash")
         } description: {
             Text("Type the code from the label on the Shelf tab instead.")
         }
     }
+
+    // MARK: - looking a code up
 
     private func look(up code: String) {
         busy = true
@@ -110,13 +177,20 @@ struct ScanView: View {
 struct CodeScanner: UIViewControllerRepresentable {
     let isActive: Bool
     let onCode: (String) -> Void
+    let onFailure: (String) -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(onCode: onCode) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCode: onCode, onFailure: onFailure)
+    }
 
     func makeUIViewController(context: Context) -> DataScannerViewController {
         let vc = DataScannerViewController(
             recognizedDataTypes: [.barcode(symbologies: [.qr])],
-            qualityLevel: .balanced,
+            // .accurate, not .balanced: the target is a QR printed at
+            // five dots per module on thermal paper, where the modules
+            // are small and the edges bleed. Frame rate is worth less
+            // here than getting it on the first try.
+            qualityLevel: .accurate,
             recognizesMultipleItems: false,
             isHighFrameRateTrackingEnabled: false,
             isHighlightingEnabled: true)
@@ -127,10 +201,26 @@ struct CodeScanner: UIViewControllerRepresentable {
     func updateUIViewController(_ vc: DataScannerViewController,
                                 context: Context) {
         context.coordinator.onCode = onCode
-        if isActive {
-            try? vc.startScanning()
-        } else {
-            vc.stopScanning()
+        context.coordinator.onFailure = onFailure
+
+        guard isActive else {
+            if vc.isScanning { vc.stopScanning() }
+            return
+        }
+        guard !vc.isScanning else { return }
+
+        // Deferred a turn of the run loop on purpose. `startScanning()`
+        // throws if the view is not yet in a window, and the first
+        // `updateUIViewController` runs before it is - which was the
+        // original bug, made invisible by a `try?`.
+        DispatchQueue.main.async {
+            guard !vc.isScanning, vc.view.window != nil else { return }
+            do {
+                try vc.startScanning()
+            } catch {
+                context.coordinator.onFailure(
+                    "The camera would not start: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -141,8 +231,13 @@ struct CodeScanner: UIViewControllerRepresentable {
 
     final class Coordinator: NSObject, DataScannerViewControllerDelegate {
         var onCode: (String) -> Void
+        var onFailure: (String) -> Void
 
-        init(onCode: @escaping (String) -> Void) { self.onCode = onCode }
+        init(onCode: @escaping (String) -> Void,
+             onFailure: @escaping (String) -> Void) {
+            self.onCode = onCode
+            self.onFailure = onFailure
+        }
 
         func dataScanner(_ scanner: DataScannerViewController,
                          didAdd addedItems: [RecognizedItem],
@@ -158,6 +253,12 @@ struct CodeScanner: UIViewControllerRepresentable {
                     return
                 }
             }
+        }
+
+        func dataScanner(_ scanner: DataScannerViewController,
+                         becameUnavailableWithError error:
+                            DataScannerViewController.ScanningUnavailable) {
+            onFailure("Scanning stopped: \(error.localizedDescription)")
         }
     }
 }
