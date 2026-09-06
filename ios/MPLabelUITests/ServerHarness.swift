@@ -94,6 +94,27 @@ struct ServerHarness {
         return id
     }
 
+    /// A listing's id by its title, for a test that typed the title and
+    /// needs to ask the server what it made of it.
+    func listingID(forTitle title: String) throws -> Int {
+        let data = try get("/api/v1/inventory")
+        let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let items = root?["items"] as? [[String: Any]] ?? []
+        guard let match = items.first(where: { $0["title"] as? String == title }),
+              let id = match["id"] as? Int else {
+            throw XCTSkip("no listing titled \(title)")
+        }
+        return id
+    }
+
+    /// What the server thinks one thing cost. The whole sourcing half
+    /// exists to make this number not-null.
+    func paid(forListing id: Int) throws -> Double? {
+        let data = try get("/api/v1/inventory/\(id)")
+        let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        return (root?["item"] as? [String: Any])?["paid"] as? Double
+    }
+
     private func request(_ path: String, method: String,
                          body: [String: Any]? = nil) throws -> Data {
         var req = URLRequest(url: URL(string: baseURL + path)!)

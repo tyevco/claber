@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS listings (
     price         REAL,
     category      TEXT,
     condition     TEXT,
+    -- Roughly when the thing is from - "c. 1910", "mid-century", "1970s".
+    -- Free text and deliberately not a year: her titles say "Antique
+    -- 1900-1915 American Edwardian", which is a range, a guess and a
+    -- selling point all at once, and pinning it to an integer would
+    -- force a precision the object does not have. Nothing computes on
+    -- it; it is there because it is most of what a buyer asks.
+    era           TEXT,
     listed_at     TEXT,
     sold_at       TEXT,
     removed_at    TEXT,
@@ -850,8 +857,8 @@ def create_item(conn, title, **fields):
     if not title:
         raise ValueError("an item needs a title")
 
-    allowed = ("price", "paid", "category", "condition", "notes", "state",
-               "listed_at", "trip_id")
+    allowed = ("price", "paid", "category", "condition", "era", "notes",
+               "state", "listed_at", "trip_id")
     clean = {k: v for k, v in fields.items() if k in allowed and v not in (None, "")}
     for money in ("price", "paid"):
         if money in clean:

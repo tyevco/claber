@@ -7146,3 +7146,74 @@ def test_the_sourcing_routes_need_authentication(app):
         status, _, _ = _http(base + path, method,
                              {} if method == "POST" else None)
         assert status == 401, f"{method} {path} answered without a token"
+
+
+def test_era_is_free_text_and_survives_a_migration(app):
+    """Roughly when a thing is from - "c. 1910", "mid-century".
+
+    Not a year, and that is the point: her titles say "Antique 1900-1915
+    American Edwardian", which is a range and a guess at once. An integer
+    column would force a precision the object does not have.
+
+    It is also the newest column, so it is the one that proves the
+    migration loop still runs - `CREATE TABLE IF NOT EXISTS` will not
+    touch a database that already holds real sales."""
+    base, conn = app
+    head = _auth(base)
+    status, _, body = _http(f"{base}/api/v1/inventory", "POST",
+                            {"title": "Oil portrait, unsigned",
+                             "era": "c. 1910", "condition": "Craquelure",
+                             "paid": 12.0}, headers=head)
+    assert status == 200
+    item = _json_of(body)["item"]
+    assert item["era"] == "c. 1910"
+    assert item["condition"] == "Craquelure"
+
+    # And it is correctable like every other field.
+    _http(f"{base}/api/v1/inventory/{item['id']}/fields", "POST",
+          {"era": "mid-century"}, headers=head)
+    _, _, body = _http(f"{base}/api/v1/inventory/{item['id']}", headers=head)
+    assert _json_of(body)["item"]["era"] == "mid-century"
+
+
+def test_a_database_predating_era_gains_it(tmp_path):
+    """The migration itself, against a database built without the column."""
+    import sqlite3
+
+    from mplabel import cli, listings
+
+    # `connect_db` opens home/sales.db, not any name the caller picks -
+    # writing this as mplabel.db made the test build one database and
+    # migrate a different, empty one.
+    path = tmp_path / "sales.db"
+    conn = sqlite3.connect(path)
+    # Drop the column from the DDL, the way a database created before it
+    # existed would have been. A literal string replace here silently
+    # matched nothing once, and the test then asserted on a schema that
+    # did have the column - passing for the wrong reason is exactly what
+    # this test is guarding against elsewhere.
+    older = re.sub(r"^\s*era\s+TEXT,\n", "", listings.SCHEMA, flags=re.M)
+    # The word appears in half the prose in that file ("several",
+    # "operates"), so this asks about the *declaration*.
+    assert not re.search(r"^\s*era\s+TEXT", older, flags=re.M), \
+        "the era column was not removed from the DDL"
+    conn.executescript(older)
+    conn.commit()
+    conn.close()
+    assert "era" not in _columns(path, "listings")
+
+    conn = cli.connect_db(tmp_path)
+    try:
+        assert "era" in _columns(path, "listings")
+    finally:
+        conn.close()
+
+
+def _columns(path, table):
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    finally:
+        conn.close()

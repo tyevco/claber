@@ -16,12 +16,20 @@ struct ShelfView: View {
     @State private var note: String?
     @State private var newBinName = ""
     @State private var askingForBin = false
+    @State private var addingItem = false
     @State private var path = NavigationPath()
 
     var body: some View {
         NavigationStack(path: $path) {
             MPScreen(eyebrow: "Shelf", title: "Where things are") {
-                Button { askingForBin = true } label: {
+                // One affordance, two things that can be new here: a
+                // place, and a thing to put in one. A second button in
+                // the header would make her read two icons to find out
+                // they are not the same plus.
+                Menu {
+                    Button("New item") { addingItem = true }
+                    Button("New bin") { askingForBin = true }
+                } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(MP.Palette.fg)
@@ -31,7 +39,7 @@ struct ShelfView: View {
                         .overlay(RoundedRectangle(cornerRadius: MP.R.chip)
                             .strokeBorder(MP.Palette.border, lineWidth: 1))
                 }
-                .accessibilityLabel("New bin")
+                .accessibilityLabel("Add")
             } content: {
                 if let error { MPError(message: error) }
                 if let note { MPNote(message: note) }
@@ -81,6 +89,13 @@ struct ShelfView: View {
             .task { await loadBins() }
             .refreshable { await loadItems(); await loadBins() }
             .navigationDestination(for: Int.self) { ItemView(itemID: $0) }
+            // A sheet, like the settings screen: adding a thing is a
+            // detour from looking at the shelf, not a place in it.
+            .sheet(isPresented: $addingItem) {
+                NavigationStack {
+                    AddItemView(onSaved: { _ in Task { await loadItems() } })
+                }
+            }
             .navigationDestination(for: String.self) { BinView(code: $0) }
             .alert("Name this place", isPresented: $askingForBin) {
                 TextField("FLOOR, ATTIC, B5…", text: $newBinName)

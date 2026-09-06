@@ -807,7 +807,8 @@ class Handler(BaseHTTPRequestHandler):
             self.db(), body.get("title"),
             price=body.get("price"), paid=body.get("paid"),
             category=body.get("category"), condition=body.get("condition"),
-            notes=body.get("notes"), trip_id=body.get("trip"))
+            era=body.get("era"), notes=body.get("notes"),
+            trip_id=body.get("trip"))
         if item is None:
             raise ValueError("the item could not be created")
         if body.get("bin"):
@@ -830,8 +831,8 @@ class Handler(BaseHTTPRequestHandler):
         if "paid" in body:
             listings_mod.set_cost(self.db(), int(lid), body["paid"])
         sets, params = [], []
-        for key in ("title", "price", "category", "condition", "notes",
-                    "state"):
+        for key in ("title", "price", "category", "condition", "era",
+                    "notes", "state"):
             if key not in body:
                 continue
             value = body[key]
@@ -853,7 +854,7 @@ class Handler(BaseHTTPRequestHandler):
     def _item_row(self, lid):
         row = self.db().execute(
             "SELECT l.id, l.listing_id, l.title, l.price, l.paid, l.state, "
-            "l.category, l.condition, l.inventory_code, l.bin_code, "
+            "l.category, l.condition, l.era, l.inventory_code, l.bin_code, "
             "b.name AS bin, l.listed_at, l.sold_at, l.notes, l.trip_id "
             "FROM listings l LEFT JOIN bins b ON b.code = l.bin_code "
             "WHERE l.id=?", (int(lid),)).fetchone()
