@@ -17,6 +17,7 @@ struct ShelfView: View {
     @State private var newBinName = ""
     @State private var askingForBin = false
     @State private var addingItem = false
+    @State private var trips: [Trip] = []
     @State private var path = NavigationPath()
 
     var body: some View {
@@ -43,6 +44,31 @@ struct ShelfView: View {
             } content: {
                 if let error { MPError(message: error) }
                 if let note { MPNote(message: note) }
+
+                // The way to the sourcing runs, and it carries the one
+                // number worth interrupting her for: money that came out
+                // of a till and has not been attached to anything yet.
+                // On the shelf because that is where she is when the
+                // question "what did this cost" occurs to her.
+                Button { path.append(Runs()) } label: {
+                    MPCard {
+                        HStack(spacing: MP.S.x2) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Sourcing runs")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(MP.Palette.fg)
+                                Text(runsLine)
+                                    .font(.system(size: 11.5))
+                                    .foregroundStyle(MP.Palette.muted)
+                            }
+                            Spacer(minLength: MP.S.x2)
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(MP.Palette.subtle)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
 
                 if !bins.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -87,8 +113,11 @@ struct ShelfView: View {
                 await loadItems()
             }
             .task { await loadBins() }
+            .task { await loadTrips() }
             .refreshable { await loadItems(); await loadBins() }
             .navigationDestination(for: Int.self) { ItemView(itemID: $0) }
+            .navigationDestination(for: TripRef.self) { TripView(tripID: $0.id) }
+            .navigationDestination(for: Runs.self) { _ in TripsView() }
             // A sheet, like the settings screen: adding a thing is a
             // detour from looking at the shelf, not a place in it.
             .sheet(isPresented: $addingItem) {
@@ -105,6 +134,20 @@ struct ShelfView: View {
                 Text("The code is minted for you - print its tag afterwards.")
             }
         }
+    }
+
+    private var runsLine: String {
+        guard !trips.isEmpty else { return "Where the things came from" }
+        // Null is not zero: a run with no recorded till total cannot say
+        // how much is unattributed, and summing it as 0 would report
+        // "all accounted for" about a question nobody has asked yet.
+        let owed = trips.compactMap(\.unassigned).reduce(0, +)
+        if owed <= 0 { return "\(trips.count) runs, every penny attributed" }
+        return "\(trips.count) runs - " + money(owed) + " has no home yet"
+    }
+
+    private func loadTrips() async {
+        trips = (try? await APIClient.shared.trips()) ?? []
     }
 
     private func loadItems() async {

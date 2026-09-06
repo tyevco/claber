@@ -192,11 +192,32 @@ echo "==> running the UI tests against $BASE on $SIMULATOR"
 #
 # xcodebuild copies variables prefixed TEST_RUNNER_ out of its own
 # environment into the runner's, with the prefix stripped.
+# TEST_RUNNER_MPLABEL_SHOTS gates Screenshots.swift, which skips itself
+# unless it is 1 - so the ordinary run does not pay two minutes for
+# pictures nobody asked for.
+#
+# Note there is no comment *inside* the assignment block below. A comment
+# line after a trailing backslash ends the continuation, which quietly
+# turned the three assignments into their own no-op command and left
+# xcodebuild with only the last one - so the runner had the screenshot
+# flag and no server, and skipped saying so.
+# Expanded as ${extra[@]+"${extra[@]}"} below, not "${extra[@]}": macOS
+# ships bash 3.2, where an *empty* array expansion under `set -u` is an
+# unbound variable and kills the script. The screenshot run passes a
+# result bundle so its array is never empty, which is exactly why this
+# only broke the ordinary run.
+extra=()
+if [ -n "${MPLABEL_RESULT_BUNDLE:-}" ]; then
+    extra+=(-resultBundlePath "$MPLABEL_RESULT_BUNDLE")
+fi
+
 TEST_RUNNER_MPLABEL_UITEST_SERVER="$BASE" \
 TEST_RUNNER_MPLABEL_UITEST_TOKEN="$TOKEN" \
 TEST_RUNNER_MPLABEL_UITEST_PASSWORD="$PASSWORD" \
+TEST_RUNNER_MPLABEL_SHOTS="${MPLABEL_SHOTS:-0}" \
 xcodebuild test \
+    ${extra[@]+"${extra[@]}"} \
     -project "$REPO/ios/MPLabel.xcodeproj" \
     -scheme MPLabel \
     -destination "platform=iOS Simulator,name=$SIMULATOR" \
-    -only-testing:MPLabelUITests
+    -only-testing:"${MPLABEL_ONLY_TESTING:-MPLabelUITests}"

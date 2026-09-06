@@ -882,6 +882,31 @@ removes it afterwards, where it is deterministic and unit-tested rather
 than a thing we hope the model does. `paid` is not in the generated type
 at all, so no guess can ever reach a margin.
 
+**A comment inside a line continuation ends it.** `run-ui-tests.sh`
+carries a block of `TEST_RUNNER_*` assignments prefixing `xcodebuild`,
+and a comment dropped between two of them terminated the continuation -
+so the assignments became their own no-op command and xcodebuild
+inherited only the last one. The runner got the screenshot flag and no
+server, and skipped saying it had no server. Same class as the original
+`TEST_RUNNER_*` bug and the same symptom: a message that is true about a
+cause it cannot see.
+
+**A picture of every screen, and why it is not a snapshot test.**
+`./ios/screenshots.sh` walks the app against the same seeded server the
+UI tests use and writes `ios/screenshots/`. It exists because looking at
+the app found two things the assertions did not - a photograph that
+failed to load sat on a spinner for ever, and the save button had
+drifted underneath two optional panels. Neither is visible to a test
+that asks whether a string is on screen. Nothing is compared against a
+committed image on purpose: a pixel diff on a design that is still
+moving fails whenever a padding changes, and says "something moved"
+rather than "this is wrong". The judgement stays a person's; the script
+only makes it cheap. It is skipped unless `MPLABEL_SHOTS=1`, so the
+ordinary run does not pay two minutes for it. Note a sheet has no back
+button and does not reliably close on `swipeDown()` - the walk drags
+from the top of the card to the bottom of the screen instead, and
+getting that wrong silently took every screen after it.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
@@ -1165,10 +1190,15 @@ that will bite you*.
 Raising the deployment floor to **iOS 26** is what made this reasonable
 rather than a second code path that could not be tested.
 
+**One trip is built** - `TripsView` and `TripView`, reached from a card
+on the Shelf that carries the number worth interrupting her for: money
+that came out of a till and has not been attached to anything yet. A
+trip id is pushed as a `TripRef` rather than an `Int`, because the shelf
+already pushes item ids as `Int` and a tap on a run would otherwise open
+whatever listing shared its number.
+
 Still missing from the design, in rough order of worth:
 
-- **One trip** - spent / listed for / unassigned, what came home. The
-  payload already answers it; there is no screen.
 - **The order-detail affordances**: fix a field, notes, the label PDF.
   The PWA has all three and the API has been there all along, so the two
   clients are uneven in both directions - the app is ahead on design
