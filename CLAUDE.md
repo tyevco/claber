@@ -25,10 +25,27 @@ python -m mplabel --help
 python -m mplabel file tests/fixtures/label_sample.pdf   # no config needed
 ```
 
+The iOS client is a second gate, on a Mac with Xcode:
+
+```bash
+xcodebuild test -project ios/MPLabel.xcodeproj -scheme MPLabel \
+    -destination 'platform=iOS Simulator,name=iPhone 17 Pro'   # unit tests
+./ios/run-ui-tests.sh                      # UI tests; starts a real server
+SIMULATOR="iPhone 16 Pro" ./ios/run-ui-tests.sh
+python tests/make_ios_fixtures.py          # regenerate ios/MPLabelTests/Fixtures
+```
+
 There is no linter, formatter or type checker configured, and no CI.
-`pytest` is the entire gate - one test file, `tests/test_mplabel.py`.
-Do not add tooling without asking; the Pi dependency list is kept short
-on purpose.
+`pytest` is the gate for the Python side - one test file,
+`tests/test_mplabel.py`, ~520 tests. Do not add tooling without asking;
+the Pi dependency list is kept short on purpose.
+
+**The Swift fixtures are generated, not written.** `make_ios_fixtures.py`
+runs a real server against a temporary database and saves what it
+actually answers, because a hand-written fixture encodes the same belief
+about `web.py` that the Swift models do - and that belief has been wrong
+twice. `test_the_ios_fixtures_are_still_what_the_server_sends` fails when
+the server's shape drifts, and pytest is where that is caught, not Xcode.
 
 Config resolution order: `MPLABEL_<KEY>` env var, then
 `/etc/mplabel.conf`, then `~/.config/mplabel.conf`, then `DEFAULTS` in
@@ -76,6 +93,14 @@ run against a real database.
 | `import <path> --format dyi\|csv\|saved [--state ...]` | listings from a file |
 | `inventory [-o F] [--state S] [--all]` | CSV of inventory labels for the label maker |
 | `sheets [--dry-run]` | push to Google Sheets |
+
+| Servers and recovery | |
+|---|---|
+| `serve [--bind] [--port]` | the phone app's HTTP server (`web.py`). Binds loopback by default; the intended route in is a Cloudflare tunnel |
+| `printd [--bind] [--port]` | the print side of the split (`printd.py`). Owns both printers, knows nothing about orders. Refuses to start without `printd_secret`, exit **78** |
+| `passwd` | set the web password (scrypt), written to the config file |
+| `status` | ask the G4 how it is. **It does not answer** - kept as the record of that, see the table below |
+| `reconcile [--since JOB] [--dry-run]` | reconcile the local DB against printd's journal. The recovery path for an ambiguous print |
 
 `probe`, `selftest`, `supvan-probe` and `file` run above `connect_db` in
 `main()` - see the note below on why.
@@ -138,13 +163,26 @@ src/mplabel/
   sheets.py      Google Sheets sync via service account
   supvan.py      T50M Pro label maker: HID transport, frames, status
   lzma1.py       LZMA1 encoder, match coded, no end-of-stream marker
+  web.py         the phone app's server: stdlib http.server, scrypt +
+                 signed tokens, the PWA and the /api/v1 surface
+  printd.py      the print side of the split: /print, /print-tag,
+                 /printed, HMAC, spool, durable journal
+  build.py       what code is actually running - install_pi.sh writes
+                 _build.py beside it, so a checkout says "checkout"
+  static/        the PWA: index.html, app.js, app.css, manifest, icons,
+                 and marker.js - the marker decoder, a port of marker.py
 
-tests/fixtures/   synthetic stand-ins; make_label.py regenerates the PDF
-tests/make_ios_fixtures.py  captures real payloads for the iOS tests
-ios/              the native client. See docs/ios-handoff.md before
-                  touching it - it was written on a machine that cannot
-                  compile Swift, and the caveats matter
-mplabel.conf.example, systemd/mplabel.service, udev/99-clabel-g4.rules
+tests/test_mplabel.py     the whole Python suite, one file
+tests/fixtures/           synthetic stand-ins; make_label.py regenerates the PDF
+tests/make_ios_fixtures.py  captures real server payloads for the Swift tests
+ios/                      the native client; see ios/README.md and
+                          docs/ios-handoff.md for what the Windows box
+                          could not verify
+docs/                     ios-handoff, split-architecture,
+                          supvan-t50m-protocol, phone-access,
+                          phase2-hardware-checklist, ui-design-prompt
+mplabel.conf.example, systemd/{mplabel,mplabel-web,mplabel-printd}.service
+udev/99-clabel-g4.rules, udev/99-supvan-t50m.rules
 install_pi.sh     Pi bootstrap
 ```
 
@@ -286,7 +324,7 @@ hardware or a real Facebook account.
 | DYI export schema | **ASSUMED.** Undocumented and reshuffled by Meta; importer walks for shape rather than assuming paths. |
 | Saved-page JSON shape | **ASSUMED.** Field names from public GraphQL modules; fixture is synthetic. |
 | `printd` split (`pi-http`) | **Verified on the hardware, over loopback.** Both printers driven over HTTP: a 4x6 through `/print` and an inventory label through `/print-tag`, each journaled with the right `kind` and `outcome`, and the printed 4x6 indistinguishable from a `tspl` one. So the transport, the HMAC, the spool, the deadline, the journal and both device paths are all real now. **Not yet run off loopback** - that is a bind address and a mesh VPN. |
-| The native iOS client | **Builds and runs against the real server; the camera is still untested.** Xcode compiles it, the simulator launches it, and it reads her actual orders, listings and bins off the Pi through a cloudflared tunnel - so the bearer token, the `/api/v1` prefix, every Codable shape and the whole HTTPS path are confirmed on real data rather than a fixture. Two things are **not**: the simulator has no camera, so `ScanView` - the entire reason this target exists rather than a web page - has never read a label; and nothing has been printed from it, which is the one action that spends physical stock. Both need a real device. |
+| The native iOS client | **Builds, runs against the real server, and its eight UI journeys now execute.** Xcode compiles it, the simulator launches it, and it reads her actual orders, listings and bins off the Pi through a cloudflared tunnel - so the bearer token, the `/api/v1` prefix, every Codable shape and the whole HTTPS path are confirmed on real data rather than a fixture. `./ios/run-ui-tests.sh` is green: 8/8 against a real `mplabel serve`, plus 19 Swift unit tests. Before that the runner had never executed a single assertion - all eight skipped, because `TEST_RUNNER_*` was being passed as a build setting - so everything the UI tests covered was unproven and two of them were in fact wrong. Two things are still **not** verified: the simulator has no camera, so `ScanView` - the entire reason this target exists rather than a web page - has never read a label; and nothing has been printed from it, which is the one action that spends physical stock. Both need a real device. |
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 
@@ -737,6 +775,20 @@ runs the browser file under node against vectors generated from the
 Python side, damaged codewords included, because error correction is
 exactly where a port diverges quietly. It has already caught one: the
 format renumbering above landed in Python and not in JavaScript.
+
+**Styling must not reach the accessibility tree, and XCTest sorts by
+name.** Two separate traps, both of which present as a screen that never
+appeared. `MPEyebrow` uppercases its caption for looks, and that
+uppercased string was what landed in the accessibility label - so
+`app.staticTexts["Ships to"]` matched nothing while the words were
+plainly on screen. It carries `.accessibilityLabel(text)` now, which also
+stops VoiceOver shouting. Separately, XCUITest runs a class's methods in
+**alphabetical order, not source order**: `testShipping...` sorts before
+`testTheQueue...`, so the test that ships 7QK ran first and emptied the
+queue the later test asserts on, however carefully the file was ordered.
+The server is shared across the file, so a test that changes data puts it
+back in `tearDownWithError` - `/unship` and `/inventory/<id>/bin` both
+exist for that - rather than relying on a name that sorts late.
 
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
