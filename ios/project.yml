@@ -34,9 +34,14 @@ targets:
         NSCameraUsageDescription:
           Reads the QR code on a printed label so you do not have to type
           the code underneath it.
-        # No ATS exception. The intended route in is a tunnel with real
-        # TLS; a plain-http LAN address is a development convenience and
-        # having to notice that it does not work is the point.
+        # No blanket ATS exception, in any configuration. The route in
+        # is a tunnel with real TLS.
+        #
+        # Debug adds NSAllowsLocalNetworking below, and only that: it
+        # permits http to the local network and nothing else, which is
+        # what a UI test driving a Python server on 127.0.0.1 needs.
+        # NSAllowsArbitraryLoads would permit the whole internet and has
+        # a way of outliving the afternoon that justified it.
     settings:
       base:
         TARGETED_DEVICE_FAMILY: "1"    # iPhone. There is no iPad layout.
@@ -45,6 +50,13 @@ targets:
         # Set these on the Mac, or in Xcode's Signing pane:
         # DEVELOPMENT_TEAM: XXXXXXXXXX
         CODE_SIGN_STYLE: Automatic
+      configs:
+        debug:
+          # Local network only, and only in Debug. The release build
+          # that goes on her phone has no exception at all, so a
+          # plain-http address still fails there - which is the
+          # behaviour worth keeping.
+          INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
 
   MPLabelTests:
     type: bundle.unit-test
@@ -67,3 +79,11 @@ targets:
         # which is the default for Debug and worth stating for anyone
         # who changes the scheme.
         ENABLE_TESTABILITY: YES
+
+  MPLabelUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: MPLabelUITests
+    dependencies:
+      - target: MPLabel
