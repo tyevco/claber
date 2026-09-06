@@ -673,9 +673,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"kind": "sale", "id": sale["id"],
                               "detail": _order_detail(sale)})
 
+        # `id` is not decoration: it is the row id every other inventory
+        # route is keyed on, so without it a scanned code identifies an
+        # item the client then cannot open. Leaving it out shipped as
+        # "Key id not found in key decoding container" on a phone, which
+        # names the field and nothing else.
+        #
+        # The bin comes along for the same reason it does on /inventory -
+        # scanning a thing and being told where it lives is most of the
+        # point - and the name is joined here so the client is never
+        # holding a code it has to resolve with a second request.
         row = self.db().execute(
-            "SELECT listing_id, title, price, state, inventory_code "
-            "FROM listings WHERE UPPER(inventory_code)=?",
+            "SELECT l.id, l.listing_id, l.title, l.price, l.state, "
+            "l.category, l.inventory_code, l.bin_code, b.name AS bin "
+            "FROM listings l LEFT JOIN bins b ON b.code = l.bin_code "
+            "WHERE UPPER(l.inventory_code)=?",
             (code,)).fetchone()
         if row is not None:
             return self.json({"kind": "listing", "listing": dict(row)})

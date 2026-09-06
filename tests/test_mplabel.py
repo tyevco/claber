@@ -2048,6 +2048,11 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
     _s, _h, body = _http(base + web_mod.API_PREFIX + "/inventory/1",
                          cookie=cookie)
     served |= set(json.loads(body)["item"])
+    # /lookup has its own hand-written SELECT rather than reusing one of
+    # the row helpers, so it is the one payload that can drift on its own.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/lookup/7K2M",
+                         cookie=cookie)
+    served |= set(json.loads(body).get("listing") or {})
     _s, _h, body = _http(base + web_mod.API_PREFIX + "/orders/1", cookie=cookie)
     served |= set(json.loads(body))
     # The batch shape is only visible on a POST. A dry run with no ids
@@ -2065,6 +2070,48 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
     assert not missing, (
         f"Models.swift maps keys the server never sends: {missing}. "
         f"Each one decodes as nil and shows as a blank row.")
+
+
+@pytest.mark.skipif(not IOS.exists(), reason="the iOS client is not checked out")
+def test_a_scanned_code_can_actually_be_opened(app):
+    """`/api/lookup` used to answer without the row id, so a scan
+    identified an item the client then had no way to open. It shipped as
+    "Key id not found in key decoding container" on a phone - which names
+    the field and nothing else, and only after a label had been printed
+    and pointed at.
+
+    The key-contract test missed it twice over: it only checked *remapped*
+    CodingKeys, and `id` maps to itself; and it never called /lookup at
+    all. Both are fixed, but this asserts the specific shape, because the
+    scanner is the reason the app exists."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (title, state, inventory_code) "
+                 "VALUES ('Hobnail vase', 'active', '7K2M')")
+    conn.commit()
+
+    from mplabel import web as web_mod
+
+    status, _h, body = _http(base + web_mod.API_PREFIX + "/lookup/7k2m",
+                             cookie=cookie)
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["kind"] == "listing"
+    listing = payload["listing"]
+
+    # Every field the Swift `InventoryItem` requires without an Optional.
+    # These are the ones whose absence is a decode failure rather than a
+    # blank row - which is the difference between a screen that looks
+    # empty and one that never appears.
+    assert isinstance(listing.get("id"), int), \
+        "a scanned code that cannot be opened is not a lookup"
+    # And enough to render the row it lands on without a second request.
+    for key in ("title", "inventory_code", "bin", "bin_code", "state"):
+        assert key in listing, f"/lookup omits {key}"
+
+    # Case-insensitive, because this is read off thermal paper by a
+    # camera and the alphabet has no lowercase in it anyway.
+    assert listing["inventory_code"] == "7K2M"
 
 
 @pytest.mark.skipif(not IOS.exists(), reason="the iOS client is not checked out")
