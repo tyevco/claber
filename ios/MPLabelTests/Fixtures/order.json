@@ -1,0 +1,21 @@
+{
+  "buyer": "Sam Sample",
+  "code": "7QK",
+  "has_label": true,
+  "id": 1,
+  "item": "Hobnail milk glass vase",
+  "listing_id": null,
+  "notes": null,
+  "order_id": null,
+  "price": 28.0,
+  "print_count": 0,
+  "printed": false,
+  "printed_at": null,
+  "received_at": null,
+  "service": null,
+  "ship_by": "2026-09-08",
+  "ship_to": "2 FICTION RD, SHELBYVILLE IN 46176",
+  "status": "to_ship",
+  "tracking": "9400100000000000000000",
+  "weight": null
+}

@@ -1,0 +1,163 @@
+"""Capture real server payloads as fixtures for the iOS tests.
+
+    python tests/make_ios_fixtures.py
+
+The Swift models are written against what `web.py` returns, and twice
+now they have been wrong about it in a way no Swift test could catch: a
+missing `id` on `/lookup`, and five CodingKeys validated against payloads
+that were empty lists. A hand-written JSON fixture would have had the
+same blind spot, because it would have been written from the same
+belief.
+
+So these are not written by hand. This starts a real server against a
+real (temporary) database, makes real requests, and writes what comes
+back. `test_the_ios_fixtures_are_still_what_the_server_sends` then fails
+if the server's shape drifts away from the committed copies, and says to
+re-run this.
+
+Same idea as `tests/fixtures/make_label.py`: the fixture is generated so
+that it cannot quietly become a fiction.
+
+Nothing here touches a real database or a real printer. The rows are
+invented, in the house style - the names are not a customer's.
+"""
+
+import json
+import pathlib
+import sys
+import threading
+import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+
+from mplabel import cli, listings, web  # noqa: E402
+
+OUT = pathlib.Path(__file__).resolve().parents[1] / "ios" / "MPLabelTests" / "Fixtures"
+
+PASSWORD = "fixture-password"
+
+
+def seed(conn):
+    """Rows chosen so every payload has something in it.
+
+    Deliberately includes the awkward cases the real database is full
+    of: a sale with no listing id, a listing with no dates, a sold item
+    with no cost. An all-populated fixture proves only that the happy
+    path decodes."""
+    conn.execute(
+        "INSERT INTO sales (message_id, item, buyer, price, ship_by, code, "
+        "ship_to, tracking, status, label_pdf, notes) VALUES "
+        "('<m1>', 'Hobnail milk glass vase', 'Sam Sample', 28.0, "
+        "'2026-09-08', '7QK', '2 FICTION RD, SHELBYVILLE IN 46176', "
+        "'9400100000000000000000', 'to_ship', '/tmp/none.pdf', NULL)")
+    # No tracking, no buyer surname, no label: a local pickup.
+    conn.execute(
+        "INSERT INTO sales (message_id, item, price, code, status) VALUES "
+        "('<m2>', 'Pressed glass tumblers', 32.0, 'B4M', 'to_ship')")
+    conn.commit()
+
+    trip = conn.execute(
+        "INSERT INTO trips (store, occurred_at, receipt_total) "
+        "VALUES ('GOODWILL 214', '2026-07-01', 21.40)")
+    conn.commit()
+    trip_id = conn.execute("SELECT id FROM trips").fetchone()["id"]
+
+    conn.executemany(
+        "INSERT INTO listings (title, price, paid, state, inventory_code, "
+        "listed_at, sold_at, category, renewed_count, trip_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [("Hobnail milk glass vase", 28.0, 6.0, "active", "7K2M",
+          "2026-07-01", None, "Home", 1, trip_id),
+         # sold, costed, with both dates - margin and days_to_sell fill in
+         ("Chenille bedspread, double", 60.0, 12.0, "sold", "9QM2",
+          "2026-07-02", "2026-07-30", "Home", 0, trip_id),
+         # sold with no cost and no dates: the saved-page import's shape
+         ("Oil portrait, unsigned", 145.0, None, "sold", "3XV8",
+          None, "2026-08-11", None, 0, None)])
+    conn.commit()
+
+    listings.create_bin(conn, "ATTIC")
+    bin_code = listings.find_bin(conn, "ATTIC")["code"]
+    conn.execute("UPDATE listings SET bin_code=? WHERE inventory_code='7K2M'",
+                 (bin_code,))
+    conn.execute("INSERT INTO photos (path, listing_id, trip_id) "
+                 "VALUES ('photos/a.jpg', NULL, ?)", (trip_id,))
+    conn.commit()
+    return bin_code
+
+
+def main():
+    import tempfile
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    # ignore_cleanup_errors because the server's per-thread SQLite
+    # connections outlive the shutdown on Windows, and a failed rmdir
+    # of a temp directory is not a reason to lose the fixtures.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        home = pathlib.Path(tmp)
+        (home / "labels").mkdir(parents=True, exist_ok=True)
+        conn = cli.connect_db(home)
+        bin_code = seed(conn)
+
+        cfg = {"home": str(home),
+               "web_password_hash": web.hash_password(PASSWORD),
+               "web_session_days": "30", "web_secure_cookie": "no"}
+        srv = web.Server(("127.0.0.1", 0), cfg)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        def call(path, method="GET", body=None, token=None):
+            data = json.dumps(body).encode() if body is not None else None
+            req = urllib.request.Request(base + path, data=data,
+                                         method=method)
+            req.add_header("Content-Type", "application/json")
+            req.add_header("X-Mplabel", "1")
+            if token:
+                req.add_header("Authorization", "Bearer " + token)
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return json.loads(res.read())
+
+        try:
+            login = call("/api/login", "POST", {"password": PASSWORD})
+            token = login["token"]
+            sid = call(web.API_PREFIX + "/orders", token=token)["orders"][0]["id"]
+            lid = call(web.API_PREFIX + "/inventory",
+                       token=token)["items"][0]["id"]
+
+            wanted = {
+                "login": login,
+                "orders": call(web.API_PREFIX + "/orders", token=token),
+                "order": call(f"{web.API_PREFIX}/orders/{sid}", token=token),
+                "pending": call(web.API_PREFIX + "/pending", token=token),
+                "inventory": call(web.API_PREFIX + "/inventory", token=token),
+                "item": call(f"{web.API_PREFIX}/inventory/{lid}", token=token),
+                "bins": call(web.API_PREFIX + "/bins", token=token),
+                "bin": call(f"{web.API_PREFIX}/bins/{bin_code}", token=token),
+                "sold": call(web.API_PREFIX + "/sold", token=token),
+                "stats": call(web.API_PREFIX + "/stats", token=token),
+                "lookup_listing": call(web.API_PREFIX + "/lookup/7K2M",
+                                       token=token),
+                "lookup_sale": call(web.API_PREFIX + "/lookup/7QK",
+                                    token=token),
+                # dry run: prints nothing and uses no labels
+                "batch": call(web.API_PREFIX + "/print/pending", "POST",
+                              {"ids": [], "dry_run": True}, token=token),
+            }
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            conn.close()
+
+    # The token is a real signed credential for a database that no longer
+    # exists, but there is no reason to commit one.
+    wanted["login"]["token"] = "<redacted>"
+
+    for name, payload in wanted.items():
+        (OUT / f"{name}.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8")
+    print(f"wrote {len(wanted)} fixtures to {OUT}")
+
+
+if __name__ == "__main__":
+    main()

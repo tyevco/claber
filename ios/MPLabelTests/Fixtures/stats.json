@@ -1,0 +1,58 @@
+{
+  "aging": [
+    {
+      "days_listed": 67,
+      "inquiries": 0,
+      "listing_id": null,
+      "price": 28.0,
+      "renewed_count": 0,
+      "title": "Hobnail milk glass vase"
+    }
+  ],
+  "monthly": [
+    {
+      "avg_days_to_sell": null,
+      "avg_order": 145.0,
+      "costed": 0,
+      "gross": 145.0,
+      "month": "2026-08",
+      "net": null,
+      "orders": 1
+    },
+    {
+      "avg_days_to_sell": 28.0,
+      "avg_order": 60.0,
+      "costed": 1,
+      "gross": 60.0,
+      "month": "2026-07",
+      "net": 48.0,
+      "orders": 1
+    }
+  ],
+  "price_bands": [
+    {
+      "avg_days_to_sell": null,
+      "avg_price": 29.33,
+      "listed": 3,
+      "price_band": "$25-50",
+      "sell_through_pct": 66.7,
+      "sold": 2
+    },
+    {
+      "avg_days_to_sell": 28.0,
+      "avg_price": 60.0,
+      "listed": 1,
+      "price_band": "$50-100",
+      "sell_through_pct": 100.0,
+      "sold": 1
+    },
+    {
+      "avg_days_to_sell": null,
+      "avg_price": 145.0,
+      "listed": 1,
+      "price_band": "$100+",
+      "sell_through_pct": 100.0,
+      "sold": 1
+    }
+  ]
+}

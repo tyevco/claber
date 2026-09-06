@@ -1,0 +1,28 @@
+{
+  "orders": [
+    {
+      "buyer": "Sam",
+      "code": "7QK",
+      "has_label": true,
+      "id": 1,
+      "item": "Hobnail milk glass vase",
+      "notes": null,
+      "price": 28.0,
+      "printed": false,
+      "ship_by": "2026-09-08",
+      "status": "to_ship"
+    },
+    {
+      "buyer": null,
+      "code": "B4M",
+      "has_label": false,
+      "id": 2,
+      "item": "Pressed glass tumblers",
+      "notes": null,
+      "price": 32.0,
+      "printed": false,
+      "ship_by": null,
+      "status": "to_ship"
+    }
+  ]
+}

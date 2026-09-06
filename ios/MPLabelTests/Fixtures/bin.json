@@ -1,0 +1,19 @@
+{
+  "bin": {
+    "code": "JBQ",
+    "created_at": "2026-09-06T11:12:59",
+    "name": "ATTIC",
+    "notes": null
+  },
+  "items": [
+    {
+      "bin_code": "JBQ",
+      "id": 1,
+      "inventory_code": "7K2M",
+      "listing_id": null,
+      "price": 28.0,
+      "state": "active",
+      "title": "Hobnail milk glass vase"
+    }
+  ]
+}
