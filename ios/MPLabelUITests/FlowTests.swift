@@ -15,22 +15,22 @@ final class FlowTests: XCTestCase {
 
     override func setUpWithError() throws {
         continueAfterFailure = false
-        server = try ServerHarness()
-        try server.start()
+        // Skips with instructions if the script did not start one.
+        server = try ServerHarness.fromEnvironment()
     }
 
-    override func tearDown() {
-        server?.stop()
-        super.tearDown()
-    }
-
+    /// The app gets the same address the runner was given. Note the
+    /// server is *shared* across the tests in this file rather than one
+    /// per test - starting it is the script's job and it happens once -
+    /// so a test that changes data must tolerate the others, and
+    /// anything that ships a parcel is the last thing to touch it.
     private func launch(signedIn: Bool = true) throws -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["MPLABEL_UITEST"] = "1"
         app.launchEnvironment["MPLABEL_UITEST_RESET"] = "1"
         app.launchEnvironment["MPLABEL_UITEST_SERVER"] = server.baseURL
         if signedIn {
-            app.launchEnvironment["MPLABEL_UITEST_TOKEN"] = try server.signIn()
+            app.launchEnvironment["MPLABEL_UITEST_TOKEN"] = server.token
         }
         app.launch()
         return app
