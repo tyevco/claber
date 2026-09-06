@@ -3582,6 +3582,35 @@ def test_the_phone_app_unit_can_reach_the_printer_and_the_lock():
     assert not re.search(r"(?m)^PrivateTmp=", unit)
 
 
+def test_the_installer_is_executable():
+    """It was committed 644, so `./install_pi.sh` is "Permission denied"
+    and only `bash install_pi.sh` runs. The two failures do not look
+    alike: the second works, and the first refuses quietly enough to be
+    stepped past - after which the symptom arrives later and somewhere
+    else, as `Failed to enable unit: ... does not exist`, which reads as
+    a missing file in the repo rather than a step that never ran.
+
+    The mode is checked through git rather than the filesystem, because
+    this is developed on Windows where the working copy has no mode bit
+    to speak of and git's index is the thing that actually ships."""
+    import subprocess
+
+    root = Path(__file__).parent.parent
+    try:
+        out = subprocess.run(["git", "ls-files", "-s", "install_pi.sh"],
+                             cwd=root, capture_output=True, text=True,
+                             timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        pytest.skip("git is not available")
+    if out.returncode != 0 or not out.stdout.strip():
+        pytest.skip("not a git checkout")
+
+    mode = out.stdout.split()[0]
+    assert mode == "100755", (
+        f"install_pi.sh is mode {mode}; it has to be 100755 or `./install_pi.sh` "
+        f"is refused and the units it writes never reach the Pi")
+
+
 def test_every_unit_in_the_repo_is_installed_by_the_installer():
     """A unit that exists in the repo and not in `install_pi.sh` never
     reaches the Pi: the documented update path is a git pull and a pip
