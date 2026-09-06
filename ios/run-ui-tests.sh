@@ -78,10 +78,17 @@ xcodebuild is not usable.
 
 Usually xcode-select is pointing at the Command Line Tools rather than
 at Xcode itself, which is enough to compile but not to drive a
-simulator:
+simulator. Find Xcode and point at it - do not assume
+/Applications/Xcode.app, because it is often somewhere else:
 
-    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+    XC=\$(mdfind "kMDItemCFBundleIdentifier == 'com.apple.dt.Xcode'" | head -1)
+    echo "\$XC"
+    sudo xcode-select -s "\$XC/Contents/Developer"
     xcodebuild -version
+
+If that prints nothing, Xcode itself is not installed - the Command Line
+Tools are a separate, smaller thing, and they cannot build for a
+simulator.
 
 The underlying error:
 EOF
