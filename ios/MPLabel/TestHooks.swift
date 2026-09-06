@@ -17,6 +17,12 @@ enum TestHooks {
     /// Applied once at launch. In a release build this function does not
     /// exist, so there is no path from a launch argument to the app's
     /// credentials on a device.
+    ///
+    /// `@MainActor` because it ends by calling `Session.refresh()`, and
+    /// Session is main-actor isolated - it publishes the state the UI
+    /// switches on. `MPLabelApp` is `@MainActor` too, so its `init` can
+    /// call this directly with no hop.
+    @MainActor
     static func applyIfPresent() {
         #if DEBUG
         let env = ProcessInfo.processInfo.environment
