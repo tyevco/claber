@@ -14,7 +14,7 @@
 # what we believe web.py answers, and that belief has been wrong twice.
 #
 #   ./ios/run-ui-tests.sh                     # default simulator
-#   SIMULATOR="iPhone 16 Pro" ./ios/run-ui-tests.sh
+#   SIMULATOR="iPhone 17 Pro" ./ios/run-ui-tests.sh
 #   MPLABEL_PYTHON=/usr/bin/python3 ./ios/run-ui-tests.sh
 
 set -euo pipefail
@@ -105,11 +105,22 @@ if [ -z "$SIMULATOR" ]; then
     # normally the newest. Any available iPhone would do - the
     # deployment target is 17.0 - so this is only about not picking the
     # oldest one on the machine by accident.
-    SIMULATOR="$(xcrun simctl list devices available         | grep -oE '^ *iPhone [^(]*' | sed 's/^ *//;s/ *$//' | head -1)"
+    SIMULATOR="$(xcrun simctl list devices available |
+        grep -oE '^ *iPhone [^(]*' | sed 's/^ *//;s/ *$//' | head -1)"
 fi
 if [ -z "$SIMULATOR" ]; then
     echo "no iPhone simulator is installed. Open Xcode > Settings >" >&2
-    echo "Components and add one, or pass SIMULATOR='iPhone 17'." >&2
+    echo "Components and add one, or pass SIMULATOR='iPhone 17 Pro'." >&2
+    exit 1
+fi
+
+# A name that is not installed fails deep inside xcodebuild talking about
+# a destination, which does not say "you typed a device that is not
+# here". Check it against what simctl actually has, and print the list.
+if ! xcrun simctl list devices available | grep -qF " $SIMULATOR ("; then
+    echo "No simulator called '$SIMULATOR'. Available iPhones:" >&2
+    xcrun simctl list devices available |
+        grep -oE '^ *iPhone [^(]*' | sed 's/^ */    /;s/ *$//' >&2
     exit 1
 fi
 
