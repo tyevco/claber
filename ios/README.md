@@ -183,3 +183,16 @@ what the system knows and what it hopes.
 **The queue payload carries no address on purpose.** `_order_row` strips
 it; only the detail screen asks for one. Do not add `ship_to` to the list
 row to save a request.
+
+## Pictures of it
+
+```bash
+./ios/screenshots.sh            # every screen into ios/screenshots/
+OUT=/tmp/shots ./ios/screenshots.sh
+```
+
+Same seeded server the UI tests use. Not a snapshot test - nothing is
+compared against a committed image, because a pixel diff on a design
+that is still moving fails whenever a padding changes. It is there to
+make looking cheap, which is how the spinner-that-never-stopped and the
+buried save button were both found.
