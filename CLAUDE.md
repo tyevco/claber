@@ -270,6 +270,7 @@ hardware or a real Facebook account.
 | DYI export schema | **ASSUMED.** Undocumented and reshuffled by Meta; importer walks for shape rather than assuming paths. |
 | Saved-page JSON shape | **ASSUMED.** Field names from public GraphQL modules; fixture is synthetic. |
 | `printd` split (`pi-http`) | **Verified on the hardware, over loopback.** Both printers driven over HTTP: a 4x6 through `/print` and an inventory label through `/print-tag`, each journaled with the right `kind` and `outcome`, and the printed 4x6 indistinguishable from a `tspl` one. So the transport, the HMAC, the spool, the deadline, the journal and both device paths are all real now. **Not yet run off loopback** - that is a bind address and a mesh VPN. |
+| The native iOS client | **Builds and runs against the real server; the camera is still untested.** Xcode compiles it, the simulator launches it, and it reads her actual orders, listings and bins off the Pi through a cloudflared tunnel - so the bearer token, the `/api/v1` prefix, every Codable shape and the whole HTTPS path are confirmed on real data rather than a fixture. Two things are **not**: the simulator has no camera, so `ScanView` - the entire reason this target exists rather than a web page - has never read a label; and nothing has been printed from it, which is the one action that spends physical stock. Both need a real device. |
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 
@@ -937,10 +938,15 @@ and the bit polarity are all settled on hardware - see the table above.
 What is left is physical and needs a camera, not a test:
 
 - #16 is **answered: the QR reads off thermal**, first time, in the stock
-  iPhone Camera app. That settles the shape of the iPhone app (#20) -
+  iPhone Camera app. That settled the shape of the iPhone app (#20) -
   VisionKit reads QR for free, so no marker decoder goes to Swift. #17
   (does the marker survive a camera) is now a curiosity rather than a
   blocker and can be closed unread.
+
+  What that leaves for #20 is **the same scan through our own code**.
+  Apple's Camera app reading the label proves the ink; it does not prove
+  `DataScannerViewController` wired up the way `ScanView` wires it, and
+  the simulator cannot answer that. One printed label and one device.
 - #18 row order and feed origin. Low priority - labels come out right
   today - but it is the difference between knowing and having been lucky.
 

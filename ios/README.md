@@ -11,13 +11,29 @@ module size at 5 dots survives thermal bleed. See the QR encoder row in
 
 ## Status
 
-**Written, never compiled.** Every line here was authored on a Windows
-workstation, which cannot run Xcode. Treat the first build as a code
-review with a compiler doing the reading: expect a handful of signature
-and availability fixes, and do not expect it to be wrong about *shapes* -
-the models were written against `web.py`'s actual payloads
-(`_order_row`, `_order_detail`, `h_inventory`, `h_item`, `h_bins`)
-rather than against the design.
+**Builds, runs, and talks to the real server.** Signing in, the queue,
+pending, the shelf, bins and moving an item between them all work
+against her actual database on the Pi, over a cloudflared tunnel.
+
+The models turned out to be right, which was the bet: they were written
+against `web.py`'s actual payloads (`_order_row`, `_order_detail`,
+`h_inventory`, `h_item`, `h_bins`) rather than against the design, and
+the key-contract test in `tests/test_mplabel.py` is what keeps them that
+way. Authoring it on a machine that cannot compile Swift cost exactly one
+real error - `Lookup`'s Hashable conformance sat in a different file from
+the enum, and synthesis only happens in the declaring file.
+
+**Two things are still untested, and they are the interesting two:**
+
+- **The scanner.** The simulator has no camera, so `ScanView` has never
+  read a label - and that is the whole reason this target exists rather
+  than a web page. Apple's Camera app reading a printed QR proves the
+  ink survives thermal; it says nothing about whether
+  `DataScannerViewController` is wired up correctly here.
+- **Printing.** The print buttons have never been pressed from this app.
+  That is the one action that spends physical stock and moves paper, and
+  the printer cannot confirm a print, so it wants doing deliberately
+  rather than while poking about.
 
 ## Opening it
 
