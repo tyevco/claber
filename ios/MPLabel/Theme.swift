@@ -2,35 +2,12 @@
 //
 //  What is left here after `Design/Tokens.swift` took the palette: the
 //  two bits of *logic* that are about this domain rather than about
-//  looks, plus three colour aliases kept alive while the screens are
-//  ported one at a time.
+//  looks. Both are shared with the PWA's `app.js` by intent - the two
+//  clients must say the same thing about the same parcel, and "TODAY"
+//  in one and "0 DAYS" in the other is a bug she would have to notice
+//  herself.
 
 import SwiftUI
-
-// MARK: - the aliases
-
-/// These forward to `MP.Palette` so a screen that has not been restyled
-/// yet still draws in the design's colours rather than the three
-/// approximations that used to live here.
-///
-/// They are a migration aid and nothing more. Once every screen uses
-/// `MP.Palette` directly these go, and nothing new should reach for
-/// them - the palette has three text weights and several tints, and a
-/// three-colour vocabulary is what made the first version look like
-/// stock SwiftUI.
-extension Color {
-    static var mpAccent: Color { MP.Palette.accent }
-    static var mpMuted: Color { MP.Palette.muted }
-    static var mpAlert: Color { MP.Palette.alert }
-}
-
-/// Superseded by `MPError`, which uses the design's alert tint and edge
-/// rather than a flat red bar. Kept for the same reason as the colours.
-struct ErrorBanner: View {
-    let message: String
-
-    var body: some View { MPError(message: message) }
-}
 
 // MARK: - domain logic
 
