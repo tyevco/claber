@@ -206,6 +206,20 @@ actor APIClient {
                            as: EmptyResponse.self)
     }
 
+    /// What has sold, newest first. A separate route from `/inventory`
+    /// because it carries `days_to_sell`, which the shelf does not need
+    /// and this screen is largely about.
+    func sold() async throws -> [InventoryItem] {
+        try await send(request("/sold"), as: InventoryResponse.self).items
+    }
+
+    /// Note this is not cheap on the Pi: `h_stats` rebuilds the derived
+    /// listing picture on every request. Fine to pull to refresh, wrong
+    /// to poll.
+    func stats() async throws -> Stats {
+        try await send(request("/stats"), as: Stats.self)
+    }
+
     // MARK: - scanning
 
     func lookUp(code: String) async throws -> Lookup {

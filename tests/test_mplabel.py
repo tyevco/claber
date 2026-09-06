@@ -2022,8 +2022,17 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
     _status, cookie = _login(base)
     from mplabel import listings as listings_mod
 
-    conn.execute("INSERT INTO listings (title, state, inventory_code) "
-                 "VALUES ('Hobnail vase', 'active', '7K2M')")
+    # Enough rows that every payload has something in it. An empty list
+    # sends no keys at all, so a fixture that is too thin makes this test
+    # pass by having nothing to disagree with - which is how it missed
+    # `id` on /lookup once already.
+    conn.executemany(
+        "INSERT INTO listings (title, price, state, inventory_code, "
+        "listed_at, sold_at, renewed_count) VALUES (?,?,?,?,?,?,?)",
+        [("Hobnail vase", 28.0, "active", "7K2M", "2026-07-01", None, 1),
+         # sold *with* dates, so days_to_sell and the monthly view fill in
+         ("Chenille bedspread", 60.0, "sold", "9QM2", "2026-07-02",
+          "2026-07-30", 0)])
     conn.commit()
     # A bin, or /bins answers with an empty list and `created_at` looks
     # like a key the server does not send.
@@ -2053,6 +2062,21 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
     _s, _h, body = _http(base + web_mod.API_PREFIX + "/lookup/7K2M",
                          cookie=cookie)
     served |= set(json.loads(body).get("listing") or {})
+    # /sold likewise, and it is the only route sending days_to_sell.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/sold", cookie=cookie)
+    for row in json.loads(body)["items"]:
+        served |= set(row)
+    # The analytics views: their column names are the CodingKeys, and
+    # CLAUDE.md is explicit that renaming a view column breaks the sheet
+    # with no test failure. It should not break the phone silently either.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/stats", cookie=cookie)
+    stats = json.loads(body)
+    # Both halves: the envelope's own keys (`price_bands`) and the row
+    # keys inside each list.
+    served |= set(stats)
+    for rows in stats.values():
+        for row in rows:
+            served |= set(row)
     _s, _h, body = _http(base + web_mod.API_PREFIX + "/orders/1", cookie=cookie)
     served |= set(json.loads(body))
     # The batch shape is only visible on a POST. A dry run with no ids
@@ -2112,6 +2136,69 @@ def test_a_scanned_code_can_actually_be_opened(app):
     # Case-insensitive, because this is read off thermal paper by a
     # camera and the alphabet has no lowercase in it anyway.
     assert listing["inventory_code"] == "7K2M"
+
+
+def test_sold_carries_how_long_it_took(app):
+    """The Sold screen is mostly "what went out and how fast". That
+    needs `days_to_sell`, which `/inventory` does not send - so this is
+    its own route rather than a state filter.
+
+    It is computed the same way `v_listing_perf` computes it. The view is
+    deliberately not reused: it has no row id, being keyed on
+    `listing_id`, which parses as NULL on plenty of real mail - so a row
+    read from it could not be opened. Widening a view the Sheets sync
+    selects from, for one phone screen, is the trade being avoided."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.executemany(
+        "INSERT INTO listings (title, price, state, listed_at, sold_at) "
+        "VALUES (?,?,?,?,?)",
+        [("Sold with dates", 25.0, "sold", "2026-08-01", "2026-08-09"),
+         ("Sold without dates", 40.0, "sold", None, None),
+         ("Still active", 15.0, "active", "2026-08-01", None)])
+    conn.commit()
+
+    from mplabel import web as web_mod
+
+    status, _h, body = _http(base + web_mod.API_PREFIX + "/sold",
+                             cookie=cookie)
+    assert status == 200
+    rows = json.loads(body)["items"]
+    titles = [r["title"] for r in rows]
+    assert "Still active" not in titles, "sold only"
+    assert len(rows) == 2
+
+    by_title = {r["title"]: r for r in rows}
+    assert by_title["Sold with dates"]["days_to_sell"] == 8
+    # No listed date means no answer, not a zero. A zero would read as
+    # "sold the same day", which is a different and flattering claim.
+    assert by_title["Sold without dates"]["days_to_sell"] is None
+    # And the row can be opened, which is the whole reason this is not
+    # read straight out of v_listing_perf.
+    assert isinstance(by_title["Sold with dates"]["id"], int)
+
+
+def test_sold_agrees_with_the_view_the_spreadsheet_uses(app):
+    """Two expressions for one number is two chances to be wrong, and the
+    view is the one that has been reporting to the spreadsheet for
+    months. If they ever disagree, the view is right."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute(
+        "INSERT INTO listings (title, price, state, listed_at, sold_at) "
+        "VALUES ('Chenille bedspread', 60.0, 'sold', '2026-07-02', "
+        "'2026-07-30')")
+    conn.commit()
+
+    from mplabel import listings as listings_mod, web as web_mod
+    listings_mod.build_views(conn)
+
+    from_view = conn.execute(
+        "SELECT days_to_sell FROM v_listing_perf WHERE title=?",
+        ("Chenille bedspread",)).fetchone()["days_to_sell"]
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/sold", cookie=cookie)
+    from_api = json.loads(body)["items"][0]["days_to_sell"]
+    assert from_api == from_view == 28
 
 
 @pytest.mark.skipif(not IOS.exists(), reason="the iOS client is not checked out")

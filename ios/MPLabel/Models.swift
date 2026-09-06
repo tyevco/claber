@@ -98,6 +98,10 @@ struct InventoryItem: Codable, Identifiable, Hashable {
     let soldAt: String?
     /// Only `h_item` sends this; the list rows do not.
     let binMates: Int?
+    /// Only `/sold` sends this. Null on anything that sold without ever
+    /// having a listed date - which is most of the saved-page import,
+    /// because neither capture carried dates.
+    let daysToSell: Int?
 
     enum CodingKeys: String, CodingKey {
         case id, title, price, state, category, bin
@@ -107,6 +111,7 @@ struct InventoryItem: Codable, Identifiable, Hashable {
         case listedAt = "listed_at"
         case soldAt = "sold_at"
         case binMates = "bin_mates"
+        case daysToSell = "days_to_sell"
     }
 }
 
@@ -140,6 +145,7 @@ struct BinContents: Codable {
 /// is a parcel, four is a thing on a shelf - and the server checks sales
 /// first, because a code currently on a box waiting to go out is the
 /// more urgent reading.
+///
 /// Hashable and Identifiable are declared *here*, on the enum itself,
 /// and not in an extension next to the screen that uses them. Swift only
 /// synthesises `==` and `hash(into:)` for an enum with associated values
@@ -177,6 +183,81 @@ extension Lookup: Decodable {
                 forKey: .kind, in: c,
                 debugDescription: "unknown lookup kind")
         }
+    }
+}
+
+// MARK: - analytics
+
+/// The three views behind the Profit screen: `v_price_band`,
+/// `v_monthly` and `v_aging`. Every number is Optional because they are
+/// SQL aggregates over a table full of nulls - `AVG` of nothing is
+/// nothing, and a band with no sales has no average days to sell.
+///
+/// Worth knowing while reading this screen: sell-through is meaningless
+/// without prices on *unsold* listings, and prices only reach the
+/// database if the listing email or an import carried one. Blank prices
+/// in Aging mean the percentages are lying.
+struct PriceBand: Codable, Identifiable {
+    let priceBand: String
+    let listed: Int?
+    let sold: Int?
+    let sellThroughPct: Double?
+    let avgDaysToSell: Double?
+    let avgPrice: Double?
+
+    var id: String { priceBand }
+
+    enum CodingKeys: String, CodingKey {
+        case listed, sold
+        case priceBand = "price_band"
+        case sellThroughPct = "sell_through_pct"
+        case avgDaysToSell = "avg_days_to_sell"
+        case avgPrice = "avg_price"
+    }
+}
+
+struct MonthRow: Codable, Identifiable {
+    let month: String?
+    let orders: Int?
+    let gross: Double?
+    let avgOrder: Double?
+    let avgDaysToSell: Double?
+
+    var id: String { month ?? UUID().uuidString }
+
+    enum CodingKeys: String, CodingKey {
+        case month, orders, gross
+        case avgOrder = "avg_order"
+        case avgDaysToSell = "avg_days_to_sell"
+    }
+}
+
+struct AgingRow: Codable, Identifiable {
+    let listingId: String?
+    let title: String?
+    let price: Double?
+    let daysListed: Int?
+    let inquiries: Int?
+    let renewedCount: Int?
+
+    var id: String { (listingId ?? "") + (title ?? "") }
+
+    enum CodingKeys: String, CodingKey {
+        case title, price, inquiries
+        case listingId = "listing_id"
+        case daysListed = "days_listed"
+        case renewedCount = "renewed_count"
+    }
+}
+
+struct Stats: Codable {
+    let priceBands: [PriceBand]
+    let monthly: [MonthRow]
+    let aging: [AgingRow]
+
+    enum CodingKeys: String, CodingKey {
+        case monthly, aging
+        case priceBands = "price_bands"
     }
 }
 

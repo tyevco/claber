@@ -323,6 +323,7 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", r"^/api/inventory$", "h_inventory", True),
         ("GET", r"^/api/inventory/(?P<lid>\d+)$", "h_item", True),
         ("POST", r"^/api/inventory/(?P<lid>\d+)/bin$", "h_move_bin", True),
+        ("GET", r"^/api/sold$", "h_sold", True),
         ("GET", r"^/api/stats$", "h_stats", True),
         ("GET", r"^/api/system$", "h_system", True),
         ("POST", r"^/api/orders/(?P<sid>\d+)/ship$", "h_ship", True),
@@ -705,6 +706,41 @@ class Handler(BaseHTTPRequestHandler):
             f"AND status NOT IN ({marks}) AND label_pdf IS NOT NULL "
             f"ORDER BY received_at", cli_mod.CLOSED_STATUSES).fetchall()
         self.json({"pending": [_order_row(r) for r in rows]})
+
+    def h_sold(self):
+        """What has sold, newest first, with how long it took.
+
+        A direct query rather than `v_listing_perf`, deliberately. That
+        view has no row id - it is keyed on `listing_id`, which parses as
+        NULL on plenty of real mail - so a row read from it cannot be
+        opened. Widening the view would work, but `sheets.TABS` selects
+        from these views by column name and they are shared with the
+        spreadsheet; a query here is cheaper than a shared thing changed
+        for one screen.
+
+        `days_to_sell` is the same expression the view uses. If those two
+        ever disagree the view is the one to believe - it is what the
+        spreadsheet has been reporting for months.
+        """
+        limit = 200
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            limit = min(int((qs.get("limit") or ["200"])[0] or 200), 500)
+        except ValueError:
+            pass
+        rows = self.db().execute(
+            "SELECT l.id, l.listing_id, l.title, l.price, l.state, "
+            "l.category, l.inventory_code, l.bin_code, b.name AS bin, "
+            "l.listed_at, l.sold_at, "
+            "CASE WHEN l.sold_at IS NOT NULL AND l.listed_at IS NOT NULL "
+            "     THEN CAST(julianday(l.sold_at) - julianday(l.listed_at) "
+            "               AS INTEGER) END AS days_to_sell "
+            "FROM listings l LEFT JOIN bins b ON b.code = l.bin_code "
+            "WHERE l.state = 'sold' "
+            "ORDER BY l.sold_at IS NULL, l.sold_at DESC LIMIT ?",
+            (limit,)).fetchall()
+        return self.json({"items": [dict(r) for r in rows],
+                          "count": len(rows)})
 
     def h_stats(self):
         conn = self.db()
