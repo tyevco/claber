@@ -59,7 +59,13 @@ targets:
     settings:
       base:
         TARGETED_DEVICE_FAMILY: "1"    # iPhone. There is no iPad layout.
-        SWIFT_VERSION: "5.9"
+        # The *language mode*, not the compiler version. Valid values
+        # are 4, 4.2, 5 and 6 - "5.9" is a compiler release and is not
+        # one of them. Kept at 5 on purpose: Xcode 27 ships a Swift 6
+        # compiler, and under mode 6 the concurrency diagnostics this
+        # code has already hit twice become errors rather than warnings.
+        # Moving to 6 is a deliberate piece of work, not a default.
+        SWIFT_VERSION: "5"
         ENABLE_USER_SCRIPT_SANDBOXING: YES
         # Set these on the Mac, or in Xcode's Signing pane:
         # DEVELOPMENT_TEAM: XXXXXXXXXX

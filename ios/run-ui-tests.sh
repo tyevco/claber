@@ -33,7 +33,11 @@ else
     PYTHON="python3"
 fi
 
-SIMULATOR="${SIMULATOR:-iPhone 16}"
+# Whatever iPhone simulator this Xcode actually has, rather than a
+# guess: the installed set moves with every release, and a name that is
+# not there fails inside xcodebuild with a message about a destination
+# rather than about a device that does not exist.
+SIMULATOR="${SIMULATOR:-}"
 PASSWORD="uitest-password"
 # Not a fixed port: a server left running from an interrupted run would
 # be picked up silently, and the tests would pass against stale data.
@@ -96,6 +100,19 @@ EOF
     exit 1
 fi
 
+if [ -z "$SIMULATOR" ]; then
+    # head, not tail: simctl groups by runtime and the first block is
+    # normally the newest. Any available iPhone would do - the
+    # deployment target is 17.0 - so this is only about not picking the
+    # oldest one on the machine by accident.
+    SIMULATOR="$(xcrun simctl list devices available         | grep -oE '^ *iPhone [^(]*' | sed 's/^ *//;s/ *$//' | head -1)"
+fi
+if [ -z "$SIMULATOR" ]; then
+    echo "no iPhone simulator is installed. Open Xcode > Settings >" >&2
+    echo "Components and add one, or pass SIMULATOR='iPhone 17'." >&2
+    exit 1
+fi
+
 HOME_DIR="$(mktemp -d)"
 mkdir -p "$HOME_DIR/labels"
 SERVER_PID=""
@@ -154,7 +171,7 @@ TOKEN="$(curl -fsS -X POST "$BASE/api/login" \
     -d "{\"password\": \"$PASSWORD\"}" \
     | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
 
-echo "==> running the UI tests against $BASE"
+echo "==> running the UI tests against $BASE on $SIMULATOR"
 xcodebuild test \
     -project "$REPO/ios/MPLabel.xcodeproj" \
     -scheme MPLabel \
