@@ -140,6 +140,10 @@ src/mplabel/
   lzma1.py       LZMA1 encoder, match coded, no end-of-stream marker
 
 tests/fixtures/   synthetic stand-ins; make_label.py regenerates the PDF
+tests/make_ios_fixtures.py  captures real payloads for the iOS tests
+ios/              the native client. See docs/ios-handoff.md before
+                  touching it - it was written on a machine that cannot
+                  compile Swift, and the caveats matter
 mplabel.conf.example, systemd/mplabel.service, udev/99-clabel-g4.rules
 install_pi.sh     Pi bootstrap
 ```
@@ -188,6 +192,18 @@ the column - and it fails inside `connect_db`, so it takes down every
 command rather than just the new feature. `listings.POST_MIGRATION_INDEXES`
 runs after the loop. Caught by the migration test, which is why that test
 exists.
+
+**A migrated database and a fresh one can disagree about constraints.**
+`ALTER TABLE ... ADD COLUMN bin_code TEXT` gets **no foreign key**, while
+the identical column in `SCHEMA` gets one - so an upgraded database and a
+new one end up with different rules, and every test passes either way
+because the `db` fixture builds from SCHEMA. That is what shipped: the
+Pi's `bin_code` is unconstrained. The decl in `MIGRATIONS` now carries
+the REFERENCES clause and
+`test_a_migrated_database_has_the_same_foreign_keys_as_a_fresh_one`
+compares the two directly. SQLite cannot add a constraint to an existing
+column without rebuilding the table, so a database that already migrated
+keeps the loose one.
 
 **Adding a column needs a migration.** `CREATE TABLE IF NOT EXISTS` will
 not touch a database that already holds real sales, so `connect_db` carries
