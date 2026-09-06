@@ -25,6 +25,14 @@ struct MPEyebrow: View {
             .font(.system(size: 11, weight: .semibold))
             .tracking(1.5)
             .foregroundStyle(MP.Palette.muted)
+            // The uppercasing is styling, and it must not leak into the
+            // accessibility tree. Two reasons, and the second is the one
+            // that bit: VoiceOver spells some all-caps strings out
+            // letter by letter, and a UI test asking for the string the
+            // caller passed - `staticTexts["Ships to"]` - silently finds
+            // nothing, which reads as a screen that never appeared
+            // rather than a caption that shouted.
+            .accessibilityLabel(text)
     }
 }
 

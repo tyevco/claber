@@ -58,9 +58,52 @@ struct ServerHarness {
     /// Ask the server directly, for the handful of assertions that are
     /// about data rather than pixels.
     func get(_ path: String) throws -> Data {
+        try request(path, method: "GET")
+    }
+
+    /// Change something directly. Used to put back what a destructive
+    /// test changed - see `FlowTests.tearDownWithError`.
+    @discardableResult
+    func post(_ path: String, body: [String: Any]? = nil) throws -> Data {
+        try request(path, method: "POST", body: body)
+    }
+
+    /// The database id of a sale, found by the code printed on the
+    /// parcel. The screens show codes and the API takes ids, so a test
+    /// that has driven the UI knows the wrong one of the two.
+    func saleID(code: String) throws -> Int {
+        let data = try get("/api/v1/orders")
+        let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let orders = root?["orders"] as? [[String: Any]] ?? []
+        guard let match = orders.first(where: { $0["code"] as? String == code }),
+              let id = match["id"] as? Int else {
+            throw XCTSkip("no sale with code \(code) on the server")
+        }
+        return id
+    }
+
+    /// The database id of a listing, by the inventory code on its own
+    /// label. Same reasoning as `saleID`.
+    func listingID(inventoryCode: String) throws -> Int {
+        let data = try get("/api/v1/lookup/" + inventoryCode)
+        let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let listing = root?["listing"] as? [String: Any]
+        guard let id = listing?["id"] as? Int else {
+            throw XCTSkip("no listing with inventory code \(inventoryCode)")
+        }
+        return id
+    }
+
+    private func request(_ path: String, method: String,
+                         body: [String: Any]? = nil) throws -> Data {
         var req = URLRequest(url: URL(string: baseURL + path)!)
+        req.httpMethod = method
         req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         req.setValue("1", forHTTPHeaderField: "X-Mplabel")
+        if let body {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
 
         var result: Result<Data, Error>!
         let done = DispatchSemaphore(value: 0)

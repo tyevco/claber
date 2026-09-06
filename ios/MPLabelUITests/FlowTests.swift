@@ -13,17 +13,46 @@ final class FlowTests: XCTestCase {
 
     private var server: ServerHarness!
 
+    /// Set by the tests that change data, and put back in teardown.
+    private var shippedSale: Int?
+    private var unbinned: (listing: Int, bin: String)?
+
     override func setUpWithError() throws {
         continueAfterFailure = false
         // Skips with instructions if the script did not start one.
         server = try ServerHarness.fromEnvironment()
     }
 
+    /// Undo the one destructive test, because the server is shared and
+    /// **XCTest runs these in alphabetical order, not source order.**
+    ///
+    /// That is what the first version of this file got wrong. It said
+    /// "anything that ships a parcel is the last thing to touch it" and
+    /// put the shipping test last in the file - but `testShipping…`
+    /// sorts before `testTheQueue…`, so 7QK was already gone by the time
+    /// the queue test looked for it, and the failure read as a queue
+    /// that had stopped rendering its rows.
+    ///
+    /// Restoring the row here is what makes the order stop mattering,
+    /// rather than a name chosen to sort late - which would be the same
+    /// trap set again for whoever adds the ninth test.
+    override func tearDownWithError() throws {
+        if let id = shippedSale {
+            shippedSale = nil
+            try server.post("/api/v1/orders/\(id)/unship")
+        }
+        if let moved = unbinned {
+            unbinned = nil
+            try server.post("/api/v1/inventory/\(moved.listing)/bin",
+                            body: ["bin": moved.bin])
+        }
+    }
+
     /// The app gets the same address the runner was given. Note the
     /// server is *shared* across the tests in this file rather than one
     /// per test - starting it is the script's job and it happens once -
-    /// so a test that changes data must tolerate the others, and
-    /// anything that ships a parcel is the last thing to touch it.
+    /// so a test that changes data must put it back in teardown. Do not
+    /// rely on running last instead: XCTest sorts by method name.
     private func launch(signedIn: Bool = true) throws -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["MPLABEL_UITEST"] = "1"
@@ -88,6 +117,11 @@ final class FlowTests: XCTestCase {
         let ship = app.buttons["Hold to mark shipped"]
         XCTAssertTrue(ship.waitForExistence(timeout: 10))
 
+        // Before the hold, not after: a shipped sale is off `/orders`,
+        // so this is the last moment the code can be turned into the id
+        // teardown needs.
+        shippedSale = try server.saleID(code: "7QK")
+
         // A tap: too short to complete the hold.
         ship.tap()
         XCTAssertFalse(
@@ -131,6 +165,14 @@ final class FlowTests: XCTestCase {
 
         XCTAssertTrue(app.staticTexts["Where it is"]
             .waitForExistence(timeout: 10))
+
+        // Before the tap. This is the other test that changes shared
+        // data, and it is the one the shelf search depends on: that test
+        // finds the vase by typing its *bin name*, so leaving the vase
+        // off the shelf makes it fail - and `testMoving…` sorts first.
+        unbinned = (listing: try server.listingID(inventoryCode: "7K2M"),
+                    bin: "ATTIC")
+
         app.staticTexts["No bin"].firstMatch.tap()
 
         // Taking it off the shelf is a real answer, not a delete, so the
