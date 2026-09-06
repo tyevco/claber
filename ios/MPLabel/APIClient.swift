@@ -303,17 +303,27 @@ actor APIClient {
     /// email at all, or a thing off a shelf being listed for the first
     /// time.
     func makeItem(title: String, paid: Double? = nil, price: Double? = nil,
-                  trip: Int? = nil) async throws -> InventoryItem {
+                  era: String? = nil, condition: String? = nil,
+                  category: String? = nil, bin: String? = nil,
+                  trip: Int? = nil,
+                  photos: [Int] = []) async throws -> InventoryItem {
         struct Body: Encodable {
             let title: String
             let paid: Double?
             let price: Double?
+            let era: String?
+            let condition: String?
+            let category: String?
+            let bin: String?
             let trip: Int?
+            let photos: [Int]
         }
         return try await send(
             request("/inventory", method: "POST",
                     body: Body(title: title, paid: paid, price: price,
-                               trip: trip)),
+                               era: era, condition: condition,
+                               category: category, bin: bin, trip: trip,
+                               photos: photos)),
             as: ItemResponse.self).item
     }
 

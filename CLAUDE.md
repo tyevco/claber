@@ -243,6 +243,13 @@ compares the two directly. SQLite cannot add a constraint to an existing
 column without rebuilding the table, so a database that already migrated
 keeps the loose one.
 
+**`era` is free text, and that is the point.** Not a year and not a
+range of years: her titles say "Antique 1900-1915 American Edwardian",
+which is a period, a guess and a selling point at once, and an integer
+column would force a precision the object does not have. Nothing
+computes on it. It is the newest column, so it is also the one that
+proves the migration loop still runs.
+
 **Adding a column needs a migration.** `CREATE TABLE IF NOT EXISTS` will
 not touch a database that already holds real sales, so `connect_db` carries
 a small `PRAGMA table_info` / `ALTER TABLE` loop. Add to that list, not
@@ -1101,13 +1108,24 @@ what it cost to the things that came home. Profit stops saying "gross"
 as soon as that has been used in anger; the margin views have been
 correct and empty this whole time.
 
+**Add an item is built too** - `AddItemView`, off the Shelf tab's plus
+menu. Title, paid, asking, era, condition, a bin picker, and the
+untriaged captures as selectable thumbnails, which is the only place a
+photograph gets attached to a thing: the shutter screen deliberately
+asks nothing at the time, because the shop is where the picture has to
+be taken and the kitchen table is where it can be said what it was of.
+`listings.era` is a new column with a migration behind it - free text,
+not a year, because "Antique 1900-1915 American Edwardian" is a range
+and a guess at once.
+
+Two parts of that screen in the design are deliberately not built, and
+both are decisions rather than omissions: **suggestions from the photos**
+(an online enrichment call with an offline queue behind it) and the
+**listing kit** (draft copy to paste into Marketplace). Each is a
+feature in its own right, not a field.
+
 Still missing from the design, in rough order of worth:
 
-- **Add an item as a screen of its own.** Triage can create one from a
-  title, which is what its "not listed yet" line does, but the design's
-  form carries paid, asking, era, condition, bin and photos. Note `era`
-  has no column - `condition` does - so that field is a migration, not
-  just a text box.
 - **One trip** - spent / listed for / unassigned, what came home. The
   payload already answers it; there is no screen.
 - **The order-detail affordances**: fix a field, notes, the label PDF.

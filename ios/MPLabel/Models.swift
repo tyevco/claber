@@ -109,9 +109,16 @@ struct InventoryItem: Codable, Identifiable, Hashable {
     /// not.
     let paid: Double?
     let tripId: Int?
+    /// Roughly when it is from - "c. 1910", "mid-century". Free text and
+    /// not a year: her titles say "Antique 1900-1915 American Edwardian",
+    /// which is a range and a guess at once.
+    let era: String?
+    /// What is wrong with it, in her words - "Craquelure, small chip".
+    /// Sent by `h_item` and the payloads built on it, not by the list.
+    let condition: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, title, price, state, category, bin, paid
+        case id, title, price, state, category, bin, paid, era, condition
         case listingId = "listing_id"
         case inventoryCode = "inventory_code"
         case binCode = "bin_code"

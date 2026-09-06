@@ -201,6 +201,7 @@ MIGRATIONS = [
     ("listings", "paid", "REAL"),
     ("listings", "trip_id",
      "INTEGER REFERENCES trips(id) ON DELETE SET NULL"),
+    ("listings", "era", "TEXT"),
 ]
 
 

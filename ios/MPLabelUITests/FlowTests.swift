@@ -248,6 +248,57 @@ final class FlowTests: XCTestCase {
             .waitForExistence(timeout: 10))
     }
 
+    /// The screen a local pickup depends on. It is also the one that puts
+    /// a cost in, so the assertion is that the thing comes back with what
+    /// it cost - a saved item with a null `paid` is the failure that
+    /// leaves Profit saying "gross" for ever.
+    func testAddingAnItemByHandKeepsWhatItCost() throws {
+        let app = try launch()
+        app.buttons["Shelf"].tap()
+        XCTAssertTrue(app.staticTexts["Where things are"]
+            .waitForExistence(timeout: 15))
+
+        app.buttons["Add"].tap()
+        app.buttons["New item"].tap()
+        XCTAssertTrue(app.staticTexts["New item"].waitForExistence(timeout: 10))
+
+        // By identifier, not by placeholder: a multi-line TextField is a
+        // textView in the accessibility tree, and the placeholder is copy
+        // that someone will reword without knowing a test reads it.
+        let title = app.descendants(matching: .any)["item-title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        title.tap()
+        title.typeText("Brass candlestick pair")
+
+        // The field this screen exists for.
+        let paid = app.descendants(matching: .any)["item-paid"]
+        XCTAssertTrue(paid.waitForExistence(timeout: 5))
+        paid.tap()
+        paid.typeText("7.50")
+        app.buttons["Done"].firstMatch.tap()
+
+        app.buttons["Hold to save"].press(forDuration: 1.4)
+
+        // Back on the shelf, and the thing is on it.
+        XCTAssertTrue(app.staticTexts["Brass candlestick pair"]
+            .waitForExistence(timeout: 15))
+
+        // Left on the server deliberately. There is no delete endpoint
+        // and this test is not the place to invent one: an inventory code
+        // is never reused, including after the thing sells, so removing a
+        // listing is a real decision rather than tidying. Nothing after
+        // this asserts on a count, so an extra row is inert.
+        let id = try server.listingID(forTitle: "Brass candlestick pair")
+        // Unwrapped rather than compared as an Optional: nil is the
+        // failure this asserts against, and `XCTAssertEqual(nil, 7.50)`
+        // would report it as a value mismatch rather than as the cost
+        // never having arrived.
+        let paidBack = try XCTUnwrap(server.paid(forListing: id),
+                                     "the item came back with no cost at all")
+        XCTAssertEqual(paidBack, 7.50, accuracy: 0.001,
+                       "the cost must survive the round trip")
+    }
+
     func testProfitSaysWhatItDoesNotKnow() throws {
         let app = try launch()
         app.buttons["Profit"].tap()
