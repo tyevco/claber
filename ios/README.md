@@ -99,10 +99,18 @@ says so rather than surfacing as a connection refusal three layers up.
 login screen. It is `#if DEBUG` throughout, so on a release build there
 is no path from a launch argument to the app's credentials.
 
-**ATS:** Debug adds `NSAllowsLocalNetworking` and only that — http to
-the local network, which is what a test against 127.0.0.1 needs. The
-release build has no exception at all, so a plain-http address still
-fails on her phone, which is the behaviour worth keeping.
+**ATS:** one exception, `NSAllowsLocalNetworking`, and it is the narrow
+one — http to unqualified names, `.local` and the private IP ranges.
+Not `NSAllowsArbitraryLoads`, which would permit the whole internet.
+
+It applies to every configuration rather than Debug only. That is a
+correction, not a choice: the Debug-only version set
+`INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking`, and no
+such build setting exists — `INFOPLIST_KEY_*` handles top-level plist
+keys and `NSAppTransportSecurity` is a dictionary, so it would have been
+ignored in silence. What still holds is the property that mattered: the
+app cannot talk to a plain-http host on the internet, so a tunnel
+hostname over http fails on her phone exactly as before.
 
 ## Re-run xcodegen whenever a file is added
 
