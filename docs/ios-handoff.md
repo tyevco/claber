@@ -121,6 +121,18 @@ photograph to the model still needs its own `#available` until the floor
 moves again. Text in and structured output back (`@Generable`) is
 available at 26.
 
+## The on-device model
+
+`OnDevice.swift` wraps `FoundationModels` for the two places the design
+asks for writing help. It runs **in the simulator** - `availability`
+reports `available` and both the text draft and the image path really
+generate - so unlike the camera this is testable without the phone.
+
+Two things about it were measured rather than reasoned, and both are in
+CLAUDE.md at length: the safety classifier refuses if the instructions
+describe *the seller*, and a field the model is not told about is one it
+invents. Neither was guessable from the API.
+
 ## Two open items that are not bugs in the app
 
 **The Pi's `bin_code` has no foreign key.** A column added by `ALTER

@@ -17,6 +17,7 @@
 //  "advanced" disclosure.
 
 import SwiftUI
+import UIKit
 
 struct AddItemView: View {
     /// Prefilled when the screen is opened from a trip, so the thing is
@@ -38,6 +39,14 @@ struct AddItemView: View {
     @State private var attached: Set<Int> = []
     @State private var busy = false
     @State private var error: String?
+    // The on-device model's two offerings. Both are held here rather
+    // than written into the fields, which is the guard: a suggestion
+    // becomes a value when she taps it and not before.
+    @State private var suggested: OnDevice.Suggested?
+    @State private var looking = false
+    @State private var draft: String?
+    @State private var drafting = false
+    @State private var modelError: String?
     @FocusState private var focused: Field?
 
     private enum Field { case title, paid, asking, era, condition }
@@ -56,12 +65,23 @@ struct AddItemView: View {
             describing
             whereItGoes
             if !pile.isEmpty { photographs }
+            // Suggestions sit *above* the button because they fill the
+            // form in - they are part of typing it. The listing kit sits
+            // below, because it produces something to paste elsewhere
+            // and is not part of getting the thing recorded.
+            if !attached.isEmpty { suggestions }
 
             MPHoldButton(title: canSave ? "Hold to save" : "A title, at least",
                          enabled: canSave) {
                 save()
             }
             .padding(.top, MP.S.x2)
+
+            // Last, deliberately. Saving is the point of the screen and
+            // the button for it should not be underneath two optional
+            // panels she has to scroll past - which is exactly what
+            // happened when this was added in the middle.
+            listingKit
         }
         .task { await load() }
         .toolbar {
@@ -256,6 +276,162 @@ struct AddItemView: View {
                     .foregroundStyle(MP.Palette.accent)
                     .padding(3)
             }
+        }
+    }
+
+    // MARK: - what the model offers
+
+    /// Chips, not a filled-in form. Tapping one writes that single
+    /// field; nothing here writes anything on its own, and `paid` is not
+    /// among them at all - a guessed cost would be indistinguishable
+    /// from a real one in every margin thereafter.
+    private var suggestions: some View {
+        MPCard {
+            VStack(alignment: .leading, spacing: MP.S.x2) {
+                HStack {
+                    MPEyebrow("From the photograph")
+                    Spacer()
+                    if looking {
+                        ProgressView().scaleEffect(0.7)
+                    } else if OnDevice.readiness.canGenerate, canSeePictures {
+                        Button(suggested == nil ? "Look" : "Look again") {
+                            look()
+                        }
+                        .font(.system(size: 13, weight: .semibold))
+                    }
+                }
+
+                if let modelError { MPError(message: modelError) }
+
+                if !OnDevice.readiness.canGenerate {
+                    Text(OnDevice.readiness.sentence)
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                } else if !canSeePictures {
+                    // The text model landed a version before it could be
+                    // shown a picture, so this is a real distinction and
+                    // not a permission problem.
+                    Text("Reading a photograph needs iOS 27. The draft "
+                         + "below works on this one.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                } else if let suggested {
+                    FlowChips(chips: chips(from: suggested))
+                    Text("Tap to accept. Nothing here fills itself in, and "
+                         + "it never guesses what you paid.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(MP.Palette.subtle)
+                } else {
+                    Text("It can read the picture and offer a title, an "
+                         + "era and what looks wrong with it. On this "
+                         + "phone - nothing is sent anywhere.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                }
+            }
+        }
+    }
+
+    private var listingKit: some View {
+        MPCard {
+            VStack(alignment: .leading, spacing: MP.S.x2) {
+                HStack {
+                    MPEyebrow("Listing kit")
+                    Spacer()
+                    if drafting {
+                        ProgressView().scaleEffect(0.7)
+                    } else if OnDevice.readiness.canGenerate {
+                        Button(draft == nil ? "Draft it" : "Again") {
+                            makeDraft()
+                        }
+                        .font(.system(size: 13, weight: .semibold))
+                        .disabled(title.trimmingCharacters(in: .whitespaces)
+                                    .isEmpty)
+                    }
+                }
+
+                if !OnDevice.readiness.canGenerate {
+                    Text(OnDevice.readiness.sentence)
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                } else if let draft {
+                    Text("DRAFT - yours to edit before it goes anywhere")
+                        .font(.system(size: 10))
+                        .foregroundStyle(MP.Palette.subtle)
+                    Text(draft)
+                        .font(.system(size: 13.5))
+                        .foregroundStyle(MP.Palette.fg)
+                        .textSelection(.enabled)
+                    Button("Copy text") {
+                        UIPasteboard.general.string = draft
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                } else {
+                    Text("A description built from what you have typed, "
+                         + "written on the phone. It invents nothing you "
+                         + "have not put in.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                }
+            }
+        }
+    }
+
+    /// Whether this OS can hand the model a picture at all. The text
+    /// half is iOS 26 and the image half is 27.
+    private var canSeePictures: Bool {
+        if #available(iOS 27.0, *) { return true }
+        return false
+    }
+
+    private func chips(from s: OnDevice.Suggested) -> [(String, String, () -> Void)] {
+        var out: [(String, String, () -> Void)] = []
+        func add(_ label: String, _ value: String, _ apply: @escaping () -> Void) {
+            let trimmed = value.trimmingCharacters(in: .whitespaces)
+            // An empty field is the model declining, which the
+            // instructions ask it to do rather than guess. Do not offer
+            // an empty chip as though it were an answer.
+            if !trimmed.isEmpty { out.append((label, trimmed, apply)) }
+        }
+        add("Title", s.title) { title = s.title }
+        add("Era", s.era) { era = s.era }
+        add("Condition", s.condition) { condition = s.condition }
+        return out
+    }
+
+    private func look() {
+        guard let id = attached.first, let data = thumbs[id],
+              let cg = UIImage(data: data)?.cgImage else {
+            modelError = "That photograph could not be read."
+            return
+        }
+        looking = true
+        modelError = nil
+        Task {
+            do {
+                if #available(iOS 27.0, *) {
+                    suggested = try await OnDevice.suggestions(
+                        from: cg, typedTitle: title)
+                }
+            } catch {
+                modelError = error.localizedDescription
+            }
+            looking = false
+        }
+    }
+
+    private func makeDraft() {
+        drafting = true
+        modelError = nil
+        Task {
+            do {
+                draft = try await OnDevice.draftListing(
+                    for: OnDevice.Item(title: title, era: era,
+                                       condition: condition, asking: asking))
+            } catch {
+                modelError = error.localizedDescription
+            }
+            drafting = false
         }
     }
 

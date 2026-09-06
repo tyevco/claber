@@ -346,6 +346,7 @@ hardware or a real Facebook account.
 | Saved-page JSON shape | **ASSUMED.** Field names from public GraphQL modules; fixture is synthetic. |
 | `printd` split (`pi-http`) | **Verified on the hardware, over loopback.** Both printers driven over HTTP: a 4x6 through `/print` and an inventory label through `/print-tag`, each journaled with the right `kind` and `outcome`, and the printed 4x6 indistinguishable from a `tspl` one. So the transport, the HMAC, the spool, the deadline, the journal and both device paths are all real now. **Not yet run off loopback** - that is a bind address and a mesh VPN. |
 | The native iOS client | **Builds, runs against the real server, and its eleven UI journeys now execute.** Xcode compiles it, the simulator launches it, and it reads her actual orders, listings and bins off the Pi through a cloudflared tunnel - so the bearer token, the `/api/v1` prefix, every Codable shape and the whole HTTPS path are confirmed on real data rather than a fixture. `./ios/run-ui-tests.sh` is green: 11/11 against a real `mplabel serve`, plus 24 Swift unit tests. Before that the runner had never executed a single assertion - all eight skipped, because `TEST_RUNNER_*` was being passed as a build setting - so everything the UI tests covered was unproven and two of them were in fact wrong. Three things are still **not** verified, all of them needing a real device: the simulator has no camera, so neither `ScanView` - the entire reason this target exists rather than a web page - nor `CaptureView`'s `AVCapturePhotoOutput` has ever seen one; and nothing has been printed from it, which is the one action that spends physical stock. |
+| The on-device model | **Verified in the simulator, on real generations.** `FoundationModels` reports `available` and both halves run: the text draft (iOS 26) and the image path (iOS 27), which decoded straight into the `@Generable` type and correctly left `era` and `condition` **empty** on a picture it could not place. So the API, the guided decode and the availability handling are real rather than compiled. **Not** run on the phone, and the model there is the same size but not the same silicon. Nothing about the *quality* of a suggestion is verified - see the two findings below, both of which were measured rather than reasoned. |
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 
@@ -850,6 +851,37 @@ print" chip, which is where she looks anyway - and a UI test asserts
 that route still exists, because a screen with no way to it is the
 quietest kind of deletion.
 
+**Do not tell the on-device model who is selling.** The listing
+instructions opened "…second-hand household items sold on Facebook
+Marketplace by one person from her home" - true, and helpful-looking
+context - and the safety classifier refused the whole request with
+`guardrailViolation`, on a milk glass vase with a chip in it. Isolated
+one sentence at a time: dropping the negative list did not help,
+dropping "Facebook Marketplace" did not help, dropping the description
+of *her* did. Describing a private individual is what tripped it. The
+instructions now say what to write and nothing about who wants it
+written. A refusal still has to be caught and turned into a sentence -
+it fires occasionally on wording it cannot place, and it must never
+reach her as a raw error or read as though she typed something wrong.
+
+**A gap the model is not told about is a gap it fills in.** Asked to
+write a listing for "Cast iron skillet" with nothing said about its
+condition, three runs of three invented damage - "light rust on the
+bottom edge", "handle is slightly bent", "minor chipping on one side".
+Naming the gap (`Condition: not stated`) stopped it three of three. That
+is the opposite of the obvious design, which was to omit an empty field
+so as not to invite an answer, and it matters more here than most places
+a model is wrong: an invented chip is a false statement about an object
+a buyer is going to unwrap.
+
+The cost of naming it is that the draft then says "Condition: not
+stated", which she would delete every time - and the model **cannot be
+told to keep quiet about it**: instructed to write nothing about a
+missing field it echoes the line back verbatim. So `OnDevice.tidy`
+removes it afterwards, where it is deterministic and unit-tested rather
+than a thing we hope the model does. `paid` is not in the generated type
+at all, so no guess can ever reach a margin.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
@@ -1118,11 +1150,20 @@ be taken and the kitchen table is where it can be said what it was of.
 not a year, because "Antique 1900-1915 American Edwardian" is a range
 and a guess at once.
 
-Two parts of that screen in the design are deliberately not built, and
-both are decisions rather than omissions: **suggestions from the photos**
-(an online enrichment call with an offline queue behind it) and the
-**listing kit** (draft copy to paste into Marketplace). Each is a
-feature in its own right, not a field.
+**Both AI halves of that screen are built, on-device.** The design drew
+them as an online call with an offline queue behind it;
+`FoundationModels` needs no key, no vendor and no network, so the queue
+is gone and the "no signal in the store" state with it. `OnDevice.swift`
+holds both: a listing draft from the fields she typed (iOS 26, text) and
+title/era/condition/category off a photograph (iOS 27, images - the
+image half of the framework arrived a version after the text half, so it
+carries its own `#available`). Nothing either produces is written
+anywhere on its own; a suggestion becomes a value when she taps its
+chip. The two measured findings that shaped the wording are in *Things
+that will bite you*.
+
+Raising the deployment floor to **iOS 26** is what made this reasonable
+rather than a second code path that could not be tested.
 
 Still missing from the design, in rough order of worth:
 
