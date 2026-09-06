@@ -9,25 +9,47 @@ struct QueueView: View {
     @State private var orders: [Order] = []
     @State private var error: String?
     @State private var loading = false
+    @State private var path: [Int] = []
+
+    /// Her own summary of the day, in the design's chip strip. Counts
+    /// rather than money: this screen is about what has to happen, and
+    /// the takings are a different screen.
+    private var unprinted: Int { orders.filter { !$0.printed && $0.hasLabel }.count }
+    private var overdue: Int { orders.filter { Due(shipBy: $0.shipBy).urgent }.count }
 
     var body: some View {
-        NavigationStack {
-            List {
-                if let error {
-                    ErrorBanner(message: error).listRowInsets(EdgeInsets())
-                }
-                if orders.isEmpty && !loading {
-                    ContentUnavailableView("Nothing to ship",
-                                           systemImage: "checkmark.circle",
-                                           description: Text("Every order is away."))
-                }
-                ForEach(orders) { order in
-                    NavigationLink(value: order.id) {
-                        OrderRow(order: order)
+        NavigationStack(path: $path) {
+            MPScreen(eyebrow: Date.now.formatted(.dateTime.weekday(.wide)
+                                                 .day().month(.wide)),
+                     title: "To ship") {
+                if let error { MPError(message: error) }
+
+                if !orders.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: MP.S.x2) {
+                            MPChip(value: "\(orders.count)", label: "open")
+                            MPChip(value: "\(unprinted)", label: "to print")
+                            MPChip(value: "\(overdue)", label: "due now",
+                                   tint: overdue > 0 ? MP.Palette.alert
+                                                     : MP.Palette.fg)
+                        }
                     }
+                    .padding(.bottom, MP.S.x1)
+                }
+
+                ForEach(orders) { order in
+                    Button { path.append(order.id) } label: {
+                        MPCard { OrderRow(order: order) }
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if orders.isEmpty && !loading {
+                    MPEmpty(title: "Nothing to ship",
+                            detail: "Every order is away.",
+                            symbol: "checkmark.circle")
                 }
             }
-            .navigationTitle("To ship")
             .navigationDestination(for: Int.self) { id in
                 OrderDetailView(orderID: id, onChange: { Task { await load() } })
             }
@@ -54,45 +76,74 @@ struct OrderRow: View {
 
     var body: some View {
         let due = Due(shipBy: order.shipBy)
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: MP.S.x1) {
+            HStack(spacing: MP.S.x2) {
                 // The parcel code is a handle, not just a marking:
                 // `reprint` and `ship` both take it, and it is the only
-                // identifier printed on the box.
+                // identifier printed on the box. Monospaced so the
+                // characters line up against what is on the label.
                 Text(order.code ?? "—")
-                    .font(.system(.subheadline, design: .monospaced))
-                    .fontWeight(.semibold)
+                    .font(.system(size: 15, weight: .semibold).monospaced())
+                    .foregroundStyle(MP.Palette.fg)
                 Text(due.label)
-                    .font(.caption2)
-                    .fontWeight(.bold)
-                    .foregroundStyle(due.urgent ? Color.mpAlert : Color.mpMuted)
-                Spacer()
+                    .font(.system(size: 10.5, weight: .bold))
+                    .tracking(0.6)
+                    .foregroundStyle(due.urgent ? MP.Palette.alert
+                                                : MP.Palette.subtle)
+                Spacer(minLength: MP.S.x2)
                 if !order.printed && order.hasLabel {
                     Image(systemName: "printer")
-                        .font(.caption)
-                        .foregroundStyle(Color.mpMuted)
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
                 }
             }
             Text(order.item ?? "(no item)")
-                .font(.subheadline)
+                .font(.system(size: 14))
+                .foregroundStyle(MP.Palette.fg)
                 .lineLimit(2)
-            HStack(spacing: 6) {
+                .multilineTextAlignment(.leading)
+            HStack(spacing: MP.S.x2) {
                 if let buyer = order.buyer { Text(buyer) }
                 Text(money(order.price))
             }
-            .font(.caption)
-            .foregroundStyle(Color.mpMuted)
+            .font(.system(size: 12))
+            .foregroundStyle(MP.Palette.muted)
 
             // A print failure is written to sales.notes, and without
             // showing it here the note only exists on the detail screen
             // of an order she has no reason to suspect.
             if let notes = order.notes, !notes.isEmpty {
                 Text(notes)
-                    .font(.caption2)
-                    .foregroundStyle(Color.mpAlert)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(MP.Palette.alert)
                     .lineLimit(2)
+                    .multilineTextAlignment(.leading)
             }
         }
-        .padding(.vertical, 2)
+    }
+}
+
+/// The design's empty state: quiet, and it says what the emptiness
+/// means rather than just that there is nothing here.
+struct MPEmpty: View {
+    let title: String
+    let detail: String
+    var symbol = "tray"
+
+    var body: some View {
+        VStack(spacing: MP.S.x2) {
+            Image(systemName: symbol)
+                .font(.system(size: 26))
+                .foregroundStyle(MP.Palette.subtle)
+            Text(title)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(MP.Palette.fg)
+            Text(detail)
+                .font(.system(size: 13))
+                .foregroundStyle(MP.Palette.muted)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, MP.S.x7)
     }
 }
