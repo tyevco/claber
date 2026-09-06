@@ -24,6 +24,9 @@ struct TriageView: View {
     @State private var pile: [Photo] = []
     @State private var index = 0
     @State private var image: Data?
+    /// Why there is no picture, when there is no picture. Nil while it is
+    /// still coming.
+    @State private var imageFailure: String?
     @State private var trips: [Trip] = []
     @State private var detail: TripDetail?
     @State private var costs: [Int: String] = [:]
@@ -95,13 +98,31 @@ struct TriageView: View {
                         .frame(maxHeight: 260)
                         .clipShape(RoundedRectangle(cornerRadius: MP.R.sm))
                 } else {
-                    // Not an error state. A photo's bytes are a separate
-                    // request to the Pi and this screen is useful before
-                    // they land.
+                    // Three states, not two. A spinner that never stops is
+                    // how a row pointing at a file that is gone presents -
+                    // and `photos.path` can absolutely point at nothing,
+                    // which is the same failure `mplabel verify` exists to
+                    // catch for labels. Saying so is what lets her file the
+                    // receipt anyway rather than waiting on a picture that
+                    // is never going to arrive.
                     RoundedRectangle(cornerRadius: MP.R.sm)
                         .fill(MP.Palette.sunken)
                         .frame(height: 140)
-                        .overlay(ProgressView())
+                        .overlay {
+                            if let imageFailure {
+                                VStack(spacing: MP.S.x1) {
+                                    Image(systemName: "photo.badge.exclamationmark")
+                                        .font(.system(size: 20))
+                                    Text(imageFailure)
+                                        .font(.system(size: 12))
+                                        .multilineTextAlignment(.center)
+                                }
+                                .foregroundStyle(MP.Palette.muted)
+                                .padding(MP.S.x3)
+                            } else {
+                                ProgressView()
+                            }
+                        }
                 }
                 if let taken = current?.takenAt {
                     Text(taken)
@@ -271,8 +292,14 @@ struct TriageView: View {
 
     private func loadImage() async {
         image = nil
+        imageFailure = nil
         guard let photo = current else { return }
-        image = try? await APIClient.shared.photoData(photo.id)
+        do {
+            image = try await APIClient.shared.photoData(photo.id)
+        } catch {
+            imageFailure = "The photograph did not load. The row is here; "
+                         + "the file may not be."
+        }
     }
 
     private func pick(_ trip: Trip) {
