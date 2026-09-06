@@ -140,8 +140,14 @@ in development, a tunnel hostname in the house, and it moves again when
 the order side goes to the cluster. First launch asks for it.
 
 **Over plain `http` the token and password cross the network in clear.**
-There is no ATS exception in the Info.plist, so a LAN address will simply
-fail - which is deliberate. Use the tunnel.
+A LAN address now *works* - `NSAllowsLocalNetworking` had to go in for
+the UI tests, and it covers the private IP ranges as well as loopback.
+So the thing that used to stop this is gone.
+
+What still fails is plain http to an internet host, so a tunnel hostname
+must be https. But `http://10.0.2.250:8080` will now connect happily and
+send her password and bearer token across the Wi-Fi in clear. Fine for
+poking at it on a bench; not the way to leave it configured.
 
 **A 401 clears the token and posts `.mplabelSignedOut`.** The network
 layer does not reach into the UI; the UI listens. Do not "fix" this by
