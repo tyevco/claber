@@ -140,9 +140,26 @@ struct BinContents: Codable {
 /// is a parcel, four is a thing on a shelf - and the server checks sales
 /// first, because a code currently on a box waiting to go out is the
 /// more urgent reading.
-enum Lookup {
+/// Hashable and Identifiable are declared *here*, on the enum itself,
+/// and not in an extension next to the screen that uses them. Swift only
+/// synthesises `==` and `hash(into:)` for an enum with associated values
+/// in the file that declares the enum - an extension anywhere else
+/// compiles as a demand to write both by hand.
+///
+/// The synthesis then works only because `OrderDetail` and
+/// `InventoryItem` are both Hashable. Drop it from either and the error
+/// lands here rather than on them.
+enum Lookup: Hashable, Identifiable {
     case sale(OrderDetail)
     case listing(InventoryItem)
+
+    /// `navigationDestination(item:)` wants this.
+    var id: String {
+        switch self {
+        case .sale(let d):     return "sale-\(d.id)"
+        case .listing(let it): return "listing-\(it.id)"
+        }
+    }
 }
 
 extension Lookup: Decodable {
