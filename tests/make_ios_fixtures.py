@@ -82,6 +82,13 @@ def seed(conn):
                  (bin_code,))
     conn.execute("INSERT INTO photos (path, listing_id, trip_id) "
                  "VALUES ('photos/a.jpg', NULL, ?)", (trip_id,))
+    # One capture about nothing yet - neither an item nor a trip - so the
+    # triage pile is non-empty. An empty list is exactly the fixture that
+    # proved nothing last time: five CodingKeys were validated against
+    # payloads with no rows in them.
+    conn.execute("INSERT INTO photos (path, sha256, taken_at, created_at) "
+                 "VALUES ('photos/receipt.jpg', 'deadbeef', "
+                 "'2026-07-01T10:14:00', '2026-07-01T10:14:00')")
     conn.commit()
     return bin_code
 
@@ -142,6 +149,11 @@ def main():
                 # dry run: prints nothing and uses no labels
                 "batch": call(web.API_PREFIX + "/print/pending", "POST",
                               {"ids": [], "dry_run": True}, token=token),
+                # The sourcing half. `trips` carries the money summary,
+                # `trip` the items that came home, `photos` the pile.
+                "trips": call(web.API_PREFIX + "/trips", token=token),
+                "trip": call(f"{web.API_PREFIX}/trips/1", token=token),
+                "photos": call(web.API_PREFIX + "/photos", token=token),
             }
         finally:
             srv.shutdown()

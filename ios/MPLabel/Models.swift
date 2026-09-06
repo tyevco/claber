@@ -102,9 +102,16 @@ struct InventoryItem: Codable, Identifiable, Hashable {
     /// having a listed date - which is most of the saved-page import,
     /// because neither capture carried dates.
     let daysToSell: Int?
+    /// What it cost, in dollars like `price` - not cents. Null means
+    /// unknown, and it has to stay null rather than becoming zero: a
+    /// missing cost read as free reports the whole price as profit.
+    /// Only `h_item` and the trip payload send it; the shelf list does
+    /// not.
+    let paid: Double?
+    let tripId: Int?
 
     enum CodingKeys: String, CodingKey {
-        case id, title, price, state, category, bin
+        case id, title, price, state, category, bin, paid
         case listingId = "listing_id"
         case inventoryCode = "inventory_code"
         case binCode = "bin_code"
@@ -112,6 +119,7 @@ struct InventoryItem: Codable, Identifiable, Hashable {
         case soldAt = "sold_at"
         case binMates = "bin_mates"
         case daysToSell = "days_to_sell"
+        case tripId = "trip_id"
     }
 }
 
@@ -309,3 +317,84 @@ struct ServerError: Codable, LocalizedError {
     let error: String
     var errorDescription: String? { error }
 }
+
+
+// MARK: - the sourcing half
+//
+// Where cost basis comes from. Everything above knows what a thing sold
+// for; these know what it cost, and until they carry data every margin
+// in the analytics is null and Profit can only say "gross".
+
+struct Trip: Codable, Identifiable, Hashable {
+    let id: Int
+    let store: String
+    let occurredAt: String?
+    /// What the till said. Deliberately not the sum of what the items
+    /// cost - a receipt has tax on it and things that never became
+    /// listings, and the gap is the point.
+    let receiptTotal: Double?
+    let notes: String?
+    /// Summed server-side from the listings pointing at this trip.
+    let assigned: Double?
+    let listedFor: Double?
+    /// **Null is not zero.** Null means the till total was never
+    /// recorded; zero means every penny has been attributed. Triage
+    /// chases one of those and not the other, so do not coalesce it.
+    let unassigned: Double?
+    let items: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case id, store, notes, assigned, items
+        case occurredAt = "occurred_at"
+        case receiptTotal = "receipt_total"
+        case listedFor = "listed_for"
+        case unassigned
+    }
+}
+
+struct TripDetail: Codable, Hashable {
+    let trip: Trip
+    let items: [InventoryItem]
+    let photos: [Photo]
+}
+
+struct TripsResponse: Codable { let trips: [Trip] }
+
+/// A photograph. The row is here; the bytes come from `/photos/<id>`,
+/// which needs the bearer token - so they are fetched rather than handed
+/// to `AsyncImage`, which cannot set a header.
+struct Photo: Codable, Identifiable, Hashable {
+    let id: Int
+    let path: String?
+    let sha256: String?
+    let takenAt: String?
+    let createdAt: String?
+    /// **The listings row id, an integer** - not `InventoryItem.listingId`,
+    /// which is Facebook's string id for the same table. Two different
+    /// things wearing one name in the schema; named apart here on
+    /// purpose.
+    let itemID: Int?
+    let tripId: Int?
+    /// Joined onto the untriaged pile only, so the screen can say where
+    /// a capture came from without a second request.
+    let store: String?
+    let tripDate: String?
+
+    /// A capture is triaged when it is about something. There is no
+    /// state column server-side and this is not one either - it reads
+    /// the same absence the server does.
+    var isTriaged: Bool { itemID != nil }
+
+    enum CodingKeys: String, CodingKey {
+        case id, path, sha256, store
+        case takenAt = "taken_at"
+        case createdAt = "created_at"
+        case itemID = "listing_id"
+        case tripId = "trip_id"
+        case tripDate = "trip_date"
+    }
+}
+
+struct PhotosResponse: Codable { let photos: [Photo] }
+struct PhotoResponse: Codable { let photo: Photo }
+struct TripResponse: Codable { let trip: Trip }

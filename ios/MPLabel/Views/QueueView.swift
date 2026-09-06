@@ -11,6 +11,7 @@ struct QueueView: View {
     @State private var loading = false
     @State private var path: [Int] = []
     @State private var showingSettings = false
+    @State private var showingPending = false
 
     /// Her own summary of the day, in the design's chip strip. Counts
     /// rather than money: this screen is about what has to happen, and
@@ -41,7 +42,17 @@ struct QueueView: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: MP.S.x2) {
                             MPChip(value: "\(orders.count)", label: "open")
-                            MPChip(value: "\(unprinted)", label: "to print")
+                            // The way to the recovery screen, and the
+                            // only one: Capture took Pending's tab, and
+                            // a chip that says "3 to print" is where she
+                            // looks anyway when a label did not come
+                            // out. The design has this chip navigate for
+                            // the same reason.
+                            Button { showingPending = true } label: {
+                                MPChip(value: "\(unprinted)", label: "to print")
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint("Opens the pending labels")
                             MPChip(value: "\(overdue)", label: "due now",
                                    tint: overdue > 0 ? MP.Palette.alert
                                                      : MP.Palette.fg)
@@ -70,6 +81,12 @@ struct QueueView: View {
             .task { await load() }
             .overlay { if loading && orders.isEmpty { ProgressView() } }
             .sheet(isPresented: $showingSettings) { SettingsView() }
+            // A sheet rather than a push: PendingView is a tab root with
+            // its own NavigationStack, and nesting one inside this
+            // screen's stack is how a back button starts lying.
+            .sheet(isPresented: $showingPending) {
+                PendingView()
+            }
         }
     }
 

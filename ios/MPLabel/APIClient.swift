@@ -220,6 +220,112 @@ actor APIClient {
         try await send(request("/stats"), as: Stats.self)
     }
 
+    // MARK: - the sourcing half
+
+    func trips() async throws -> [Trip] {
+        try await send(request("/trips"), as: TripsResponse.self).trips
+    }
+
+    func trip(_ id: Int) async throws -> TripDetail {
+        try await send(request("/trips/\(id)"), as: TripDetail.self)
+    }
+
+    func makeTrip(store: String, receiptTotal: Double? = nil,
+                  occurredAt: String? = nil) async throws -> Trip {
+        struct Body: Encodable {
+            let store: String
+            let receipt_total: Double?
+            let occurred_at: String?
+        }
+        return try await send(
+            request("/trips", method: "POST",
+                    body: Body(store: store, receipt_total: receiptTotal,
+                               occurred_at: occurredAt)),
+            as: TripResponse.self).trip
+    }
+
+    /// The triage pile: captures that are not about anything yet.
+    func untriaged() async throws -> [Photo] {
+        try await send(request("/photos"), as: PhotosResponse.self).photos
+    }
+
+    /// One photograph, as raw bytes with a real Content-Type.
+    ///
+    /// Not multipart: there is one file and no other fields, so the trip
+    /// rides in the query string and the body is the image. The server
+    /// keys the row on the sha256 of exactly these bytes, which is what
+    /// makes a retry from a shop with one bar of signal safe - the same
+    /// photo twice is one row, not two receipts in the pile.
+    func uploadPhoto(_ data: Data, contentType: String = "image/jpeg",
+                     trip: Int? = nil) async throws -> Photo {
+        var path = "/photos"
+        if let trip { path += "?trip=\(trip)" }
+        var req = try request(path, method: "POST")
+        req.httpBody = data
+        req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        // A photo over a house wifi is not a small SQLite query, so the
+        // 20 seconds the rest of this client uses is the wrong number.
+        req.timeoutInterval = 120
+        return try await send(req, as: PhotoResponse.self).photo
+    }
+
+    /// The bytes, fetched rather than handed to `AsyncImage`, which
+    /// cannot carry the bearer token.
+    func photoData(_ id: Int) async throws -> Data {
+        let (data, response) = try await session.data(for: request("/photos/\(id)"))
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else {
+            throw APIError.server("the photo could not be loaded",
+                                  (response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        return data
+    }
+
+    func attach(photo id: Int, toItem item: Int) async throws {
+        struct Body: Encodable { let listing: Int }
+        _ = try await send(request("/photos/\(id)/attach", method: "POST",
+                                   body: Body(listing: item)),
+                           as: EmptyResponse.self)
+    }
+
+    /// File a receipt against the run it records. This is what takes a
+    /// capture out of the triage pile - a receipt is never about one
+    /// listing, it is the record of a trip several of whose items it
+    /// paid for.
+    func attach(photo id: Int, toTrip trip: Int) async throws {
+        struct Body: Encodable { let trip: Int }
+        _ = try await send(request("/photos/\(id)/attach", method: "POST",
+                                   body: Body(trip: trip)),
+                           as: EmptyResponse.self)
+    }
+
+    /// Add something by hand: a local pickup, which produces no label
+    /// email at all, or a thing off a shelf being listed for the first
+    /// time.
+    func makeItem(title: String, paid: Double? = nil, price: Double? = nil,
+                  trip: Int? = nil) async throws -> InventoryItem {
+        struct Body: Encodable {
+            let title: String
+            let paid: Double?
+            let price: Double?
+            let trip: Int?
+        }
+        return try await send(
+            request("/inventory", method: "POST",
+                    body: Body(title: title, paid: paid, price: price,
+                               trip: trip)),
+            as: ItemResponse.self).item
+    }
+
+    /// What one object cost. `nil` clears it back to unknown, which is a
+    /// real answer and not the same as zero.
+    func setCost(item id: Int, paid: Double?) async throws -> InventoryItem {
+        struct Body: Encodable { let paid: Double? }
+        return try await send(request("/inventory/\(id)/fields",
+                                      method: "POST", body: Body(paid: paid)),
+                              as: ItemResponse.self).item
+    }
+
     // MARK: - scanning
 
     func lookUp(code: String) async throws -> Lookup {

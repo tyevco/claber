@@ -938,15 +938,26 @@ def attach_photo(conn, photo_id, listing_id=None, trip_id=None):
 
 
 def untriaged(conn, limit=200):
-    """Captures that are not yet about anything.
+    """Captures that are not yet about anything - *either* thing.
 
-    There is no state column and no `captures` table on purpose - the
-    schema note says why. "Not yet turned into an item" is the absence of
-    a listing reference, and a flag saying the same thing would be a
-    second place for it to be wrong."""
+    There is no state column and no `captures` table on purpose; the
+    schema note says why. But "about something" is two references, not
+    one. The first version of this asked only for `listing_id IS NULL`,
+    on the schema comment's reading that a capture becomes triaged by
+    turning into an item - and that is true of a photograph of an object
+    and false of the thing she actually photographs most, which is a
+    receipt. A receipt is never about one listing: it is the record of a
+    trip, several of whose items it paid for. Filed against a trip, it
+    would have sat in this pile for ever, and the pile is the one number
+    on the capture screen.
+
+    So the pile is a photo with neither reference. That keeps the
+    property worth keeping - triaged is still an absence rather than a
+    flag - and stops the queue from lying. Money still needing a home is
+    a different question with a different answer: `trip.unassigned`."""
     rows = conn.execute(
         "SELECT p.*, t.store AS store, t.occurred_at AS trip_date "
         "FROM photos p LEFT JOIN trips t ON t.id = p.trip_id "
-        "WHERE p.listing_id IS NULL "
+        "WHERE p.listing_id IS NULL AND p.trip_id IS NULL "
         "ORDER BY p.created_at DESC, p.id DESC LIMIT ?", (int(limit),))
     return [dict(r) for r in rows]

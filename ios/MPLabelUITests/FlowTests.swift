@@ -190,6 +190,46 @@ final class FlowTests: XCTestCase {
             .waitForExistence(timeout: 15))
     }
 
+    /// The simulator has no camera, so this is the same assertion the
+    /// scanner gets and for the same reason: the first version of a
+    /// camera screen in this app showed a blank rectangle, which is the
+    /// worst possible way to say "there is no camera here".
+    func testTheCaptureTabExplainsItselfWithoutACamera() throws {
+        let app = try launch()
+        app.buttons["Capture"].tap()
+        XCTAssertTrue(app.staticTexts["No camera here"]
+            .waitForExistence(timeout: 15))
+    }
+
+    /// Triage is the half that works without a camera, which is exactly
+    /// why it is reachable from the screen that cannot use one.
+    func testTriageShowsTheCaptureAndTheRunItCouldBelongTo() throws {
+        let app = try launch()
+        app.buttons["Capture"].tap()
+        XCTAssertTrue(app.staticTexts["No camera here"]
+            .waitForExistence(timeout: 15))
+        app.buttons["Go to triage"].tap()
+
+        XCTAssertTrue(app.staticTexts["What did it cost?"]
+            .waitForExistence(timeout: 15))
+        // The seeded capture is about nothing yet, so the pile has it.
+        XCTAssertTrue(app.staticTexts["Receipt 1 of 1"].exists)
+        // And the run it might belong to is offered rather than typed.
+        XCTAssertTrue(app.staticTexts["GOODWILL 214"]
+            .waitForExistence(timeout: 10))
+    }
+
+    /// Capture took Pending's tab, so the queue's chip is the only way to
+    /// the recovery screen. A screen with no route to it is a feature
+    /// that does not exist.
+    func testThePendingLabelsAreStillReachableFromTheQueue() throws {
+        let app = try launch()
+        XCTAssertTrue(app.staticTexts["To ship"].waitForExistence(timeout: 15))
+        app.staticTexts["to print"].tap()
+        XCTAssertTrue(app.staticTexts["Pending labels"]
+            .waitForExistence(timeout: 10))
+    }
+
     func testProfitSaysWhatItDoesNotKnow() throws {
         let app = try launch()
         app.buttons["Profit"].tap()
