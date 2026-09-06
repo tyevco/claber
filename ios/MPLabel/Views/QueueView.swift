@@ -10,6 +10,7 @@ struct QueueView: View {
     @State private var error: String?
     @State private var loading = false
     @State private var path: [Int] = []
+    @State private var showingSettings = false
 
     /// Her own summary of the day, in the design's chip strip. Counts
     /// rather than money: this screen is about what has to happen, and
@@ -22,6 +23,18 @@ struct QueueView: View {
             MPScreen(eyebrow: Date.now.formatted(.dateTime.weekday(.wide)
                                                  .day().month(.wide)),
                      title: "To ship") {
+                Button { showingSettings = true } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(MP.Palette.fg)
+                        .frame(width: 40, height: 40)
+                        .background(MP.Palette.raised,
+                                    in: RoundedRectangle(cornerRadius: MP.R.chip))
+                        .overlay(RoundedRectangle(cornerRadius: MP.R.chip)
+                            .strokeBorder(MP.Palette.border, lineWidth: 1))
+                }
+                .accessibilityLabel("Settings")
+            } content: {
                 if let error { MPError(message: error) }
 
                 if !orders.isEmpty {
@@ -56,6 +69,7 @@ struct QueueView: View {
             .refreshable { await load() }
             .task { await load() }
             .overlay { if loading && orders.isEmpty { ProgressView() } }
+            .sheet(isPresented: $showingSettings) { SettingsView() }
         }
     }
 

@@ -43,6 +43,10 @@ struct RootView: View {
 
 struct MainTabs: View {
     var body: some View {
+        // Five, and the four that are not Scan are the design's own tab
+        // bar. Settings is not among them - it is a gear on the queue,
+        // the way the PWA has it, because a tab is for something she
+        // does and settings is something she did once.
         TabView {
             QueueView()
                 .tabItem { Label("To ship", systemImage: "shippingbox") }
@@ -52,8 +56,8 @@ struct MainTabs: View {
                 .tabItem { Label("Shelf", systemImage: "square.grid.2x2") }
             ScanView()
                 .tabItem { Label("Scan", systemImage: "qrcode.viewfinder") }
-            SettingsView()
-                .tabItem { Label("Settings", systemImage: "gearshape") }
+            ProfitView()
+                .tabItem { Label("Profit", systemImage: "chart.bar") }
         }
     }
 }
