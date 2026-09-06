@@ -2041,6 +2041,13 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
     # A bin, or /bins answers with an empty list and `created_at` looks
     # like a key the server does not send.
     listings_mod.create_bin(conn, "ATTIC")
+    # Same reasoning for the sourcing half: a trip with something on it,
+    # and a capture that is about nothing so the pile is not empty.
+    listings_mod.create_trip(conn, "GOODWILL 214", receipt_total=21.40)
+    conn.execute("UPDATE listings SET trip_id=1, paid=6.0 "
+                 "WHERE inventory_code='7K2M'")
+    conn.commit()
+    listings_mod.add_photo(conn, "photos/receipt.jpg", sha256="deadbeef")
 
     swift = _swift("Models.swift")
     # Only the remapped ones: `case shipBy = "ship_by"`. A key that
@@ -2050,13 +2057,23 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
     assert mapped, "no CodingKeys found - has Models.swift been rewritten?"
 
     served = set()
-    for path in ("/orders", "/inventory", "/bins", "/pending"):
+    for path in ("/orders", "/inventory", "/bins", "/pending",
+             "/trips", "/photos"):
         _s, _h, body = _http(base + web_mod.API_PREFIX + path, cookie=cookie)
         payload = json.loads(body)
         for rows in payload.values():
             if isinstance(rows, list):
                 for row in rows:
                     served |= set(row)
+    # A trip's own payload nests: the summary under "trip", the items
+    # that came home under "items". Both halves are models here.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/trips/1", cookie=cookie)
+    trip = json.loads(body)
+    served |= set(trip["trip"])
+    for row in trip["items"]:
+        served |= set(row)
+    for row in trip["photos"]:
+        served |= set(row)
     # The detail and item payloads carry the rest.
     _s, _h, body = _http(base + web_mod.API_PREFIX + "/inventory/1",
                          cookie=cookie)
@@ -7034,10 +7051,40 @@ def test_a_photo_of_the_wrong_kind_is_refused_by_type_not_by_filename(app):
     assert "photo must be" in _json_of(body)["error"]
 
 
+def test_a_receipt_filed_against_a_trip_leaves_the_pile(app):
+    """A receipt is never about one listing.
+
+    The pile asked only for `listing_id IS NULL` at first, on the
+    schema's reading that a capture is triaged by becoming an item. True
+    of a photograph of an object; false of a receipt, which is the record
+    of a trip several of whose items it paid for - so a filed receipt sat
+    in the queue for ever, and that queue is the one number on the
+    capture screen. Money still needing a home is `trip.unassigned`, a
+    different question."""
+    base, _ = app
+    head = _auth(base)
+    shot_head = dict(head, **{"Content-Type": "image/jpeg"})
+    _, _, body = _http(f"{base}/api/v1/photos", "POST",
+                       raw=b"\xff\xd8 a receipt", headers=shot_head)
+    photo = _json_of(body)["photo"]
+    _, _, body = _http(f"{base}/api/v1/trips", "POST",
+                       {"store": "GOODWILL 214", "receipt_total": 29.46},
+                       headers=head)
+    trip = _json_of(body)["trip"]
+
+    _, _, body = _http(f"{base}/api/v1/photos", headers=head)
+    assert len(_json_of(body)["photos"]) == 1, "not filed yet"
+
+    _http(f"{base}/api/v1/photos/{photo['id']}/attach", "POST",
+          {"trip": trip["id"]}, headers=head)
+    _, _, body = _http(f"{base}/api/v1/photos", headers=head)
+    assert _json_of(body)["photos"] == [], "it is the record of that trip now"
+
+
 def test_the_triage_pile_is_what_has_no_item_yet(app):
     """No state column and no captures table - "not yet triaged" is the
-    absence of a listing reference, and a flag would be a second place for
-    it to be wrong."""
+    absence of a reference, and a flag would be a second place for it to
+    be wrong."""
     base, _ = app
     head = _auth(base)
     shot_head = dict(head, **{"Content-Type": "image/png"})

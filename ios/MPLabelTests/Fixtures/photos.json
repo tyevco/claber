@@ -1,0 +1,15 @@
+{
+  "photos": [
+    {
+      "created_at": "2026-07-01T10:14:00",
+      "id": 2,
+      "listing_id": null,
+      "path": "photos/receipt.jpg",
+      "sha256": "deadbeef",
+      "store": null,
+      "taken_at": "2026-07-01T10:14:00",
+      "trip_date": null,
+      "trip_id": null
+    }
+  ]
+}

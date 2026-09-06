@@ -170,4 +170,71 @@ final class ModelDecodingTests: XCTestCase {
         let err = try JSONDecoder().decode(ServerError.self, from: raw)
         XCTAssertEqual(err.errorDescription, "no bin FLOOR. Make it first")
     }
+
+    // MARK: - the sourcing half
+
+    func testATripCarriesTheMoneySummaryTheScreenNeeds() throws {
+        let out = try decode(TripsResponse.self, from: "trips")
+        let trip = try XCTUnwrap(out.trips.first)
+        XCTAssertEqual(trip.store, "GOODWILL 214")
+        XCTAssertEqual(trip.receiptTotal, 21.40)
+        XCTAssertEqual(trip.assigned, 18.0)
+        // What the till said minus what has been attributed. Not derived
+        // on this side: the server owns the arithmetic so the phone and
+        // the CLI cannot disagree about it.
+        XCTAssertEqual(trip.unassigned, 3.40)
+    }
+
+    /// The distinction the whole triage screen turns on. Null means
+    /// nobody wrote the till total down; zero means every penny is
+    /// attributed. Decoding null into 0 would make the second sentence
+    /// appear over the first situation, which is a screen telling her
+    /// the job is finished when it has not started.
+    func testUnassignedNullIsNotZero() throws {
+        let json = Data("""
+        {"id": 9, "store": "ESTATE SALE", "occurred_at": null,
+         "receipt_total": null, "notes": null, "assigned": null,
+         "listed_for": null, "unassigned": null, "items": 0}
+        """.utf8)
+        let trip = try JSONDecoder().decode(Trip.self, from: json)
+        XCTAssertNil(trip.unassigned)
+        XCTAssertNotEqual(trip.unassigned, 0)
+    }
+
+    func testATripsItemsCarryWhatTheyCost() throws {
+        let out = try decode(TripDetail.self, from: "trip")
+        XCTAssertEqual(out.items.count, 2)
+        let vase = try XCTUnwrap(out.items.first {
+            $0.title == "Hobnail milk glass vase" })
+        XCTAssertEqual(vase.paid, 6.0)
+        XCTAssertEqual(vase.price, 28.0)
+        // The reduced row the trip payload sends omits most of what an
+        // InventoryItem can carry; every one of those has to be optional
+        // or the screen decodes into nothing.
+        XCTAssertNil(vase.listingId)
+    }
+
+    func testThePileIsCapturesThatAreAboutNothing() throws {
+        let out = try decode(PhotosResponse.self, from: "photos")
+        let shot = try XCTUnwrap(out.photos.first)
+        XCTAssertNil(shot.itemID)
+        XCTAssertNil(shot.tripId)
+        XCTAssertFalse(shot.isTriaged)
+        XCTAssertEqual(shot.sha256, "deadbeef")
+    }
+
+    /// `photos.listing_id` is the listings *row id*, an integer, while
+    /// `InventoryItem.listingId` is Facebook's string id for the same
+    /// table. One name, two types, and decoding one as the other is a
+    /// crash rather than a wrong number - so they are named apart on
+    /// this side.
+    func testAPhotosItemReferenceIsTheRowIdNotFacebooks() throws {
+        let json = Data("""
+        {"id": 3, "path": "photos/x.jpg", "sha256": null, "taken_at": null,
+         "created_at": null, "listing_id": 7, "trip_id": null}
+        """.utf8)
+        let photo = try JSONDecoder().decode(Photo.self, from: json)
+        XCTAssertEqual(photo.itemID, 7)
+        XCTAssertTrue(photo.isTriaged)
+    }
 }

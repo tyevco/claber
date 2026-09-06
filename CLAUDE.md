@@ -338,7 +338,7 @@ hardware or a real Facebook account.
 | DYI export schema | **ASSUMED.** Undocumented and reshuffled by Meta; importer walks for shape rather than assuming paths. |
 | Saved-page JSON shape | **ASSUMED.** Field names from public GraphQL modules; fixture is synthetic. |
 | `printd` split (`pi-http`) | **Verified on the hardware, over loopback.** Both printers driven over HTTP: a 4x6 through `/print` and an inventory label through `/print-tag`, each journaled with the right `kind` and `outcome`, and the printed 4x6 indistinguishable from a `tspl` one. So the transport, the HMAC, the spool, the deadline, the journal and both device paths are all real now. **Not yet run off loopback** - that is a bind address and a mesh VPN. |
-| The native iOS client | **Builds, runs against the real server, and its eight UI journeys now execute.** Xcode compiles it, the simulator launches it, and it reads her actual orders, listings and bins off the Pi through a cloudflared tunnel - so the bearer token, the `/api/v1` prefix, every Codable shape and the whole HTTPS path are confirmed on real data rather than a fixture. `./ios/run-ui-tests.sh` is green: 8/8 against a real `mplabel serve`, plus 19 Swift unit tests. Before that the runner had never executed a single assertion - all eight skipped, because `TEST_RUNNER_*` was being passed as a build setting - so everything the UI tests covered was unproven and two of them were in fact wrong. Two things are still **not** verified: the simulator has no camera, so `ScanView` - the entire reason this target exists rather than a web page - has never read a label; and nothing has been printed from it, which is the one action that spends physical stock. Both need a real device. |
+| The native iOS client | **Builds, runs against the real server, and its eleven UI journeys now execute.** Xcode compiles it, the simulator launches it, and it reads her actual orders, listings and bins off the Pi through a cloudflared tunnel - so the bearer token, the `/api/v1` prefix, every Codable shape and the whole HTTPS path are confirmed on real data rather than a fixture. `./ios/run-ui-tests.sh` is green: 11/11 against a real `mplabel serve`, plus 24 Swift unit tests. Before that the runner had never executed a single assertion - all eight skipped, because `TEST_RUNNER_*` was being passed as a build setting - so everything the UI tests covered was unproven and two of them were in fact wrong. Three things are still **not** verified, all of them needing a real device: the simulator has no camera, so neither `ScanView` - the entire reason this target exists rather than a web page - nor `CaptureView`'s `AVCapturePhotoOutput` has ever seen one; and nothing has been printed from it, which is the one action that spends physical stock. |
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 
@@ -821,6 +821,28 @@ from any name the client sent. There is still no state column and no
 `captures` table: "not yet triaged" is `photos.listing_id IS NULL`, and
 a flag saying the same thing would be a second place for it to be wrong.
 
+**A receipt is not about one item, and the triage pile has to know
+that.** "Triaged" started as `photos.listing_id IS NOT NULL`, following
+the schema's note that a capture becomes triaged by turning into an
+item. That is true of a photograph of an object and false of the thing
+she photographs most: a receipt records a *trip*, several of whose items
+it paid for, so a filed receipt sat in the queue for ever - and that
+queue is the one number on the capture screen. The pile is now a photo
+with **neither** reference, which keeps the property worth keeping
+(triaged is an absence, not a flag) and stops the count lying. Money
+still needing a home is a different question with its own number:
+`trip.unassigned`, which is null rather than zero when nobody wrote the
+till total down.
+
+**Five tabs, and Capture took Pending's.** iOS hides the sixth behind
+"More", and a tab she cannot see is a feature that does not exist.
+Capture is one of the four moments the app is for and is useless two
+taps deep while she is holding a cart; Pending is a recovery screen for
+a printer that was off all morning. So Pending moved to the queue's "to
+print" chip, which is where she looks anyway - and a UI test asserts
+that route still exists, because a screen with no way to it is the
+quietest kind of deletion.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
@@ -1071,18 +1093,34 @@ poller cannot detect its own absence.
 
 ### The sourcing half
 
-The design (`docs/ui-design-prompt.md`, and the Claude Design handoff
-built from it) has six screens the app does not: Capture, Triage, Add an
-item, One trip, Notifications, and the corrections/label-PDF affordances
-on order detail. **The API for all of it exists now** - trips, photos,
-attach, create-item and an allow-listed item `fields` that takes `paid`.
-What is left is client work in `ios/`, and it is what makes Profit stop
-saying "gross, not profit": the margin views have been correct and empty
-this whole time.
+The API is done - trips, photos, attach, create-item and an allow-listed
+item `fields` that takes `paid` - and **Capture and Triage are built**
+against it in `ios/`. That is the flow the whole phase was for: she
+photographs a receipt in a shop, and at the kitchen table attributes
+what it cost to the things that came home. Profit stops saying "gross"
+as soon as that has been used in anger; the margin views have been
+correct and empty this whole time.
 
-Note the native app deliberately does not have the PWA's "fix a field"
-form yet, so the two clients are uneven in both directions - the app is
-ahead on design fidelity, the PWA is ahead on corrections.
+Still missing from the design, in rough order of worth:
+
+- **Add an item as a screen of its own.** Triage can create one from a
+  title, which is what its "not listed yet" line does, but the design's
+  form carries paid, asking, era, condition, bin and photos. Note `era`
+  has no column - `condition` does - so that field is a migration, not
+  just a text box.
+- **One trip** - spent / listed for / unassigned, what came home. The
+  payload already answers it; there is no screen.
+- **The order-detail affordances**: fix a field, notes, the label PDF.
+  The PWA has all three and the API has been there all along, so the two
+  clients are uneven in both directions - the app is ahead on design
+  fidelity, the PWA is ahead on corrections.
+- **Notifications**, which needs push and has no backend at all.
+
+What is deliberately *not* built: an offline outbox on the phone.
+Uploads go straight up and a failed one keeps its bytes on screen to be
+retried, which works because the server keys a photo on its sha256 -
+pressing retry cannot make a second row. A local queue would be a second
+source of truth for the same photographs.
 
 ### Older, still true
 

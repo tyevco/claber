@@ -49,15 +49,23 @@ struct RootView: View {
 
 struct MainTabs: View {
     var body: some View {
-        // Five, and the four that are not Scan are the design's own tab
-        // bar. Settings is not among them - it is a gear on the queue,
-        // the way the PWA has it, because a tab is for something she
-        // does and settings is something she did once.
+        // Five, which is the most iOS shows before it starts hiding
+        // them behind "More" - and a tab she cannot see is a feature
+        // that does not exist. Settings is not among them: it is a gear
+        // on the queue, the way the PWA has it, because a tab is for
+        // something she does and settings is something she did once.
+        //
+        // Capture takes Pending's place rather than adding a sixth.
+        // Pending is a recovery screen for a printer that was off all
+        // morning; Capture is one of the four moments the app is for and
+        // is useless if it is two taps deep while she is holding a cart.
+        // Pending keeps its own count on the queue's chip strip, which
+        // is where she looks when a label did not come out.
         TabView {
             QueueView()
                 .tabItem { Label("To ship", systemImage: "shippingbox") }
-            PendingView()
-                .tabItem { Label("Pending", systemImage: "printer.dotmatrix") }
+            CaptureView()
+                .tabItem { Label("Capture", systemImage: "camera") }
             ShelfView()
                 .tabItem { Label("Shelf", systemImage: "square.grid.2x2") }
             ScanView()

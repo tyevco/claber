@@ -1,0 +1,16 @@
+{
+  "trips": [
+    {
+      "assigned": 18.0,
+      "created_at": null,
+      "id": 1,
+      "items": 2,
+      "listed_for": 88.0,
+      "notes": null,
+      "occurred_at": "2026-07-01",
+      "receipt_total": 21.4,
+      "store": "GOODWILL 214",
+      "unassigned": 3.4
+    }
+  ]
+}
