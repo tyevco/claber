@@ -32,6 +32,9 @@ from pathlib import Path
 # CLAUDE.md says a new column needs a migration; the index needs one too.
 POST_MIGRATION_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_listing_bin ON listings(bin_code)",
+    "CREATE INDEX IF NOT EXISTS idx_listing_trip ON listings(trip_id)",
+    "CREATE INDEX IF NOT EXISTS idx_photo_listing ON photos(listing_id)",
+    "CREATE INDEX IF NOT EXISTS idx_photo_trip ON photos(trip_id)",
 )
 
 SCHEMA = """
@@ -44,6 +47,26 @@ SCHEMA = """
 -- following it. `code` is three characters from the code alphabet, minted
 -- rather than typed, and is what a tag carries and a phone reads. Renaming
 -- a bin moves neither the tag nor the things in it.
+-- One sourcing trip: a shop, a day, and what the receipt came to.
+--
+-- Its identity is minted here, so like a bin it earns a real key. Unlike
+-- a bin it is never printed on anything, so the id is an ordinary
+-- integer rather than a code from the alphabet - nothing has to read it
+-- off thermal paper.
+--
+-- `receipt_total` is what the till said, and it is deliberately not the
+-- sum of what the items cost: a receipt has tax and things that never
+-- became listings on it, and the difference between the two numbers is
+-- itself worth seeing.
+CREATE TABLE IF NOT EXISTS trips (
+    id            INTEGER PRIMARY KEY,
+    store         TEXT NOT NULL,
+    occurred_at   TEXT,
+    receipt_total REAL,
+    notes         TEXT,
+    created_at    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS bins (
     code       TEXT PRIMARY KEY,
     name       TEXT NOT NULL UNIQUE,
@@ -82,6 +105,23 @@ CREATE TABLE IF NOT EXISTS listings (
     -- "where has this been?" becomes a real question it is a new table
     -- beside this, not a different shape of it.
     bin_code      TEXT REFERENCES bins(code) ON DELETE SET NULL,
+
+    -- What it cost, in dollars, like `price`. NOT cents.
+    --
+    -- `amount_with_offset` is already the trap on record for this: read
+    -- raw it turns $15 into $1500 and silently corrupts every average.
+    -- A second money column is a second chance to make that mistake, so
+    -- it uses the same unit as the first one and a test says so.
+    --
+    -- Null means unknown, which is the honest state for everything that
+    -- predates this column - and margin has to stay null rather than
+    -- becoming the whole price.
+    paid          REAL,
+
+    -- Which trip it came home from. SET NULL because deleting a trip is
+    -- tidying up a record of a shop visit, not disowning the things.
+    trip_id       INTEGER REFERENCES trips(id) ON DELETE SET NULL,
+
     notes         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_listing_state ON listings(state);
@@ -89,6 +129,28 @@ CREATE INDEX IF NOT EXISTS idx_listing_sold  ON listings(sold_at);
 
 -- Every Facebook email we have classified, so backfill is resumable and
 -- we can report on subject lines we do not yet recognise.
+-- A photograph. The row points at a file; the bytes are on disk under
+-- `home/photos/`, exactly as `labels/` works.
+--
+-- Not a blob: this is an SD card in a Raspberry Pi, and a database that
+-- grows by three megabytes per photo is a database that stops being
+-- copyable. `verify` is already the pattern for checking a row still
+-- matches its file.
+--
+-- A photo with no `listing_id` is a capture awaiting triage. That is
+-- why there is no `captures` table and no state column: "not yet turned
+-- into an item" is the absence of a reference, and inventing a state to
+-- say the same thing gives two places to disagree.
+CREATE TABLE IF NOT EXISTS photos (
+    id         INTEGER PRIMARY KEY,
+    path       TEXT NOT NULL,
+    sha256     TEXT,
+    taken_at   TEXT,
+    created_at TEXT,
+    listing_id INTEGER REFERENCES listings(id) ON DELETE SET NULL,
+    trip_id    INTEGER REFERENCES trips(id)    ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS mail_events (
     id          INTEGER PRIMARY KEY,
     message_id  TEXT UNIQUE,
@@ -630,7 +692,11 @@ DROP VIEW IF EXISTS v_listing_perf;
 CREATE VIEW v_listing_perf AS
 SELECT
     listing_id, title, category, price, state, inquiries, renewed_count,
-    listed_at, sold_at,
+    listed_at, sold_at, paid, trip_id,
+    -- Null unless both halves are known. A missing cost must not read as
+    -- a cost of zero, which would report the whole price as profit.
+    CASE WHEN price IS NOT NULL AND paid IS NOT NULL
+         THEN ROUND(price - paid, 2) END AS margin,
     CASE WHEN sold_at IS NOT NULL AND listed_at IS NOT NULL
          THEN CAST(julianday(sold_at) - julianday(listed_at) AS INTEGER)
     END AS days_to_sell,
@@ -663,6 +729,11 @@ CREATE VIEW v_monthly AS
 SELECT strftime('%Y-%m', sold_at) AS month,
        COUNT(*)             AS orders,
        ROUND(SUM(price), 2) AS gross,
+       -- Only over rows that have a cost. A month with one costed item
+       -- reports that item's margin, not the month's - which is why the
+       -- count comes with it.
+       ROUND(SUM(margin), 2) AS net,
+       SUM(margin IS NOT NULL) AS costed,
        ROUND(AVG(price), 2) AS avg_order,
        ROUND(AVG(days_to_sell), 1) AS avg_days_to_sell
 FROM v_listing_perf

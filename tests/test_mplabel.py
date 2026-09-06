@@ -4621,6 +4621,166 @@ def test_foreign_keys_are_actually_enforced(db):
         db.commit()
 
 
+def test_a_migrated_database_has_the_same_foreign_keys_as_a_fresh_one(tmp_path):
+    """A column added by `ALTER TABLE ... ADD COLUMN bin_code TEXT` gets
+    no foreign key, while the identical column in SCHEMA gets one. So a
+    database that upgraded and a database that was created new end up
+    with different constraints, and every test passes either way because
+    the fixture builds from SCHEMA.
+
+    That is exactly what shipped: `bin_code` went out declared as plain
+    TEXT in MIGRATIONS, so the Pi's database has it unconstrained. The
+    decl now carries the REFERENCES clause, and this compares the two
+    databases directly rather than trusting that it does.
+
+    Note what this cannot fix: SQLite will not add a constraint to a
+    column that already exists without rebuilding the table, so a
+    database that migrated before the decl was corrected keeps the
+    unconstrained column."""
+    import sqlite3
+    from mplabel import cli, listings
+
+    def foreign_keys(conn):
+        out = set()
+        for table in ("listings", "photos"):
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})"):
+                # (id, seq, table, from, to, on_update, on_delete, match)
+                out.add((table, row[3], row[2], row[4], row[6]))
+        return out
+
+    fresh_home = tmp_path / "fresh"
+    (fresh_home / "labels").mkdir(parents=True)
+    fresh = cli.connect_db(fresh_home)
+
+    # A database as it was before any of these columns existed.
+    old_home = tmp_path / "old"
+    (old_home / "labels").mkdir(parents=True)
+    raw = sqlite3.connect(old_home / "sales.db")
+    before = ";".join(
+        "\n".join(line for line in stmt.splitlines()
+                   if not any(c in line for c in
+                              ("bin_code", "paid", "trip_id")))
+        for stmt in listings.SCHEMA.split(";")
+        if "CREATE TABLE IF NOT EXISTS bins" not in stmt
+        and "CREATE TABLE IF NOT EXISTS trips" not in stmt
+        and "CREATE TABLE IF NOT EXISTS photos" not in stmt) + ";"
+    raw.executescript(before)
+    raw.execute("INSERT INTO listings (title) VALUES ('before all of it')")
+    raw.commit()
+    raw.close()
+
+    migrated = cli.connect_db(old_home)
+
+    assert foreign_keys(migrated) == foreign_keys(fresh), (
+        "a migrated database and a fresh one disagree about foreign keys; "
+        "check the REFERENCES clause is in the MIGRATIONS decl too")
+    # And the row that predates everything survived.
+    assert migrated.execute(
+        "SELECT COUNT(*) c FROM listings").fetchone()["c"] == 1
+
+
+def test_paid_is_dollars_like_price_not_cents(db):
+    """The second money column, and the second chance to make the mistake
+    already on record: `amount_with_offset` read raw turns $15 into $1500
+    and silently corrupts every average downstream.
+
+    So `paid` is dollars, the same unit as `price`, and margin is a plain
+    subtraction. If this ever fails because someone stored cents, the
+    symptom is not an exception - it is a profit report that is a hundred
+    times wrong and looks plausible."""
+    from mplabel import listings
+
+    db.execute("INSERT INTO listings (title, price, paid, state, sold_at) "
+               "VALUES ('Hobnail vase', 28.00, 6.00, 'sold', '2026-08-01')")
+    db.commit()
+    listings.build_views(db)
+
+    row = db.execute("SELECT price, paid, margin FROM v_listing_perf "
+                     "WHERE title='Hobnail vase'").fetchone()
+    assert row["price"] == 28.0
+    assert row["paid"] == 6.0
+    assert row["margin"] == 22.0
+
+
+def test_margin_is_null_without_a_cost_not_the_whole_price(db):
+    """Everything predating the `paid` column has no cost, and a missing
+    cost read as zero would report the entire price as profit - which is
+    the flattering direction, and therefore the one to guard."""
+    from mplabel import listings
+
+    db.execute("INSERT INTO listings (title, price, state, sold_at) "
+               "VALUES ('No cost known', 40.0, 'sold', '2026-08-01')")
+    db.commit()
+    listings.build_views(db)
+
+    assert db.execute("SELECT margin FROM v_listing_perf "
+                      "WHERE title='No cost known'").fetchone()["margin"] is None
+    # And the month it sold in reports how many rows actually had a cost,
+    # so a net of nothing cannot be read as a net of zero.
+    month = db.execute("SELECT net, costed, orders FROM v_monthly").fetchone()
+    assert month["net"] is None
+    assert month["costed"] == 0
+    assert month["orders"] == 1
+
+
+def test_deleting_a_trip_keeps_what_came_home(db):
+    """`SET NULL`, like a bin. Deleting a trip is tidying up the record
+    of a shop visit; the things are still on the shelf."""
+    db.execute("INSERT INTO trips (store, occurred_at) "
+               "VALUES ('GOODWILL 214', '2026-08-14')")
+    trip = db.execute("SELECT id FROM trips").fetchone()["id"]
+    db.execute("INSERT INTO listings (title, trip_id, paid) "
+               "VALUES ('Enamel bread bin', ?, 4.0)", (trip,))
+    db.commit()
+
+    db.execute("DELETE FROM trips WHERE id=?", (trip,))
+    db.commit()
+
+    row = db.execute("SELECT title, trip_id, paid FROM listings").fetchone()
+    assert row["title"] == "Enamel bread bin"
+    assert row["trip_id"] is None
+    # The cost is a fact about the thing, not about the trip, so it stays.
+    assert row["paid"] == 4.0
+
+
+def test_a_photo_cannot_point_at_a_listing_that_is_not_there(db):
+    """The reference is real, so a triage bug cannot leave a photo
+    attached to nothing. Deleting the listing un-attaches instead, which
+    puts the photo back in triage rather than losing it."""
+    db.execute("INSERT INTO listings (title) VALUES ('Oil portrait')")
+    lid = db.execute("SELECT id FROM listings").fetchone()["id"]
+    db.execute("INSERT INTO photos (path, listing_id) VALUES ('a.jpg', ?)",
+               (lid,))
+    db.commit()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO photos (path, listing_id) "
+                   "VALUES ('b.jpg', 9999)")
+        db.commit()
+    db.rollback()
+
+    db.execute("DELETE FROM listings WHERE id=?", (lid,))
+    db.commit()
+    assert db.execute(
+        "SELECT listing_id FROM photos WHERE path='a.jpg'"
+    ).fetchone()["listing_id"] is None
+
+
+def test_a_capture_awaiting_triage_is_a_photo_with_no_listing(db):
+    """No `captures` table and no state column, deliberately: "not yet
+    turned into an item" is the absence of a reference. A state column
+    saying the same thing is a second place to disagree with the first."""
+    db.execute("INSERT INTO listings (title) VALUES ('Already an item')")
+    lid = db.execute("SELECT id FROM listings").fetchone()["id"]
+    db.executemany("INSERT INTO photos (path, listing_id) VALUES (?,?)",
+                   [("triaged.jpg", lid), ("waiting.jpg", None)])
+    db.commit()
+
+    waiting = [r["path"] for r in db.execute(
+        "SELECT path FROM photos WHERE listing_id IS NULL")]
+    assert waiting == ["waiting.jpg"]
+
+
 def test_the_bin_column_reaches_a_database_that_predates_it(tmp_path):
     """`CREATE TABLE IF NOT EXISTS` will not touch a database that holds
     real listings, so the column has to be in MIGRATIONS as well as in

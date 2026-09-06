@@ -181,10 +181,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_order
 # already holds real sales, so a new column has to be named here as well
 # as in the SCHEMA it belongs to - otherwise it exists on fresh installs
 # and nowhere else, and the difference only shows up on her Pi.
+# `decl` is pasted into `ALTER TABLE ... ADD COLUMN`, so it carries the
+# REFERENCES clause too - and it has to.
+#
+# A column added as plain TEXT gets **no foreign key at all**, while the
+# same column in SCHEMA gets one, so a migrated database and a fresh one
+# quietly end up with different constraints. `bin_code` shipped that way
+# and the tests missed it, because the fixture builds from SCHEMA.
+# `test_a_migrated_database_has_the_same_foreign_keys` is the guard.
+#
+# Note this only helps a database that has not migrated yet: SQLite
+# cannot add a constraint to a column that already exists without
+# rebuilding the table.
 MIGRATIONS = [
     ("sales", "code", "TEXT"),
     ("listings", "inventory_code", "TEXT"),
-    ("listings", "bin_code", "TEXT"),
+    ("listings", "bin_code",
+     "TEXT REFERENCES bins(code) ON DELETE SET NULL"),
+    ("listings", "paid", "REAL"),
+    ("listings", "trip_id",
+     "INTEGER REFERENCES trips(id) ON DELETE SET NULL"),
 ]
 
 
