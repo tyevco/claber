@@ -20,12 +20,54 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON="${MPLABEL_PYTHON:-python3}"
+
+# A virtualenv in the repo wins over the system python, because the
+# system one on a Mac almost certainly does not have Pillow and
+# pdfplumber - and `mplabel.cli` imports `label`, which imports
+# pdfplumber at module scope, so *every* entry point needs them.
+if [ -n "${MPLABEL_PYTHON:-}" ]; then
+    PYTHON="$MPLABEL_PYTHON"
+elif [ -x "$REPO/.venv/bin/python" ]; then
+    PYTHON="$REPO/.venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
 SIMULATOR="${SIMULATOR:-iPhone 16}"
 PASSWORD="uitest-password"
 # Not a fixed port: a server left running from an interrupted run would
 # be picked up silently, and the tests would pass against stale data.
 PORT="${PORT:-$((49200 + RANDOM % 700))}"
+
+# Exported before the check, not after: the rest of the script runs with
+# this set, so a preflight without it could reject a python that would
+# actually have worked.
+export PYTHONPATH="$REPO/src"
+
+# Check before doing anything, and say what to run. Without this the
+# first failure is a ModuleNotFoundError from inside a heredoc, which
+# reads as a broken script rather than an environment that has never had
+# the dependencies installed.
+if ! "$PYTHON" -c "import mplabel.cli" >/dev/null 2>&1; then
+    cat >&2 <<EOF
+$PYTHON cannot import mplabel.
+
+Most likely it has none of the dependencies: mplabel.cli imports label,
+which imports pdfplumber at module scope, so every entry point needs
+them. Set one up once:
+
+    cd "$REPO"
+    python3 -m venv .venv
+    .venv/bin/pip install -e ".[dev]"
+
+This script picks up .venv/bin/python automatically after that. Or point
+it somewhere else with MPLABEL_PYTHON=/path/to/python.
+
+The underlying error:
+EOF
+    "$PYTHON" -c "import mplabel.cli" >&2 || true
+    exit 1
+fi
 
 HOME_DIR="$(mktemp -d)"
 mkdir -p "$HOME_DIR/labels"
@@ -37,7 +79,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export PYTHONPATH="$REPO/src"
 export MPLABEL_HOME="$HOME_DIR"
 
 echo "==> seeding a database in $HOME_DIR"
