@@ -65,6 +65,27 @@ the app is killed the instant the Scan tab opens, with no message.
 | `Views/ShelfView.swift`, `ItemView.swift` | where things are, and moving one |
 | `Views/LoginView.swift` | server address, password, settings |
 
+## Re-run xcodegen whenever a file is added
+
+```bash
+cd ios && xcodegen generate
+```
+
+The file list is written **into** the `.pbxproj` when the project is
+generated; Xcode does not rescan the directory on build. So a new file
+pulled from git is simply not in the target, and the symptom is a
+compile error about whatever it declared:
+
+```
+Cannot find 'MP' in scope
+```
+
+which reads as a broken reference rather than a missing file. If a pull
+brought new Swift and the build suddenly cannot see a type it saw
+before, this is why. That is the cost of generating the project instead
+of committing it, and it is still the better trade - a `.pbxproj` is a
+wall of UUIDs that conflicts on every branch.
+
 ## Things that will bite you
 
 **The server address is configuration, not a constant.** It is loopback
