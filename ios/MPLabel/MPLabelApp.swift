@@ -12,6 +12,12 @@ import SwiftUI
 struct MPLabelApp: App {
     @StateObject private var session = Session.shared
 
+    init() {
+        // Before any view reads Settings or the keychain. In release
+        // this is a call to a function whose body is #if DEBUG'd away.
+        TestHooks.applyIfPresent()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

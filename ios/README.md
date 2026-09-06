@@ -65,6 +65,45 @@ the app is killed the instant the Scan tab opens, with no message.
 | `Views/ShelfView.swift`, `ItemView.swift` | where things are, and moving one |
 | `Views/LoginView.swift` | server address, password, settings |
 
+## Tests
+
+⌘U in Xcode, or:
+
+```bash
+xcodebuild test -project ios/MPLabel.xcodeproj -scheme MPLabel \
+  -destination 'platform=iOS Simulator,name=iPhone 15'
+```
+
+Two bundles, and they answer different questions.
+
+**`MPLabelTests`** decodes committed JSON fixtures into the models. The
+fixtures are **generated, never hand-written** — `python
+tests/make_ios_fixtures.py` starts a real server against a real
+temporary database and writes what comes back. That property is the
+whole point: a JSON file typed out by hand would carry the same belief
+as the models it checks, and that belief has been wrong twice. A pytest
+guard fails if the server's shape drifts from the committed copies.
+
+**`MPLabelUITests`** drives the real app against **the real server**, not
+a mock. `ServerHarness` spawns `mplabel serve` on the Mac (a UI test
+bundle runs on the host, so it can start a process; the simulator shares
+the host's network). Same reasoning: a Swift stub would answer what we
+*believe* `web.py` answers, so it would have agreed with the models on
+both occasions it mattered and caught neither.
+
+It needs a Python that can import this repo. `python3` on PATH by
+default; `MPLABEL_PYTHON=/path/to/python` overrides, and the failure
+says so rather than surfacing as a connection refusal three layers up.
+
+`TestHooks` is how a test points the app at that server and skips the
+login screen. It is `#if DEBUG` throughout, so on a release build there
+is no path from a launch argument to the app's credentials.
+
+**ATS:** Debug adds `NSAllowsLocalNetworking` and only that — http to
+the local network, which is what a test against 127.0.0.1 needs. The
+release build has no exception at all, so a plain-http address still
+fails on her phone, which is the behaviour worth keeping.
+
 ## Re-run xcodegen whenever a file is added
 
 ```bash
