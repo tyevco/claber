@@ -37,6 +37,9 @@ struct AddItemView: View {
     @State private var pile: [Photo] = []
     @State private var thumbs: [Int: Data] = [:]
     @State private var attached: Set<Int> = []
+    /// Whether the thumbnail fetches have finished. Before they have, a
+    /// missing picture is "not yet"; after, it is "not there".
+    @State private var thumbsLoaded = false
     @State private var busy = false
     @State private var error: String?
     // The on-device model's two offerings. Both are held here rather
@@ -263,7 +266,15 @@ struct AddItemView: View {
                 if let data = thumbs[photo.id], let ui = UIImage(data: data) {
                     Image(uiImage: ui).resizable().scaledToFill()
                 } else {
-                    MP.Palette.sunken
+                    // Third time this app has had to say it: a row can
+                    // outlive its file, and a blank tile is one she taps
+                    // expecting a picture. Same treatment as triage.
+                    MP.Palette.sunken.overlay {
+                        Image(systemName: thumbsLoaded
+                              ? "photo.badge.exclamationmark" : "photo")
+                            .font(.system(size: 16))
+                            .foregroundStyle(MP.Palette.subtle)
+                    }
                 }
             }
             .frame(width: 64, height: 72)
@@ -446,9 +457,10 @@ struct AddItemView: View {
         }
         for photo in pile {
             // One at a time and best effort: a thumbnail that does not
-            // arrive is a grey rectangle, not a broken screen.
+            // arrive is marked, not a broken screen.
             thumbs[photo.id] = try? await APIClient.shared.photoData(photo.id)
         }
+        thumbsLoaded = true
     }
 
     private func toggle(_ photo: Photo) {

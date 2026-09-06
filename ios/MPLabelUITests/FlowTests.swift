@@ -16,6 +16,7 @@ final class FlowTests: XCTestCase {
     /// Set by the tests that change data, and put back in teardown.
     private var shippedSale: Int?
     private var unbinned: (listing: Int, bin: String)?
+    private var correctedSale: Int?
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -40,6 +41,13 @@ final class FlowTests: XCTestCase {
         if let id = shippedSale {
             shippedSale = nil
             try server.post("/api/v1/orders/\(id)/unship")
+        }
+        if let id = correctedSale {
+            correctedSale = nil
+            // Put the parser's own reading back, so the queue test that
+            // follows sees the row it expects.
+            try server.post("/api/v1/orders/\(id)/fields",
+                            body: ["buyer": "Sam Sample"])
         }
         if let moved = unbinned {
             unbinned = nil
@@ -308,6 +316,51 @@ final class FlowTests: XCTestCase {
                                      "the item came back with no cost at all")
         XCTAssertEqual(paidBack, 7.50, accuracy: 0.001,
                        "the cost must survive the round trip")
+    }
+
+    /// Corrections are a first-class action because the parser gets a
+    /// buyer or a price wrong often enough. Destructive, so it puts the
+    /// buyer back in teardown.
+    func testCorrectingAFieldSticks() throws {
+        let app = try launch()
+        XCTAssertTrue(app.staticTexts["7QK"].waitForExistence(timeout: 15))
+        app.staticTexts["7QK"].tap()
+        XCTAssertTrue(app.staticTexts["Ships to"].waitForExistence(timeout: 10))
+
+        correctedSale = try server.saleID(code: "7QK")
+        app.buttons["Edit"].tap()
+
+        let buyer = app.descendants(matching: .any)["fix-buyer"]
+        XCTAssertTrue(buyer.waitForExistence(timeout: 10))
+        buyer.tap()
+        // Clear it first: the field is prefilled with what the parser
+        // read, which is the point of the screen.
+        buyer.press(forDuration: 1.2)
+        if app.menuItems["Select All"].waitForExistence(timeout: 2) {
+            app.menuItems["Select All"].tap()
+        }
+        buyer.typeText("Corrected Name")
+
+        app.buttons["Hold to correct"].press(forDuration: 1.4)
+        XCTAssertTrue(app.staticTexts["Corrected Name"]
+            .waitForExistence(timeout: 15))
+    }
+
+    /// The seeded sale points at a label file that is not on disk, which
+    /// is exactly the case `mplabel verify` exists for. The screen must
+    /// say so rather than spin - the third place in this app where a row
+    /// can outlive its file.
+    func testAMissingLabelFileSaysSo() throws {
+        let app = try launch()
+        XCTAssertTrue(app.staticTexts["7QK"].waitForExistence(timeout: 15))
+        app.staticTexts["7QK"].tap()
+        XCTAssertTrue(app.staticTexts["The label"]
+            .waitForExistence(timeout: 10))
+        app.buttons["Show it"].tap()
+        XCTAssertTrue(app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS 'no label file'")
+        ).firstMatch.waitForExistence(timeout: 10),
+        "a label file that is gone must be reported, not spun on")
     }
 
     func testProfitSaysWhatItDoesNotKnow() throws {

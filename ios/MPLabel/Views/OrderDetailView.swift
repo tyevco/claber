@@ -18,6 +18,18 @@ struct OrderDetailView: View {
     /// tap, and two prints for the same sale collide over the same
     /// stamped temporary file server-side.
     @State private var busy = false
+    /// Corrections. The parser gets a name or a price wrong often enough
+    /// that this is a first-class action rather than an overflow menu -
+    /// and the fields it gets wrong are exactly the ones a buyer reads.
+    @State private var fixing = false
+    @State private var fixItem = ""
+    @State private var fixBuyer = ""
+    @State private var fixPrice = ""
+    @State private var fixShipBy = ""
+    @State private var fixNotes = ""
+    @State private var label: Data?
+    @State private var labelProblem: String?
+    @State private var showingLabel = false
 
     var body: some View {
         MPScreen(eyebrow: detail?.status ?? "Order",
@@ -76,6 +88,7 @@ struct OrderDetailView: View {
                     MPError(message: notes)
                 }
 
+
                 VStack(spacing: MP.S.x2) {
                     MPHoldButton(title: d.printed ? "Hold to print again"
                                                   : "Hold to print label",
@@ -114,12 +127,159 @@ struct OrderDetailView: View {
                 .foregroundStyle(MP.Palette.subtle)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, MP.S.x1)
+
+                // Below the two hold buttons, not above them. Printing
+                // and shipping are what this screen is *for*; the label
+                // and the corrections are reference and repair. Putting
+                // them in the middle pushed the primary actions under a
+                // fold - the same mistake the add-item screen made with
+                // its AI panels, made again a day later.
+                labelCard(d)
+                corrections(d)
             } else {
                 ProgressView().padding(.top, MP.S.x7)
             }
         }
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
+    }
+
+    // MARK: - the label on file
+
+    /// The archived PDF, as Facebook sent it.
+    ///
+    /// A missing one is an ordinary answer and says so - a local pickup
+    /// never had a label, and a row can outlive its file. That is the
+    /// same failure `mplabel verify` sweeps the archive for, and showing
+    /// a spinner over it would be the third time this app has hidden a
+    /// missing file behind one.
+    private func labelCard(_ d: OrderDetail) -> some View {
+        MPCard {
+            VStack(alignment: .leading, spacing: MP.S.x2) {
+                HStack {
+                    MPEyebrow("The label")
+                    Spacer()
+                    if d.hasLabel && label == nil && labelProblem == nil {
+                        Button("Show it") { Task { await loadLabel(d) } }
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                }
+                if !d.hasLabel {
+                    Text("No label file for this one - a local pickup sale "
+                         + "never gets one.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                } else if let labelProblem {
+                    Text(labelProblem)
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                } else if let label {
+                    Button { showingLabel = true } label: {
+                        PDFPage(data: label)
+                            .frame(height: 220)
+                            .clipShape(RoundedRectangle(cornerRadius: MP.R.sm))
+                            .overlay(RoundedRectangle(cornerRadius: MP.R.sm)
+                                .strokeBorder(MP.Palette.border, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    Text("Tap to see it full size. This is the file itself, "
+                         + "without the parcel code - that is stamped on a "
+                         + "copy on its way to the printer.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(MP.Palette.subtle)
+                }
+            }
+        }
+        .sheet(isPresented: $showingLabel) {
+            if let label {
+                PDFPage(data: label).ignoresSafeArea()
+            }
+        }
+    }
+
+    private func loadLabel(_ d: OrderDetail) async {
+        do {
+            label = try await APIClient.shared.labelPDF(d.id)
+            labelProblem = nil
+        } catch {
+            labelProblem = error.localizedDescription
+        }
+    }
+
+    // MARK: - correcting what the parser got wrong
+
+    private func corrections(_ d: OrderDetail) -> some View {
+        MPCard {
+            VStack(alignment: .leading, spacing: MP.S.x2) {
+                HStack {
+                    MPEyebrow("Fix a field")
+                    Spacer()
+                    Button(fixing ? "Cancel" : "Edit") {
+                        if !fixing { startFixing(d) }
+                        fixing.toggle()
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                }
+
+                if fixing {
+                    field("Item", $fixItem, id: "fix-item")
+                    field("Buyer", $fixBuyer, id: "fix-buyer")
+                    field("Price", $fixPrice, id: "fix-price",
+                          numeric: true)
+                    field("Ship by", $fixShipBy, id: "fix-ship-by")
+                    field("Note", $fixNotes, id: "fix-notes")
+                    MPHoldButton(title: "Hold to correct", enabled: !busy) {
+                        applyFix(d)
+                    }
+                    .padding(.top, MP.S.x1)
+                } else {
+                    Text("The email parser gets a buyer or a price wrong "
+                         + "often enough to keep this in reach. A note is "
+                         + "saved here too.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                }
+            }
+        }
+    }
+
+    private func field(_ label: String, _ text: Binding<String>,
+                       id: String, numeric: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.system(size: 11.5))
+                .foregroundStyle(MP.Palette.muted)
+            TextField(label, text: text)
+                .font(.system(size: 15))
+                .keyboardType(numeric ? .decimalPad : .default)
+                .accessibilityIdentifier(id)
+        }
+    }
+
+    private func startFixing(_ d: OrderDetail) {
+        fixItem = d.item ?? ""
+        fixBuyer = d.buyer ?? ""
+        fixPrice = d.price.map { String(format: "%.2f", $0) } ?? ""
+        fixShipBy = d.shipBy ?? ""
+        fixNotes = d.notes ?? ""
+    }
+
+    private func applyFix(_ d: OrderDetail) {
+        busy = true
+        error = nil
+        Task {
+            do {
+                detail = try await APIClient.shared.correct(
+                    order: d.id, item: fixItem, buyer: fixBuyer,
+                    price: fixPrice, shipBy: fixShipBy, notes: fixNotes)
+                note = "Corrected."
+                fixing = false
+                onChange?()
+            } catch {
+                self.error = error.localizedDescription
+            }
+            busy = false
+        }
     }
 
     private func load() async {

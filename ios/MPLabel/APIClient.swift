@@ -220,6 +220,51 @@ actor APIClient {
         try await send(request("/stats"), as: Stats.self)
     }
 
+    /// Correct what the email parser got wrong.
+    ///
+    /// The server allow-lists the columns, so this sends only what the
+    /// screen can edit and never names a column the request invented.
+    /// Every argument is optional and an omitted one is left alone -
+    /// `nil` here means "do not touch", which is why clearing a value
+    /// is done by sending an empty string rather than by omitting it.
+    func correct(order id: Int, item: String? = nil, buyer: String? = nil,
+                 price: String? = nil, shipBy: String? = nil,
+                 notes: String? = nil) async throws -> OrderDetail {
+        struct Body: Encodable {
+            let item: String?
+            let buyer: String?
+            let price: String?
+            let ship_by: String?
+            let notes: String?
+        }
+        return try await send(
+            request("/orders/\(id)/fields", method: "POST",
+                    body: Body(item: item, buyer: buyer, price: price,
+                               ship_by: shipBy, notes: notes)),
+            as: OrderDetail.self)
+    }
+
+    /// The archived label, as it was filed. Fetched rather than linked:
+    /// it needs the bearer token, and a `Link` cannot carry one.
+    ///
+    /// A 404 here is an ordinary answer, not a fault - a local pickup
+    /// sale never had a label, and a row can outlive its file.
+    func labelPDF(_ id: Int) async throws -> Data {
+        let (data, response) = try await session.data(
+            for: request("/orders/\(id)/label"))
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.transport("no HTTP response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.server(
+                http.statusCode == 404
+                    ? "There is no label file for this order."
+                    : "The label could not be loaded.",
+                http.statusCode)
+        }
+        return data
+    }
+
     // MARK: - the sourcing half
 
     func trips() async throws -> [Trip] {
