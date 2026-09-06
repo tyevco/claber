@@ -122,7 +122,7 @@ struct ScanView: View {
             .ignoresSafeArea(edges: .bottom)
 
             VStack(spacing: 10) {
-                if let error { ErrorBanner(message: error) }
+                if let error { MPError(message: error) }
                 Text("Point at the QR on a label")
                     .font(.footnote)
                     .foregroundStyle(.white)

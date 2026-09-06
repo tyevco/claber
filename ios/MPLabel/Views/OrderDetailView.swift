@@ -1,7 +1,8 @@
 //  OrderDetailView.swift
 //
 //  One order, and the two things that actually happen to it: a label
-//  comes out, and it goes in the post.
+//  comes out, and it goes in the post. Both are held rather than
+//  tapped - see MPHoldButton for why.
 
 import SwiftUI
 
@@ -19,91 +20,104 @@ struct OrderDetailView: View {
     @State private var busy = false
 
     var body: some View {
-        List {
-            if let error { ErrorBanner(message: error).listRowInsets(EdgeInsets()) }
-            if let note {
-                Text(note).font(.footnote).foregroundStyle(Color.mpAccent)
-            }
+        MPScreen(eyebrow: detail?.status ?? "Order",
+                 title: detail?.code ?? "—") {
+            if let error { MPError(message: error) }
+            if let note { MPNote(message: note) }
 
             if let d = detail {
-                Section {
-                    LabeledContent("Code") {
-                        Text(d.code ?? "—")
-                            .font(.system(.body, design: .monospaced))
-                    }
-                    LabeledContent("Item", value: d.item ?? "—")
-                    LabeledContent("Price", value: money(d.price))
-                    LabeledContent("Due", value: Due(shipBy: d.shipBy).label)
-                    LabeledContent("Status", value: d.status ?? "—")
-                }
-
-                Section("Posting to") {
-                    Text(d.buyer ?? "—")
-                    // The one genuinely sensitive field in the app. It
-                    // arrives only on this screen because the queue
-                    // payload has no address field at all.
-                    Text(d.shipTo ?? "—")
-                        .font(.callout)
-                        .foregroundStyle(Color.mpMuted)
-                        .textSelection(.enabled)
-                    if let t = d.tracking, !t.isEmpty {
-                        LabeledContent("Tracking") {
-                            Text(t)
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
+                MPCard {
+                    VStack(alignment: .leading, spacing: MP.S.x2) {
+                        Text(d.item ?? "(no item)")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(MP.Palette.fg)
+                        HStack(spacing: MP.S.x2) {
+                            MPTag(text: Due(shipBy: d.shipBy).label,
+                                  style: Due(shipBy: d.shipBy).urgent
+                                         ? .alert : .normal)
+                            Text(money(d.price))
+                                .font(.system(size: 13))
+                                .foregroundStyle(MP.Palette.muted)
                         }
                     }
-                    if let s = d.service { LabeledContent("Service", value: s) }
-                    if let w = d.weight { LabeledContent("Weight", value: w) }
                 }
 
-                Section {
-                    Button {
+                MPCard {
+                    VStack(spacing: 0) {
+                        MPRow(label: "Sold for", value: money(d.price))
+                        MPRow(label: "Ship by", value: d.shipBy ?? "—")
+                        MPRow(label: "Buyer", value: d.buyer ?? "—")
+                        if let w = d.weight { MPRow(label: "Weight", value: w) }
+                        if let s = d.service { MPRow(label: "Service", value: s) }
+                    }
+                }
+
+                // The address is the one genuinely sensitive thing in
+                // this app, and it is on this screen only - the queue
+                // payload has no such field at all.
+                MPCard {
+                    VStack(alignment: .leading, spacing: MP.S.x1) {
+                        MPEyebrow("Ships to")
+                        Text(d.shipTo ?? "—")
+                            .font(.system(size: 14))
+                            .foregroundStyle(MP.Palette.fg)
+                            .textSelection(.enabled)
+                        if let t = d.tracking, !t.isEmpty {
+                            Text(t)
+                                .font(.system(size: 11.5).monospaced())
+                                .foregroundStyle(MP.Palette.muted)
+                                .textSelection(.enabled)
+                                .padding(.top, MP.S.x1)
+                        }
+                    }
+                }
+
+                if let notes = d.notes, !notes.isEmpty {
+                    MPError(message: notes)
+                }
+
+                VStack(spacing: MP.S.x2) {
+                    MPHoldButton(title: d.printed ? "Hold to print again"
+                                                  : "Hold to print label",
+                                 enabled: !busy && d.hasLabel) {
                         act { code in
                             let printed = try await APIClient.shared.printLabel(d.id)
                             return "Label \(printed ?? code ?? "") sent to the printer."
                         }
-                    } label: {
-                        Label(d.printed ? "Print again" : "Print label",
-                              systemImage: "printer")
                     }
-                    .disabled(busy || !d.hasLabel)
-
-                    Button {
+                    MPHoldButton(title: "Hold to mark shipped",
+                                 enabled: !busy) {
                         act { _ in
                             try await APIClient.shared.markShipped(d.id)
                             return "Code \(d.code ?? "") is shipped and free again."
                         }
-                    } label: {
-                        Label("Mark shipped", systemImage: "checkmark.circle")
                     }
-                    .disabled(busy)
-                } footer: {
+                }
+                .padding(.top, MP.S.x2)
+
+                Group {
                     if !d.hasLabel {
                         Text("No label file for this one - a local pickup "
                              + "sale never gets one.")
                     } else if d.printed {
                         // A successful write is not proof a label came
-                        // out: the printer is write-only, so the paper is
-                        // the only source of truth. Saying "printed" flatly
-                        // would overstate what is known.
+                        // out: the printer is write-only, so the paper
+                        // is the only source of truth. Saying "printed"
+                        // flatly would overstate what is known.
                         Text("Recorded as printed"
                              + (d.printCount.map { " \($0)x" } ?? "")
                              + ". The printer cannot confirm it, so the "
                              + "paper is the only proof.")
                     }
                 }
-
-                if let notes = d.notes, !notes.isEmpty {
-                    Section("Note") {
-                        Text(notes).foregroundStyle(Color.mpAlert)
-                    }
-                }
+                .font(.system(size: 11.5))
+                .foregroundStyle(MP.Palette.subtle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, MP.S.x1)
             } else {
-                ProgressView()
+                ProgressView().padding(.top, MP.S.x7)
             }
         }
-        .navigationTitle(detail?.code ?? "Order")
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
     }

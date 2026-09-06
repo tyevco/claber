@@ -1,7 +1,8 @@
 //  LoginView.swift
 //
 //  Two screens that only appear when something is missing: where the
-//  server is, and who she is.
+//  server is, and who she is. Plus settings, which is mostly a place to
+//  say what is deliberately not configurable from here.
 
 import SwiftUI
 
@@ -10,19 +11,28 @@ struct ServerSetupView: View {
     @State private var address = ""
 
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: MP.S.x4) {
             Spacer()
             Image(systemName: "shippingbox")
-                .font(.system(size: 44))
-                .foregroundStyle(Color.mpAccent)
-            Text("Where is it?").font(.title2).bold()
-            Text("The address of the machine running `mplabel serve`.")
-                .font(.footnote)
-                .foregroundStyle(Color.mpMuted)
+                .font(.system(size: 40))
+                .foregroundStyle(MP.Palette.accent)
+            MPEyebrow("Day one")
+            Text("Where is it?")
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundStyle(MP.Palette.fg)
+            Text("The address of the machine running mplabel serve.")
+                .font(.system(size: 13))
+                .foregroundStyle(MP.Palette.muted)
                 .multilineTextAlignment(.center)
 
             TextField("mplabel.example.com", text: $address)
-                .textFieldStyle(.roundedBorder)
+                .textFieldStyle(.plain)
+                .font(.system(size: 16))
+                .padding(MP.S.x3)
+                .background(MP.Palette.raised,
+                            in: RoundedRectangle(cornerRadius: MP.R.card))
+                .overlay(RoundedRectangle(cornerRadius: MP.R.card)
+                    .strokeBorder(MP.Palette.border, lineWidth: 1))
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .keyboardType(.URL)
@@ -32,18 +42,27 @@ struct ServerSetupView: View {
             // knowing which she is on: over http the token and the
             // password cross the network in clear.
             Text("https:// is assumed unless you type otherwise.")
-                .font(.caption2)
-                .foregroundStyle(Color.mpMuted)
+                .font(.system(size: 11.5))
+                .foregroundStyle(MP.Palette.subtle)
 
-            Button("Continue") {
+            Button {
                 Settings.serverURL = address
                 session.refresh()
+            } label: {
+                Text("Continue")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(MP.Palette.accentInk)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, MP.S.x3)
+                    .background(MP.Palette.accent,
+                                in: RoundedRectangle(cornerRadius: MP.R.card))
             }
-            .buttonStyle(.borderedProminent)
             .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty)
             Spacer()
         }
-        .padding(28)
+        .padding(MP.S.x6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(MP.Palette.bg)
     }
 }
 
@@ -54,37 +73,52 @@ struct LoginView: View {
     @State private var busy = false
 
     var body: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: MP.S.x4) {
             Spacer()
-            Text("mplabel").font(.largeTitle).bold()
+            Text("mplabel")
+                .font(.system(size: 32, weight: .semibold))
+                .foregroundStyle(MP.Palette.fg)
             Text(Settings.serverURL ?? "")
-                .font(.caption)
-                .foregroundStyle(Color.mpMuted)
+                .font(.system(size: 11.5).monospaced())
+                .foregroundStyle(MP.Palette.subtle)
 
             SecureField("Password", text: $password)
-                .textFieldStyle(.roundedBorder)
+                .textFieldStyle(.plain)
+                .font(.system(size: 16))
+                .padding(MP.S.x3)
+                .background(MP.Palette.raised,
+                            in: RoundedRectangle(cornerRadius: MP.R.card))
+                .overlay(RoundedRectangle(cornerRadius: MP.R.card)
+                    .strokeBorder(MP.Palette.border, lineWidth: 1))
                 .textContentType(.password)
                 .onSubmit(signIn)
 
-            if let error {
-                Text(error).font(.footnote).foregroundStyle(Color.mpAlert)
-                    .multilineTextAlignment(.center)
-            }
+            if let error { MPError(message: error) }
 
             Button(action: signIn) {
-                if busy { ProgressView() } else { Text("Sign in") }
+                Group {
+                    if busy { ProgressView() } else { Text("Sign in") }
+                }
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(MP.Palette.accentInk)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, MP.S.x3)
+                .background(MP.Palette.accent,
+                            in: RoundedRectangle(cornerRadius: MP.R.card))
             }
-            .buttonStyle(.borderedProminent)
             .disabled(busy || password.isEmpty)
 
             Button("Change server") {
                 Settings.serverURL = nil
                 session.refresh()
             }
-            .font(.footnote)
+            .font(.system(size: 12))
+            .foregroundStyle(MP.Palette.muted)
             Spacer()
         }
-        .padding(28)
+        .padding(MP.S.x6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(MP.Palette.bg)
     }
 
     private func signIn() {
@@ -112,24 +146,45 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section("Server") {
-                    Text(Settings.serverURL ?? "not set")
-                        .font(.system(.footnote, design: .monospaced))
-                    Button("Change server") {
-                        Settings.serverURL = nil
-                        session.signOut()
+            MPScreen(eyebrow: "Yours", title: "Settings") {
+                MPCard {
+                    VStack(alignment: .leading, spacing: MP.S.x2) {
+                        MPEyebrow("Server")
+                        Text(Settings.serverURL ?? "not set")
+                            .font(.system(size: 12).monospaced())
+                            .foregroundStyle(MP.Palette.fg)
                     }
                 }
-                Section {
-                    Button("Sign out", role: .destructive) { session.signOut() }
-                } footer: {
-                    Text("Printer settings are not here. They live in "
-                         + "/etc/mplabel.conf on the machine with the "
-                         + "printer, which is the one that can see the paper.")
+
+                Button {
+                    Settings.serverURL = nil
+                    session.signOut()
+                } label: {
+                    MPCard {
+                        Text("Change server")
+                            .font(.system(size: 14))
+                            .foregroundStyle(MP.Palette.fg)
+                    }
                 }
+                .buttonStyle(.plain)
+
+                Button { session.signOut() } label: {
+                    MPCard {
+                        Text("Sign out")
+                            .font(.system(size: 14))
+                            .foregroundStyle(MP.Palette.alert)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Text("Printer settings are not here. They live in "
+                     + "/etc/mplabel.conf on the machine with the printer, "
+                     + "which is the one that can see the paper.")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(MP.Palette.subtle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, MP.S.x2)
             }
-            .navigationTitle("Settings")
         }
     }
 }

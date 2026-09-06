@@ -26,62 +26,72 @@ struct PendingView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                if let error { ErrorBanner(message: error).listRowInsets(EdgeInsets()) }
-                if let note {
-                    Text(note).font(.footnote).foregroundStyle(Color.mpAccent)
-                }
+            MPScreen(eyebrow: "Recovery", title: "Pending labels") {
+                if let error { MPError(message: error) }
+                if let note { MPNote(message: note) }
 
                 if rows.isEmpty {
-                    ContentUnavailableView(
-                        "Nothing pending", systemImage: "checkmark.circle",
-                        description: Text("Every recorded label has been printed."))
+                    MPEmpty(title: "Nothing pending",
+                            detail: "Every recorded label has been printed.",
+                            symbol: "checkmark.circle")
                 } else {
-                    Section {
-                        ForEach(rows) { order in
-                            Button { toggle(order.id) } label: {
-                                HStack(alignment: .top, spacing: 10) {
+                    Text("These were recorded but never came out. Usually "
+                         + "the printer was off. Today only - older ones "
+                         + "may already have been posted by hand.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.muted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.bottom, MP.S.x1)
+
+                    ForEach(rows) { order in
+                        Button { toggle(order.id) } label: {
+                            MPCard {
+                                HStack(alignment: .top, spacing: MP.S.x3) {
                                     Image(systemName: selected.contains(order.id)
                                           ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 18))
                                         .foregroundStyle(selected.contains(order.id)
-                                                         ? Color.mpAccent
-                                                         : Color.mpMuted)
+                                                         ? MP.Palette.accent
+                                                         : MP.Palette.subtle)
                                     OrderRow(order: order)
                                 }
                             }
-                            .buttonStyle(.plain)
                         }
-                    } header: {
-                        Text("Recorded but never printed")
-                    } footer: {
-                        Text("Usually the printer was off. Today only - "
-                             + "older ones may already have been posted by "
-                             + "hand.")
+                        .buttonStyle(.plain)
                     }
 
-                    Section {
-                        Toggle("Dry run", isOn: $dryRun)
-                        Button {
-                            run()
-                        } label: {
-                            if busy {
-                                ProgressView()
-                            } else {
-                                Text(selected.isEmpty
-                                     ? "Choose the ones to run again"
-                                     : (dryRun ? "Preview \(selected.count)"
-                                               : "Print \(selected.count)"))
+                    Button { dryRun.toggle() } label: {
+                        MPCard {
+                            HStack(spacing: MP.S.x3) {
+                                Image(systemName: dryRun
+                                      ? "checkmark.square.fill" : "square")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(dryRun ? MP.Palette.accent
+                                                            : MP.Palette.subtle)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Dry run")
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .foregroundStyle(MP.Palette.fg)
+                                    Text("Show what would print. No labels used.")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(MP.Palette.muted)
+                                }
                             }
                         }
-                        .disabled(busy || selected.isEmpty)
-                    } footer: {
-                        if dryRun {
-                            Text("Shows what would print. No labels used.")
-                        }
                     }
+                    .buttonStyle(.plain)
+                    .padding(.top, MP.S.x1)
+
+                    MPHoldButton(
+                        title: selected.isEmpty
+                            ? "Choose the ones to run again"
+                            : (dryRun ? "Hold to preview \(selected.count)"
+                                      : "Hold to print \(selected.count)"),
+                        enabled: !busy && !selected.isEmpty
+                    ) { run() }
+                    .padding(.top, MP.S.x2)
                 }
             }
-            .navigationTitle("Pending")
             .refreshable { await load() }
             .task { await load() }
         }

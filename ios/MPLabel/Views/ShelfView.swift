@@ -13,45 +13,68 @@ struct ShelfView: View {
     @State private var bins: [Bin] = []
     @State private var query = ""
     @State private var error: String?
+    @State private var note: String?
     @State private var newBinName = ""
     @State private var askingForBin = false
+    @State private var path = NavigationPath()
 
     var body: some View {
-        NavigationStack {
-            List {
-                if let error { ErrorBanner(message: error).listRowInsets(EdgeInsets()) }
+        NavigationStack(path: $path) {
+            MPScreen(eyebrow: "Shelf", title: "Where things are") {
+                Button { askingForBin = true } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(MP.Palette.fg)
+                        .frame(width: 40, height: 40)
+                        .background(MP.Palette.raised,
+                                    in: RoundedRectangle(cornerRadius: MP.R.chip))
+                        .overlay(RoundedRectangle(cornerRadius: MP.R.chip)
+                            .strokeBorder(MP.Palette.border, lineWidth: 1))
+                }
+                .accessibilityLabel("New bin")
+            } content: {
+                if let error { MPError(message: error) }
+                if let note { MPNote(message: note) }
 
                 if !bins.isEmpty {
-                    Section("Bins") {
-                        ForEach(bins) { bin in
-                            NavigationLink(value: bin.code) {
-                                HStack {
-                                    // The name is what she reads across
-                                    // a room; the code is for a scanner.
-                                    Text(bin.name)
-                                    Spacer()
-                                    Text("\(bin.count ?? 0)")
-                                        .foregroundStyle(Color.mpMuted)
-                                        .font(.callout)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: MP.S.x2) {
+                            ForEach(bins) { bin in
+                                Button { path.append(bin.code) } label: {
+                                    // The name is what she reads across a
+                                    // room; the code is for a scanner.
+                                    MPChip(value: bin.name,
+                                           label: "\(bin.count ?? 0) item"
+                                                + ((bin.count ?? 0) == 1 ? "" : "s"))
                                 }
+                                .buttonStyle(.plain)
                             }
                         }
                     }
+                    .padding(.bottom, MP.S.x1)
                 }
 
-                Section(items.isEmpty ? "" : "Items") {
-                    ForEach(items) { item in
-                        NavigationLink(value: item.id) { ItemRow(item: item) }
+                ForEach(items) { item in
+                    Button { path.append(item.id) } label: {
+                        MPCard { ItemRow(item: item) }
                     }
+                    .buttonStyle(.plain)
+                }
+
+                if items.isEmpty {
+                    MPEmpty(title: "Nothing here",
+                            detail: query.isEmpty
+                                ? "No listings imported yet."
+                                : "No item matches that.",
+                            symbol: "shippingbox")
                 }
             }
-            .navigationTitle("Shelf")
             .searchable(text: $query, prompt: "Title, bin, category or code")
             .task(id: query) {
                 // Debounced: this is a phone on house Wi-Fi talking to a
                 // Pi, and a request per keystroke makes the list jump
                 // under her thumb. A cancelled task swallows the sleep,
-                // so no timer to manage.
+                // so there is no timer to manage.
                 try? await Task.sleep(for: .milliseconds(220))
                 await loadItems()
             }
@@ -59,11 +82,6 @@ struct ShelfView: View {
             .refreshable { await loadItems(); await loadBins() }
             .navigationDestination(for: Int.self) { ItemView(itemID: $0) }
             .navigationDestination(for: String.self) { BinView(code: $0) }
-            .toolbar {
-                Button { askingForBin = true } label: {
-                    Label("New bin", systemImage: "plus")
-                }
-            }
             .alert("Name this place", isPresented: $askingForBin) {
                 TextField("FLOOR, ATTIC, B5…", text: $newBinName)
                 Button("Cancel", role: .cancel) { newBinName = "" }
@@ -98,9 +116,9 @@ struct ShelfView: View {
                 let made = try await APIClient.shared.makeBin(name: name)
                 error = nil
                 await loadBins()
-                // The code is the thing she needs next, because the tag
-                // has to be printed for it.
-                self.error = "\(made.name) is \(made.code) — print its tag"
+                // The code is what she needs next, because the tag has
+                // to be printed for it.
+                note = "\(made.name) is \(made.code) — print its tag"
             } catch {
                 self.error = error.localizedDescription
             }
@@ -112,30 +130,36 @@ struct ItemRow: View {
     let item: InventoryItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(item.title ?? "(untitled)").font(.subheadline).lineLimit(2)
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: MP.S.x1) {
+            Text(item.title ?? "(untitled)")
+                .font(.system(size: 14))
+                .foregroundStyle(MP.Palette.fg)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+            HStack(spacing: MP.S.x2) {
                 if let bin = item.bin {
-                    Text(bin)
-                        .font(.caption2).fontWeight(.semibold)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Color.mpMuted.opacity(0.18),
-                                    in: RoundedRectangle(cornerRadius: 5))
+                    MPTag(text: bin)
                 } else {
                     // Not a missing value. It is what a thing in her
                     // hand is, on its way somewhere.
-                    Text("No bin").font(.caption2).foregroundStyle(Color.mpMuted)
+                    MPTag(text: "No bin", style: .absent)
                 }
                 if let code = item.inventoryCode {
-                    Text(code).font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(Color.mpMuted)
+                    Text(code)
+                        .font(.system(size: 11).monospaced())
+                        .foregroundStyle(MP.Palette.subtle)
                 }
                 if item.state == "sold" {
-                    Text("sold").font(.caption2).foregroundStyle(Color.mpMuted)
+                    Text("sold")
+                        .font(.system(size: 11))
+                        .foregroundStyle(MP.Palette.subtle)
                 }
+                Spacer(minLength: 0)
+                Text(money(item.price))
+                    .font(.system(size: 12))
+                    .foregroundStyle(MP.Palette.muted)
             }
         }
-        .padding(.vertical, 2)
     }
 }
 
@@ -144,23 +168,25 @@ struct BinView: View {
     @State private var contents: BinContents?
 
     var body: some View {
-        List {
+        MPScreen(eyebrow: "Bin \(code)",
+                 title: contents?.bin.name ?? code) {
             if let c = contents {
                 if c.items.isEmpty {
-                    ContentUnavailableView(
-                        "Empty", systemImage: "tray",
-                        description: Text("Nothing is in this bin. It still "
-                                          + "exists - someone named it and "
-                                          + "printed its tag."))
+                    MPEmpty(title: "Empty",
+                            detail: "Nothing is in this bin. It still exists - "
+                                  + "someone named it and printed its tag.",
+                            symbol: "tray")
                 }
                 ForEach(c.items) { item in
-                    NavigationLink(value: item.id) { ItemRow(item: item) }
+                    NavigationLink(value: item.id) {
+                        MPCard { ItemRow(item: item) }
+                    }
+                    .buttonStyle(.plain)
                 }
             } else {
-                ProgressView()
+                ProgressView().padding(.top, MP.S.x7)
             }
         }
-        .navigationTitle(contents?.bin.name ?? code)
         .navigationBarTitleDisplayMode(.inline)
         .task { contents = try? await APIClient.shared.binContents(code) }
     }

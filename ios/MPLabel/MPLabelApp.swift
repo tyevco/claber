@@ -16,7 +16,12 @@ struct MPLabelApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(session)
-                .tint(.mpAccent)
+                .tint(MP.Palette.accent)
+                // The design is dark-first. Both palettes are defined,
+                // and `Color(light:dark:)` resolves per environment, so
+                // this is the default rather than a lock - the system
+                // setting still wins on a device set to light.
+                .background(MP.Palette.bg)
         }
     }
 }
