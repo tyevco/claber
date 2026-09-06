@@ -162,15 +162,7 @@ struct CodeScanner: UIViewControllerRepresentable {
     }
 }
 
-/// `navigationDestination(item:)` needs Hashable and Identifiable. The
-/// Hashable half is synthesised only because `OrderDetail` and
-/// `InventoryItem` both declare it in Models.swift - drop it from either
-/// and the error surfaces here, three files away from the cause.
-extension Lookup: Hashable, Identifiable {
-    var id: String {
-        switch self {
-        case .sale(let d):     return "sale-\(d.id)"
-        case .listing(let it): return "listing-\(it.id)"
-        }
-    }
-}
+// `Lookup`'s Hashable and Identifiable conformances live on the enum in
+// Models.swift, not here: Swift synthesises `==` and `hash(into:)` for an
+// enum with associated values only in the file that declares it, so an
+// extension in this file was a demand to write both by hand.
