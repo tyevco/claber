@@ -172,7 +172,16 @@ CREATE TABLE IF NOT EXISTS sales (
     print_count  INTEGER DEFAULT 0,
     code         TEXT,
     status       TEXT DEFAULT 'to_ship',
-    notes        TEXT
+    notes        TEXT,
+    -- What the postage cost, in dollars like `price`. NULL means nobody
+    -- knows, which is the honest state for almost every row: the label
+    -- email is a *prepaid* label and does not carry a charge.
+    postage      REAL,
+    -- 'confirmed' if a person typed it, 'estimated' if it was derived
+    -- from other confirmed rows. Never inferred from the presence of a
+    -- number: the two are indistinguishable once written down, and it is
+    -- the estimate that must not be able to pass for a fact.
+    postage_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_status   ON sales(status);
 CREATE INDEX IF NOT EXISTS idx_tracking ON sales(tracking);
@@ -211,6 +220,12 @@ MIGRATIONS = [
     ("listings", "trip_id",
      "INTEGER REFERENCES trips(id) ON DELETE SET NULL"),
     ("listings", "era", "TEXT"),
+    # What the postage actually cost, and whether that figure was
+    # measured or guessed. Two columns rather than one because an
+    # estimate silently hardening into a fact is the whole trap here -
+    # see the note in `listings.estimate_postage`.
+    ("sales", "postage", "REAL"),
+    ("sales", "postage_source", "TEXT"),
 ]
 
 

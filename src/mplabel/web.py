@@ -321,7 +321,22 @@ def _order_detail(r):
         "print_count": r["print_count"],
         "has_label": bool(r["label_pdf"]),
     })
+    # Postage, and whether anybody actually knows it. The two travel
+    # together on purpose: a number without its provenance is an estimate
+    # that will be read as a fact by the next screen to show it.
+    postage = _column(r, "postage")
+    d["postage"] = postage
+    d["postage_source"] = _column(r, "postage_source")
+    d["kept"] = listings_mod.kept(r["price"], postage)
     return d
+
+
+def _column(row, name):
+    """A column that may predate its migration on somebody's database."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
 
 
 # ------------------------------------------------------------- the server
@@ -913,7 +928,18 @@ class Handler(BaseHTTPRequestHandler):
                                 (int(sid),)).fetchone()
         if row is None:
             return self.fail(404, "no such order")
-        self.json(_order_detail(row))
+        detail = _order_detail(row)
+        # Offer an estimate only where there is nothing measured, and
+        # only where other parcels have given it something to reason
+        # from. `estimate_postage` returns (None, None) rather than a
+        # number when it has no basis, and that is the common case.
+        if detail.get("postage") is None:
+            guess, source = listings_mod.estimate_postage(
+                self.db(), row["weight"])
+            detail["postage"] = guess
+            detail["postage_source"] = source
+            detail["kept"] = listings_mod.kept(row["price"], guess)
+        self.json(detail)
 
     def h_label(self, sid):
         row = self.db().execute("SELECT label_pdf FROM sales WHERE id=?",
@@ -1138,18 +1164,25 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             return
         body = self.body() or {}
-        allowed = {"item", "buyer", "price", "notes", "ship_by"}
+        allowed = {"item", "buyer", "price", "notes", "ship_by", "postage"}
         sets, params = [], []
         for key in allowed:
             if key in body:
                 value = body[key]
-                if key == "price" and value not in (None, ""):
+                if key in ("price", "postage") and value not in (None, ""):
                     try:
                         value = float(value)
                     except (TypeError, ValueError):
-                        raise ValueError("price must be a number")
+                        raise ValueError(f"{key} must be a number")
                 sets.append(f"{key}=?")
                 params.append(value if value != "" else None)
+        if "postage" in body:
+            # A person typed it, so it is measured. Clearing it clears
+            # the provenance too - an orphaned 'confirmed' on a null
+            # would make the next estimate look like it had been checked.
+            sets.append("postage_source=?")
+            params.append("confirmed" if body["postage"] not in (None, "")
+                          else None)
         if not sets:
             raise ValueError("nothing to change")
         params.append(row["id"])

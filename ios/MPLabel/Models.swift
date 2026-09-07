@@ -63,6 +63,20 @@ struct OrderDetail: Codable, Identifiable, Hashable {
     let service: String?
     let printedAt: String?
     let printCount: Int?
+    /// What the postage cost, and whether anybody actually knows.
+    ///
+    /// The two travel together: `postageSource` is `"confirmed"` when a
+    /// person typed the figure and `"estimated"` when it was derived
+    /// from other parcels that were. Showing the number without the
+    /// provenance is how an estimate becomes a fact - and no email
+    /// carries the real charge, so almost every one starts unknown.
+    let postage: Double?
+    let postageSource: String?
+    /// Price minus postage. Null when either is unknown, because a
+    /// missing postage read as zero reports the whole price as kept.
+    let kept: Double?
+
+    var postageIsMeasured: Bool { postageSource == "confirmed" }
 
     enum CodingKeys: String, CodingKey {
         case id, code, item, buyer, price, status, printed, notes
@@ -75,6 +89,8 @@ struct OrderDetail: Codable, Identifiable, Hashable {
         case shipTo = "ship_to"
         case printedAt = "printed_at"
         case printCount = "print_count"
+        case postage, kept
+        case postageSource = "postage_source"
     }
 }
 

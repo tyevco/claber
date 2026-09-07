@@ -237,4 +237,24 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(photo.itemID, 7)
         XCTAssertTrue(photo.isTriaged)
     }
+
+    /// Postage without its provenance is an estimate that the next screen
+    /// reads as a fact - and no email carries the real charge, so almost
+    /// every parcel starts with nobody knowing.
+    func testPostageCarriesWhereItCameFrom() throws {
+        let json = Data("""
+        {"id": 1, "code": "7QK", "printed": false, "has_label": true,
+         "postage": 12.40, "postage_source": "estimated", "kept": 82.60}
+        """.utf8)
+        let estimated = try JSONDecoder().decode(OrderDetail.self, from: json)
+        XCTAssertEqual(estimated.postage, 12.40)
+        XCTAssertFalse(estimated.postageIsMeasured,
+                       "an estimate must not read as measured")
+
+        let unknown = try decode(OrderDetail.self, from: "order")
+        XCTAssertNil(unknown.postage)
+        XCTAssertNil(unknown.kept, "no postage means no answer, not the "
+                     + "whole price")
+        XCTAssertFalse(unknown.postageIsMeasured)
+    }
 }

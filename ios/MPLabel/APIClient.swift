@@ -230,18 +230,21 @@ actor APIClient {
     /// is done by sending an empty string rather than by omitting it.
     func correct(order id: Int, item: String? = nil, buyer: String? = nil,
                  price: String? = nil, shipBy: String? = nil,
-                 notes: String? = nil) async throws -> OrderDetail {
+                 notes: String? = nil,
+                 postage: String? = nil) async throws -> OrderDetail {
         struct Body: Encodable {
             let item: String?
             let buyer: String?
             let price: String?
             let ship_by: String?
             let notes: String?
+            let postage: String?
         }
         return try await send(
             request("/orders/\(id)/fields", method: "POST",
                     body: Body(item: item, buyer: buyer, price: price,
-                               ship_by: shipBy, notes: notes)),
+                               ship_by: shipBy, notes: notes,
+                               postage: postage)),
             as: OrderDetail.self)
     }
 
