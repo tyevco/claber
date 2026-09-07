@@ -93,6 +93,22 @@ def sign(secret, job, body):
                     f"{job}\n{digest}".encode(), hashlib.sha256).hexdigest()
 
 
+def _rows(lines):
+    """Parse what parses, skip what does not.
+
+    A half-written last line is exactly what a crash mid-append leaves,
+    and losing the 199 rows above it to one bad one would be losing the
+    record to the accident it is supposed to survive.
+    """
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
 class Journal:
     """Append-only record of what actually reached the printer.
 
@@ -108,11 +124,8 @@ class Journal:
         self._done = set()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
-            for line in self.path.read_text(errors="replace").splitlines():
-                try:
-                    self._done.add(json.loads(line)["job"])
-                except (ValueError, KeyError):
-                    continue
+            lines = self.path.read_text(errors="replace").splitlines()
+            self._done = {row["job"] for row in _rows(lines) if "job" in row}
 
     def seen(self, job):
         with self._lock:
@@ -133,31 +146,76 @@ class Journal:
                "sha256": digest, "kind": kind, "outcome": outcome}
         with self._lock:
             self._done.add(job)
+            # Flushed and fsynced before the lock is released, because
+            # the whole value of this file is that it survives the
+            # restart that follows a printer fault. An append sitting in
+            # a buffer when the power goes is a print that happened and
+            # is not recorded, which is the one direction of error this
+            # file exists to prevent.
             with open(self.path, "a") as fh:
                 fh.write(json.dumps(row) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             self._trim()
         return row
 
     def _trim(self):
+        """Keep the tail, and never be caught halfway.
+
+        This used to `read_text` then `write_text` over the same path: a
+        crash between the two truncates the only durable record of what
+        reached the printer, and the G4 is write-only so there is no
+        second source for it. Written to a temp file in the same
+        directory and moved into place instead - `os.replace` is atomic,
+        so a reader sees either the old file or the new one and never a
+        half-written one.
+
+        Same directory on purpose: `os.replace` across filesystems is not
+        atomic, and /tmp is very often a different one.
+
+        Callers hold `self._lock`.
+        """
         try:
             lines = self.path.read_text(errors="replace").splitlines()
         except OSError:
             return
         if len(lines) <= JOURNAL_KEEP * 2:
             return
-        self.path.write_text("\n".join(lines[-JOURNAL_KEEP:]) + "\n")
+        keep = lines[-JOURNAL_KEEP:]
+        tmp = self.path.with_suffix(self.path.suffix + ".trim")
+        try:
+            with open(tmp, "w") as fh:
+                fh.write("\n".join(keep) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except OSError:
+            # A trim that fails is a journal that is too long, which
+            # costs disk and nothing else. A trim that half-succeeds
+            # costs the record. Leave it long.
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return
+        # The in-memory set outlived the file it came from: a job trimmed
+        # out of the journal stayed 409-able until a restart and then
+        # silently stopped being. Now the two say the same thing, so
+        # "have I seen this job" has one answer rather than one that
+        # depends on how long the process has been up.
+        self._done = {row["job"] for row in _rows(keep) if "job" in row}
 
     def since(self, job=None, limit=200):
-        try:
-            lines = self.path.read_text(errors="replace").splitlines()
-        except OSError:
-            return []
-        rows = []
-        for line in lines:
+        # Under the lock: `_trim` replaces this file, and reading it
+        # unlocked meant a reconcile could land on the moment between the
+        # old inode and the new one. `os.replace` makes that a stale read
+        # rather than a truncated one, and the lock makes it neither.
+        with self._lock:
             try:
-                rows.append(json.loads(line))
-            except ValueError:
-                continue
+                lines = self.path.read_text(errors="replace").splitlines()
+            except OSError:
+                return []
+        rows = _rows(lines)
         if job:
             for i, row in enumerate(rows):
                 if row.get("job") == job:

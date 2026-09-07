@@ -7467,3 +7467,116 @@ def test_a_dry_run_says_nothing_and_remembers_nothing(tmp_path, capsys):
 
     cli.cmd_notify({"apns_topic": "x"}, conn, args)
     assert capsys.readouterr().out == first
+
+
+# ------------------------------- the journal is the only record there is
+
+
+def test_a_crash_mid_trim_cannot_lose_the_journal(tmp_path, monkeypatch):
+    """The G4 is write-only, so this file *is* the answer to "did that come
+    out?" - there is no second source for it.
+
+    The trim used to `read_text` then `write_text` over the same path, so
+    a crash between the two truncated exactly the record that has no
+    other copy. It writes a temp file and `os.replace`s it now, which is
+    atomic: a reader sees the old file or the new one."""
+    import os
+
+    from mplabel import printd
+
+    monkeypatch.setattr(printd, "JOURNAL_KEEP", 5)
+    path = tmp_path / "journal.jsonl"
+    journal = printd.Journal(path)
+    for n in range(12):
+        journal.record(f"job{n}", 10, "sha")
+
+    # The rename is the last thing that happens, so a failure before it
+    # must leave the original intact rather than a half-written file.
+    real_replace = os.replace
+
+    def explode(src, dst):
+        raise OSError("power cut")
+
+    before = path.read_text()
+    monkeypatch.setattr(os, "replace", explode)
+    journal.record("job99", 10, "sha")
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    after = path.read_text()
+    assert before.splitlines()[0] in after, "the head was lost"
+    assert "job99" in after, "the append itself must still have landed"
+    assert not list(tmp_path.glob("*.trim")), "the temp file was left behind"
+
+
+def test_a_torn_last_line_does_not_lose_the_rest(tmp_path):
+    """A half-written last line is what a crash mid-append leaves. Losing
+    the rows above it to that one would be losing the record to the
+    accident it exists to survive."""
+    from mplabel import printd
+
+    path = tmp_path / "journal.jsonl"
+    journal = printd.Journal(path)
+    journal.record("7QK-abc", 10, "sha")
+    journal.record("B4M-def", 10, "sha")
+    with open(path, "a") as fh:
+        fh.write('{"job": "torn-')          # no newline, no closing brace
+
+    reopened = printd.Journal(path)
+    assert reopened.seen("7QK-abc")
+    assert reopened.seen("B4M-def")
+    assert [r["job"] for r in reopened.since()] == ["7QK-abc", "B4M-def"]
+
+
+def test_a_trimmed_job_stops_being_seen(tmp_path, monkeypatch):
+    """`_done` outlived the file it came from: a job trimmed out of the
+    journal stayed 409-able until a restart and then silently stopped
+    being. Whether a job is "seen" must not depend on how long the
+    process has been up."""
+    from mplabel import printd
+
+    monkeypatch.setattr(printd, "JOURNAL_KEEP", 3)
+    path = tmp_path / "journal.jsonl"
+    journal = printd.Journal(path)
+    for n in range(10):
+        journal.record(f"job{n}", 10, "sha")
+
+    assert not journal.seen("job0"), "trimmed out of the file, and out of memory"
+    assert journal.seen("job9")
+    # And a fresh process agrees, which is the property that was broken.
+    assert printd.Journal(path).seen("job9")
+    assert not printd.Journal(path).seen("job0")
+
+
+def test_reading_the_journal_takes_the_lock(tmp_path):
+    """`since()` re-read the file without the lock, so a reconcile could
+    land in the middle of a trim. Hammered from threads here because the
+    race is the point - the assertion is that no reader ever sees a
+    truncated journal."""
+    import threading as _threading
+
+    from mplabel import printd
+
+    path = tmp_path / "journal.jsonl"
+    journal = printd.Journal(path)
+    for n in range(40):
+        journal.record(f"job{n}", 10, "sha")
+
+    seen_short = []
+
+    def read():
+        for _ in range(60):
+            rows = journal.since()
+            if rows and len(rows) < 5:
+                seen_short.append(len(rows))
+
+    def write():
+        for n in range(60):
+            journal.record(f"more{n}", 10, "sha")
+
+    threads = [_threading.Thread(target=read),
+               _threading.Thread(target=write)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert seen_short == [], "a reader saw a journal mid-rewrite"
