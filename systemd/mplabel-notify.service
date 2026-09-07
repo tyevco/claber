@@ -1,0 +1,35 @@
+[Unit]
+Description=Marketplace notifications
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=oneshot, not simple: this runs, says what is worth saying, and
+# exits. The timer below is what makes it recur, and a service that
+# lingers would be a second scheduler beside it.
+Type=oneshot
+User=pi
+WorkingDirectory=/opt/mplabel
+ExecStart=/opt/mplabel/venv/bin/python -m mplabel notify
+
+# No Restart=. A oneshot that failed will be run again by the timer, and
+# the failures worth retrying (APNs unreachable) are exactly the ones
+# where trying again in five seconds is useless. 78 is the config
+# refusal - unset APNs key, key id or team id - and is permanent until
+# somebody edits the file, so it is recorded rather than retried.
+SuccessExitStatus=0 78
+
+EnvironmentFile=-/etc/mplabel.env
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+# The database, to read what is due and to record what has been said.
+# No /run/lock: this process never touches a printer.
+ReadWritePaths=/home/pi/marketplace
+
+[Install]
+WantedBy=multi-user.target
