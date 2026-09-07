@@ -404,6 +404,112 @@ actor APIClient {
                               as: ItemResponse.self).item
     }
 
+    // MARK: - the aisle
+
+    func candidates(trip: Int? = nil,
+                    decision: String? = nil) async throws -> [Candidate] {
+        var path = "/candidates"
+        var query: [String] = []
+        if let trip { query.append("trip=\(trip)") }
+        if let decision { query.append("decision=\(decision)") }
+        if !query.isEmpty { path += "?" + query.joined(separator: "&") }
+        return try await send(request(path),
+                              as: CandidatesResponse.self).candidates
+    }
+
+    func addCandidate(trip: Int?, photo: Int?, title: String?,
+                      era: String?, condition: String?,
+                      category: String?) async throws -> Candidate {
+        struct Body: Encodable {
+            let trip: Int?
+            let photo: Int?
+            let title: String?
+            let era: String?
+            let condition: String?
+            let category: String?
+        }
+        return try await send(
+            request("/candidates", method: "POST",
+                    body: Body(trip: trip, photo: photo, title: title,
+                               era: era, condition: condition,
+                               category: category)),
+            as: CandidateResponse.self).candidate
+    }
+
+    /// Cart it or put it back. A passed one is kept: the same object
+    /// turns up again next month and a price she already rejected is a
+    /// note to herself.
+    @discardableResult
+    func decide(candidate id: Int, _ decision: String) async throws
+        -> Candidate {
+        struct Body: Encodable { let decision: String }
+        return try await send(
+            request("/candidates/\(id)/decision", method: "POST",
+                    body: Body(decision: decision)),
+            as: CandidateResponse.self).candidate
+    }
+
+    @discardableResult
+    func updateCandidate(_ id: Int, title: String? = nil,
+                         asking: String? = nil) async throws -> Candidate {
+        struct Body: Encodable {
+            let title: String?
+            let asking: String?
+        }
+        return try await send(
+            request("/candidates/\(id)", method: "POST",
+                    body: Body(title: title, asking: asking)),
+            as: CandidateResponse.self).candidate
+    }
+
+    /// The receipt as the phone read it.
+    ///
+    /// The OCR happens here, on-device: Vision does it for free, and
+    /// shipping the picture to the Pi to read it would put her receipts
+    /// on the wire for no gain.
+    @discardableResult
+    func sendReceipt(trip: Int, text: String) async throws
+        -> ReceiptResponse {
+        struct Body: Encodable { let text: String }
+        return try await send(
+            request("/trips/\(trip)/receipt", method: "POST",
+                    body: Body(text: text)),
+            as: ReceiptResponse.self)
+    }
+
+    /// What has been read off this run's receipt, if anything. An empty
+    /// list is the ordinary answer for a trip whose receipt is still in
+    /// her bag.
+    func receiptLines(trip: Int) async throws -> [ReceiptLine] {
+        try await send(request("/trips/\(trip)/receipt-lines"),
+                       as: ReceiptResponse.self).lines
+    }
+
+    func proposal(trip: Int) async throws -> ProposalResponse {
+        try await send(request("/trips/\(trip)/reconcile"),
+                       as: ProposalResponse.self)
+    }
+
+    /// Only what she confirmed becomes inventory.
+    func reconcile(trip: Int,
+                   assignments: [[String: Double]]) async throws -> Int {
+        struct Assignment: Encodable {
+            let candidate: Int
+            let amount: Double?
+        }
+        struct Body: Encodable { let assignments: [Assignment] }
+        let payload = assignments.compactMap { row -> Assignment? in
+            guard let candidate = row["candidate"] else { return nil }
+            return Assignment(candidate: Int(candidate),
+                              amount: row["amount"])
+        }
+        let out = try await send(
+            request("/trips/\(trip)/reconcile", method: "POST",
+                    body: Body(assignments: payload)),
+            as: ReconcileResult.self)
+        return out.created.count
+    }
+
     // MARK: - scanning
 
     func lookUp(code: String) async throws -> Lookup {

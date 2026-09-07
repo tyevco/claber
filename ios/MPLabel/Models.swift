@@ -462,3 +462,108 @@ struct Photo: Codable, Identifiable, Hashable {
 struct PhotosResponse: Codable { let photos: [Photo] }
 struct PhotoResponse: Codable { let photo: Photo }
 struct TripResponse: Codable { let trip: Trip }
+
+// MARK: - the aisle
+
+/// Something she pointed the camera at in a shop.
+///
+/// Not a listing, and most never become one - she photographs a thing,
+/// the phone offers a title, and she puts it back. `itemID` is the whole
+/// state machine: null means this never became inventory.
+struct Candidate: Codable, Identifiable, Hashable {
+    let id: Int
+    let tripId: Int?
+    let photoId: Int?
+    let title: String?
+    let era: String?
+    let condition: String?
+    let category: String?
+    /// The price on the shelf ticket, if she typed it. Not what she
+    /// paid - that comes off the receipt, later, with her help.
+    let asking: Double?
+    let decision: String?
+    let itemID: Int?
+
+    var carted: Bool { decision == "carted" }
+    var passed: Bool { decision == "passed" }
+    var decided: Bool { decision != nil }
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, era, condition, category, asking, decision
+        case tripId = "trip_id"
+        case photoId = "photo_id"
+        case itemID = "listing_id"
+    }
+}
+
+struct CandidatesResponse: Codable { let candidates: [Candidate] }
+struct CandidateResponse: Codable { let candidate: Candidate }
+
+/// One line as it was read off the receipt. It points at no object.
+struct ReceiptLine: Codable, Identifiable, Hashable {
+    let position: Int
+    let label: String?
+    let amount: Double?
+    /// item | total | tax | subtotal | ignored. Cash tendered and change
+    /// are the largest numbers on the paper and are `ignored` for that
+    /// reason - offering one as a cost would be catastrophic and easy.
+    let kind: String?
+
+    var id: Int { position }
+    var isGoods: Bool { kind == "item" }
+}
+
+struct ReceiptResponse: Codable {
+    let lines: [ReceiptLine]
+    let trip: Trip?
+}
+
+/// What the server thinks a line says about a thing in the cart, and how
+/// sure that is. The confidence is the point: a receipt itemises by
+/// department, so where two things came out of HOUSEWARES the pick is a
+/// coin toss and has to look like one.
+struct Proposal: Codable, Identifiable, Hashable {
+    let candidate: Int
+    let title: String?
+    let category: String?
+    let line: Int?
+    let label: String?
+    let amount: Double?
+    let confidence: String?
+
+    var id: Int { candidate }
+    var isMatched: Bool { confidence == "matched" }
+    var isGuess: Bool { confidence == "guessed" }
+    var hasNothing: Bool { confidence == "none" }
+
+    /// Said in words, because "guessed" on its own reads like a synonym
+    /// for matched to anyone who has not read the code.
+    var sentence: String {
+        switch confidence {
+        case "matched":
+            return "the department fits"
+        case "guessed":
+            return "no department match - check this one"
+        default:
+            return "no line left for it"
+        }
+    }
+}
+
+struct ProposalResponse: Codable {
+    let proposals: [Proposal]
+    let unclaimedLines: [ReceiptLine]
+    let carted: Int
+    let itemLines: Int
+
+    enum CodingKeys: String, CodingKey {
+        case proposals, carted
+        case unclaimedLines = "unclaimed_lines"
+        case itemLines = "item_lines"
+    }
+}
+
+struct ReconcileResult: Codable {
+    let created: [InventoryItem]
+    let trip: Trip?
+}

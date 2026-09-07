@@ -395,6 +395,8 @@ class Handler(BaseHTTPRequestHandler):
         ("POST", r"^/api/candidates/(?P<cid>\d+)/decision$", "h_decide",
          True),
         ("POST", r"^/api/trips/(?P<tid>\d+)/receipt$", "h_receipt", True),
+        ("GET", r"^/api/trips/(?P<tid>\d+)/receipt-lines$",
+         "h_receipt_lines", True),
         ("GET", r"^/api/trips/(?P<tid>\d+)/reconcile$", "h_propose", True),
         ("POST", r"^/api/trips/(?P<tid>\d+)/reconcile$", "h_reconcile",
          True),
@@ -734,6 +736,10 @@ class Handler(BaseHTTPRequestHandler):
         lines = shopping_mod.store_receipt(self.db(), int(tid),
                                            body.get("text"))
         self.json({"ok": True, "lines": lines,
+                   "trip": listings_mod.trip_summary(self.db(), int(tid))})
+
+    def h_receipt_lines(self, tid):
+        self.json({"lines": shopping_mod.receipt(self.db(), int(tid)),
                    "trip": listings_mod.trip_summary(self.db(), int(tid))})
 
     def h_propose(self, tid):
