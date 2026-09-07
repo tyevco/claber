@@ -657,13 +657,34 @@ class _Device:
         self.held = False
 
     def __enter__(self):
+        started = time.monotonic()
         if not self.gate.acquire(timeout=max(0.05, self.deadline)):
             return False
         # The flock as well: another process on this Pi - a hand-run
         # `mplabel reprint` over ssh - reaches the same printer.
-        self._lock = printers.print_lock(self.server.cfg, device=self.node,
-                                         required=True)
-        self._lock.__enter__()
+        #
+        # Bounded by what is *left* of the caller's deadline, not
+        # unbounded. This used to be a blocking flock underneath a
+        # deadline that had already been checked, so a lock nobody
+        # released stalled the request past that deadline with the device
+        # held - the same "prints to an empty room" failure the deadline
+        # exists to prevent, one layer down. Failing to get it inside the
+        # budget is "printer busy", the same answer the gate gives, which
+        # is what the caller already knows how to handle.
+        left = self.deadline - (time.monotonic() - started)
+        try:
+            # Both inside the guard: the refusal comes from `__enter__`
+            # today, and a future one that validated its arguments at the
+            # call would otherwise escape past a caller that has already
+            # been told the printer is busy.
+            self._lock = printers.print_lock(self.server.cfg,
+                                             device=self.node,
+                                             required=True,
+                                             timeout=max(0.05, left))
+            self._lock.__enter__()
+        except printers.PrinterUnavailable:
+            self.gate.release()
+            return False
         self.held = True
         setattr(self.server, self.attr, time.monotonic())
         return True

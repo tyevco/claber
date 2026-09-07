@@ -493,6 +493,24 @@ lock per job**, and a test counts it, because there is no `flock` on the
 platform the tests run on and the deadlock itself cannot be reproduced
 there.
 
+**A bounded wait under a deadline, or the deadline means nothing.**
+`printd` bounds acquiring its gate with the caller's
+`X-MPLabel-Deadline` and then took `print_lock` underneath it with **no
+timeout at all** - so a lock nobody released stalled the request past
+that deadline with the device held, which is the same "prints to an
+empty room" failure the deadline exists to prevent, one layer down.
+`print_lock` takes a `timeout` now (polled `LOCK_EX | LOCK_NB`, because
+`SIGALRM` is process-wide and printd is threaded), `_Device` passes what
+is *left* of the budget after the gate, and failing inside it is
+"printer busy" - the answer the caller already handles - rather than a
+socket held open.
+
+The CLI still passes no timeout, deliberately: a person at a terminal
+would rather queue behind the poller than be refused. And a *stale* lock
+is not a thing that can happen - flock is held by an open file
+description, so the kernel drops it when a killed process's descriptors
+close. What survives a kill is an empty file that locks nobody out.
+
 **A configuration refusal must not be retried.** `printd` will not start
 without `printd_secret` - a print request is a physical action and it
 will not accept unsigned jobs - but `Restart=always` turned that into a
@@ -1215,6 +1233,8 @@ VPN - is deployment rather than code. Of the hardening, #12 (signing
 `GET /printed`) and #13 (the journal) are done; #14 is answered by
 `systemd/mplabel-web.service` existing; #15 (the installer assumes one
 host) is open.
+
+#31 (the print lock blocking under a deadline) is done too.
 
 **The journal is the only record there is, so it is written like one.**
 The G4 is write-only - a failed print cannot be detected in software -
