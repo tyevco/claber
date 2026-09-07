@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from mplabel import (inventory, label, listings, mailparse, marker, qr, rs,
-                     savedpage, sheets, supvan)
+                     savedpage, sheets, shopping, supvan)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LABEL_PDF = FIXTURES / "label_sample.pdf"
@@ -50,6 +50,10 @@ def db():
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(cli.SCHEMA)
     conn.executescript(listings.SCHEMA)
+    # And the in-store half. Every schema the code creates, or the
+    # fixture is a database the code would never meet - which is the
+    # exact mistake the comment above records.
+    conn.executescript(shopping.SCHEMA)
     return conn
 
 
@@ -7938,3 +7942,187 @@ def test_stats_says_how_much_of_what_sold_is_costed(app):
     assert july["costed"] == 1
     assert july["net"] == 48.0
     assert july["gross"] == 100.0
+# ------------------------------------------- the aisle, and the receipt
+
+
+def _trip_with_receipt(conn, text=None):
+    from mplabel import listings, shopping
+
+    trip = listings.create_trip(conn, "GOODWILL 214")
+    shopping.store_receipt(conn, trip["id"], text or """GOODWILL 214
+HOUSEWARES     4.99
+FURNITURE     12.99
+LINENS         3.49
+SUBTOTAL      21.47
+TAX            0.00
+TOTAL         21.47
+CASH          40.00
+CHANGE        18.53""")
+    return trip
+
+
+def test_a_receipt_line_is_not_an_object(db):
+    """The constraint the whole flow is built around.
+
+    A thrift receipt itemises by department, so `HOUSEWARES 4.99` says
+    what a department took and nothing about which object. Parsing it is
+    reading, not identifying - and the arithmetic lines have to be told
+    apart from the goods or the total gets attributed to something."""
+    from mplabel import shopping
+
+    trip = _trip_with_receipt(db)
+    lines = shopping.receipt(db, trip["id"])
+    kinds = {l["label"]: l["kind"] for l in lines}
+    assert kinds["HOUSEWARES"] == "item"
+    assert kinds["TOTAL"] == "total"
+    assert kinds["SUBTOTAL"] == "subtotal"
+    assert kinds["TAX"] == "tax"
+    # Cash tendered and change are not goods and must never be offered as
+    # a cost - they are the largest numbers on the paper.
+    assert kinds["CASH"] == "ignored"
+    assert kinds["CHANGE"] == "ignored"
+
+    # The till's own total wins over anything summed from lines: a line
+    # the OCR dropped would otherwise quietly lower it.
+    assert db.execute("SELECT receipt_total FROM trips WHERE id=?",
+                      (trip["id"],)).fetchone()[0] == 21.47
+
+
+def test_re_reading_a_receipt_replaces_it(db):
+    """Re-photographing is what happens when the first one was blurry.
+    Two readings of one piece of paper would double every amount."""
+    from mplabel import shopping
+
+    trip = _trip_with_receipt(db)
+    first = len(shopping.receipt(db, trip["id"]))
+    shopping.store_receipt(db, trip["id"], "HOUSEWARES 4.99\nTOTAL 4.99")
+    assert len(shopping.receipt(db, trip["id"])) == 2, \
+        f"was {first}, then appended instead of replacing"
+
+
+def test_a_department_match_beats_a_bare_guess(db):
+    """Four things and four lines is not four answers. Where a department
+    plainly covers a category the pick is obvious; where it does not, the
+    proposal says so rather than dressing a coin toss up as a match."""
+    from mplabel import shopping
+
+    trip = _trip_with_receipt(db)
+    sofa = shopping.add_candidate(db, trip_id=trip["id"],
+                                  title="Chair", category="Furniture")
+    vase = shopping.add_candidate(db, trip_id=trip["id"],
+                                  title="Vase", category="Home")
+    mystery = shopping.add_candidate(db, trip_id=trip["id"],
+                                     title="Thing", category="Sports")
+    for c in (sofa, vase, mystery):
+        shopping.decide(db, c["id"], "carted")
+
+    out = shopping.propose(db, trip["id"])
+    by_id = {p["candidate"]: p for p in out["proposals"]}
+
+    assert by_id[sofa["id"]]["label"] == "FURNITURE"
+    assert by_id[sofa["id"]]["confidence"] == "matched"
+    assert by_id[vase["id"]]["label"] == "HOUSEWARES"
+    assert by_id[vase["id"]]["confidence"] == "matched"
+    # Nothing on this receipt is a Sports department, so it gets what is
+    # left and is honest about it.
+    assert by_id[mystery["id"]]["confidence"] == "guessed"
+    assert by_id[mystery["id"]]["label"] == "LINENS"
+
+
+def test_more_things_than_lines_says_none_rather_than_inventing_one(db):
+    from mplabel import shopping
+
+    trip = _trip_with_receipt(db, "HOUSEWARES 4.99\nTOTAL 4.99")
+    a = shopping.add_candidate(db, trip_id=trip["id"], title="One",
+                               category="Home")
+    b = shopping.add_candidate(db, trip_id=trip["id"], title="Two",
+                               category="Home")
+    shopping.decide(db, a["id"], "carted")
+    shopping.decide(db, b["id"], "carted")
+
+    out = shopping.propose(db, trip["id"])
+    confidences = sorted(p["confidence"] for p in out["proposals"])
+    assert confidences == ["matched", "none"]
+    assert out["carted"] == 2 and out["item_lines"] == 1
+
+
+def test_a_proposal_writes_nothing(db):
+    """The rule the whole module is built on: it proposes, she assigns.
+    A cost this system invented is indistinguishable from one she checked
+    a week later."""
+    from mplabel import shopping
+
+    trip = _trip_with_receipt(db)
+    c = shopping.add_candidate(db, trip_id=trip["id"], title="Vase",
+                               category="Home")
+    shopping.decide(db, c["id"], "carted")
+    shopping.propose(db, trip["id"])
+
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 0
+    assert shopping.one(db, c["id"])["listing_id"] is None
+
+
+def test_only_what_she_confirmed_becomes_inventory(db):
+    from mplabel import shopping
+
+    trip = _trip_with_receipt(db)
+    kept = shopping.add_candidate(db, trip_id=trip["id"], title="Milk vase",
+                                  category="Home", asking="28")
+    other = shopping.add_candidate(db, trip_id=trip["id"], title="Chair",
+                                   category="Furniture")
+    for c in (kept, other):
+        shopping.decide(db, c["id"], "carted")
+
+    created = shopping.apply(db, trip["id"],
+                             [{"candidate": kept["id"], "amount": 4.99}])
+    assert len(created) == 1
+    assert created[0]["paid"] == 4.99
+    assert created[0]["price"] == 28.0, "the shelf ticket becomes the asking"
+    assert shopping.one(db, kept["id"])["listing_id"] == created[0]["id"]
+    # The one she did not confirm is untouched.
+    assert shopping.one(db, other["id"])["listing_id"] is None
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 1
+
+
+def test_confirming_twice_does_not_make_two_things(db):
+    """A retry on a flaky connection is one object, not two."""
+    from mplabel import shopping
+
+    trip = _trip_with_receipt(db)
+    c = shopping.add_candidate(db, trip_id=trip["id"], title="Vase",
+                               category="Home")
+    shopping.decide(db, c["id"], "carted")
+    shopping.apply(db, trip["id"], [{"candidate": c["id"], "amount": 4.99}])
+    again = shopping.apply(db, trip["id"],
+                           [{"candidate": c["id"], "amount": 4.99}])
+    assert again == []
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 1
+
+
+def test_what_she_put_back_is_kept(db):
+    """"I saw this and passed on it at $40" is a note to herself that
+    nothing else in the system carries, and the same object turns up
+    again next month."""
+    from mplabel import shopping
+
+    trip = _trip_with_receipt(db)
+    passed = shopping.add_candidate(db, trip_id=trip["id"], title="Lamp",
+                                    category="Home", asking="40")
+    shopping.decide(db, passed["id"], "passed")
+
+    assert shopping.one(db, passed["id"])["decision"] == "passed"
+    assert shopping.candidates(db, trip_id=trip["id"], decision="passed")
+    # And it is not in the cart, so it cannot be reconciled into stock.
+    assert shopping.propose(db, trip["id"])["carted"] == 0
+
+
+def test_the_aisle_routes_need_authentication(app):
+    base, _ = app
+    for method, path in [("GET", "/api/v1/candidates"),
+                         ("POST", "/api/v1/candidates"),
+                         ("POST", "/api/v1/trips/1/receipt"),
+                         ("GET", "/api/v1/trips/1/reconcile"),
+                         ("POST", "/api/v1/trips/1/reconcile")]:
+        status, _, _ = _http(base + path, method,
+                             {} if method == "POST" else None)
+        assert status == 401, f"{method} {path} answered without a token"

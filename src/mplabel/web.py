@@ -49,6 +49,7 @@ from urllib.parse import urlparse, unquote, parse_qs
 from . import printd as printd_mod
 
 from . import listings as listings_mod
+from . import shopping as shopping_mod
 from . import build as build_mod
 from . import printers as printers_mod
 
@@ -385,6 +386,18 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", r"^/api/photos/(?P<pid>\d+)$", "h_photo", True),
         ("POST", r"^/api/photos/(?P<pid>\d+)/attach$", "h_attach_photo",
          True),
+        # The aisle: what she pointed the camera at, and what she did
+        # about it.
+        ("GET", r"^/api/candidates$", "h_candidates", True),
+        ("POST", r"^/api/candidates$", "h_add_candidate", True),
+        ("POST", r"^/api/candidates/(?P<cid>\d+)$", "h_update_candidate",
+         True),
+        ("POST", r"^/api/candidates/(?P<cid>\d+)/decision$", "h_decide",
+         True),
+        ("POST", r"^/api/trips/(?P<tid>\d+)/receipt$", "h_receipt", True),
+        ("GET", r"^/api/trips/(?P<tid>\d+)/reconcile$", "h_propose", True),
+        ("POST", r"^/api/trips/(?P<tid>\d+)/reconcile$", "h_reconcile",
+         True),
         ("POST", r"^/api/devices$", "h_register_device", True),
         ("GET", r"^/api/devices$", "h_devices", True),
         ("POST", r"^/api/inventory$", "h_make_item", True),
@@ -675,6 +688,65 @@ class Handler(BaseHTTPRequestHandler):
         body = self.body() or {}
         code = listings_mod.set_bin(self.db(), int(lid), body.get("bin"))
         return self.json({"ok": True, "id": int(lid), "bin_code": code})
+
+    # --- the aisle
+
+    def h_candidates(self):
+        qs = parse_qs(urlparse(self.path).query)
+        trip = (qs.get("trip") or [None])[0]
+        decision = (qs.get("decision") or [None])[0]
+        self.json({"candidates": shopping_mod.candidates(
+            self.db(), trip_id=int(trip) if trip else None,
+            decision=decision or None)})
+
+    def h_add_candidate(self):
+        """Something she photographed. No decision yet, and no listing -
+        most of these never become one."""
+        body = self.body() or {}
+        self.json({"ok": True, "candidate": shopping_mod.add_candidate(
+            self.db(), trip_id=body.get("trip"), photo_id=body.get("photo"),
+            title=body.get("title"), era=body.get("era"),
+            condition=body.get("condition"), category=body.get("category"),
+            asking=body.get("asking"))})
+
+    def h_update_candidate(self, cid):
+        body = self.body() or {}
+        self.json({"ok": True,
+                   "candidate": shopping_mod.update(self.db(), int(cid),
+                                                    **body)})
+
+    def h_decide(self, cid):
+        """Cart it or put it back. A passed one is kept - the same object
+        turns up again next month."""
+        body = self.body() or {}
+        self.json({"ok": True,
+                   "candidate": shopping_mod.decide(self.db(), int(cid),
+                                                    body.get("decision"))})
+
+    def h_receipt(self, tid):
+        """The receipt, as text the phone read off it.
+
+        The OCR happens on the phone - Vision does it on-device for free,
+        and shipping the picture here to read it would put her receipts
+        on the wire for no gain. What arrives is the reading; the
+        photograph stays where it was taken."""
+        body = self.body() or {}
+        lines = shopping_mod.store_receipt(self.db(), int(tid),
+                                           body.get("text"))
+        self.json({"ok": True, "lines": lines,
+                   "trip": listings_mod.trip_summary(self.db(), int(tid))})
+
+    def h_propose(self, tid):
+        """What it thinks the receipt says about the cart. Writes nothing."""
+        self.json(shopping_mod.propose(self.db(), int(tid)))
+
+    def h_reconcile(self, tid):
+        """Turn what she confirmed into inventory. Only what she confirmed."""
+        body = self.body() or {}
+        created = shopping_mod.apply(self.db(), int(tid),
+                                     body.get("assignments"))
+        self.json({"ok": True, "created": created,
+                   "trip": listings_mod.trip_summary(self.db(), int(tid))})
 
     # --- push
 
