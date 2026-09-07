@@ -1074,6 +1074,22 @@ had autocreated one in `xcuserdata` on one machine - which
 `xcodegen generate` then wiped, and which a fresh clone never had. The
 failure reads `does not contain a scheme named "MPLabel"`, which looks
 like a broken project rather than a file nobody generated.
+**A caveat that was true when it was written goes on being said.**
+Profit and Sold both stated flatly that there was no cost basis in the
+database. That was true for months and stopped being true the moment the
+sourcing half landed - and the screens went on saying it, which is worse
+than saying nothing because it tells her the opposite of the truth.
+`v_monthly` has carried `net` and `costed` since the views were written
+and `/stats` simply never selected them.
+
+The fix is that the sentence follows the data: `/stats` sends how many
+sold items have a cost against them, and the fraction decides which
+sentence is honest - `net` over two costed listings out of ninety is not
+a month's profit. `kept` is shown only where anything is costed at all,
+because a net of 0.00 reads as a month that broke even rather than one
+nobody has costed. Every version still says what is **not** in the
+figure: postage is per parcel, and Facebook's fee has never been
+confirmed against a real payout, so neither is counted.
 
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that

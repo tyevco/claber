@@ -257,4 +257,41 @@ final class ModelDecodingTests: XCTestCase {
                      + "whole price")
         XCTAssertFalse(unknown.postageIsMeasured)
     }
+
+    /// The sentence under the numbers has to follow the data. It said
+    /// "there is no cost basis yet" for as long as that was true and
+    /// then went on saying it, which is a screen telling her the
+    /// opposite of the truth.
+    func testTheProfitCaveatFollowsHowMuchIsCosted() throws {
+        let none = CostCoverage(sold: 9, costed: 0, margin: nil)
+        XCTAssertTrue(none.sentence.contains("takings and not profit"))
+
+        let some = CostCoverage(sold: 9, costed: 2, margin: 40)
+        XCTAssertTrue(some.sentence.contains("2 of 9"),
+                      "the fraction is what decides how much to trust it")
+
+        let all = CostCoverage(sold: 9, costed: 9, margin: 400)
+        XCTAssertTrue(all.all)
+        XCTAssertTrue(all.sentence.contains("Every sold item"))
+
+        // Every state says something, including the empty one.
+        for state in [none, some, all,
+                      CostCoverage(sold: 0, costed: 0, margin: nil)] {
+            XCTAssertFalse(state.sentence.isEmpty)
+            // And none of them claims a figure it does not have.
+            XCTAssertTrue(state.sentence.contains("fee")
+                          || state.sentence.contains("cost")
+                          || state.sentence.contains("sold"))
+        }
+    }
+
+    /// Postage and Facebook's fee are in none of these numbers, and the
+    /// screen has to keep saying so - the fee has never been confirmed
+    /// against a real payout.
+    func testTheCaveatNeverClaimsFeesAreCounted() {
+        XCTAssertTrue(CostCoverage(sold: 9, costed: 9, margin: 400)
+            .sentence.contains("fee"))
+        XCTAssertTrue(CostCoverage(sold: 9, costed: 2, margin: 40)
+            .sentence.contains("fee"))
+    }
 }

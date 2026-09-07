@@ -1047,10 +1047,27 @@ class Handler(BaseHTTPRequestHandler):
         def rows(sql):
             return [dict(r) for r in conn.execute(sql)]
 
+        # How much of this is actually costed.
+        #
+        # `v_monthly` has carried `net` and `costed` since the views were
+        # written and this endpoint never selected either, so the profit
+        # screen said "there is no cost basis yet" for as long as that was
+        # true and then went on saying it. A screen that tells her the
+        # opposite of the truth is worse than one that says nothing, and
+        # the fraction is what decides which sentence is honest: `net`
+        # over two costed listings out of ninety is not a month's profit.
+        coverage = conn.execute(
+            "SELECT COUNT(*) AS sold, "
+            "       SUM(paid IS NOT NULL) AS costed, "
+            "       ROUND(SUM(margin), 2) AS margin "
+            "FROM v_listing_perf WHERE state = 'sold'").fetchone()
         self.json({
             "price_bands": rows("SELECT * FROM v_price_band ORDER BY avg_price"),
             "monthly": rows("SELECT * FROM v_monthly LIMIT 12"),
             "aging": rows("SELECT * FROM v_aging LIMIT 10"),
+            "cost": {"sold": coverage["sold"] or 0,
+                     "costed": coverage["costed"] or 0,
+                     "margin": coverage["margin"]},
         })
 
     def h_system(self):

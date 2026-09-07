@@ -367,10 +367,19 @@ final class FlowTests: XCTestCase {
         let app = try launch()
         app.buttons["Profit"].tap()
         XCTAssertTrue(app.staticTexts["Profit"].waitForExistence(timeout: 15))
-        // The screen must keep saying it is gross. Someone tidying the
-        // copy would be removing a caveat, not a caption.
+        // The screen must keep saying what is *not* in the figure.
+        // Someone tidying the copy would be removing a caveat, not a
+        // caption.
+        //
+        // Asserted on the promise rather than the sentence: this used to
+        // pin the literal words "Gross, not profit", which stopped being
+        // true when cost basis arrived - so the test was holding a
+        // screen to a claim that had become false. What must never go is
+        // the admission that postage and Facebook's fee are not counted,
+        // whatever the wording around it.
         XCTAssertTrue(app.staticTexts.containing(
-            NSPredicate(format: "label CONTAINS 'Gross, not profit'")
-        ).firstMatch.waitForExistence(timeout: 10))
+            NSPredicate(format: "label CONTAINS 'fee'")
+        ).firstMatch.waitForExistence(timeout: 10),
+        "the profit screen stopped saying what it does not count")
     }
 }
