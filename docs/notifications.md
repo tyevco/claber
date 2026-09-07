@@ -32,7 +32,7 @@ Then, in `/etc/mplabel.conf`:
 apns_key_path = /etc/mplabel/AuthKey_XXXXXXXXXX.p8
 apns_key_id = XXXXXXXXXX
 apns_team_id = YYYYYYYYYY
-apns_topic = com.tyevco.MPLabel
+apns_topic = com.marchvector.Sellomatic
 apns_environment = sandbox     ; production once the app is not a dev build
 ```
 

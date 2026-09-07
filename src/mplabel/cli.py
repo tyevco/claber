@@ -89,7 +89,7 @@ DEFAULTS = {
     "apns_key_path": "",
     "apns_key_id": "",
     "apns_team_id": "",
-    "apns_topic": "com.tyevco.MPLabel",
+    "apns_topic": "com.marchvector.Sellomatic",
     "apns_environment": "production",
     "supvan_device": "/dev/hidraw0",
     # The label maker's own backend, separate from printer_backend:
@@ -1757,6 +1757,54 @@ def cmd_notify(cfg, conn, args):
         recorded.append((alert["title"], alert["body"]))
         return True, "dry run"
 
+    if getattr(args, "test", False):
+        # The equivalent of `selftest` for the printer: nothing else here
+        # can prove the path works, because every real trigger waits on
+        # something happening first. Deliberately ignores the notices
+        # table - this is a wire check, not one of the three things, and
+        # recording it would silence the real notification about the same
+        # parcel. It reports what Apple said per device rather than a
+        # summary, because the useful refusals name themselves and each
+        # points at a different mistake.
+        conn.executescript(notify_mod.SCHEMA)
+        conn.commit()
+        targets = notify_mod.devices(conn)
+        if not targets:
+            print("no devices are registered, so there is nothing to send "
+                  "to.\nOpen the app on the phone, go to Settings, and "
+                  "turn notifications on.")
+            return 0
+        failed = 0
+        for device in targets:
+            try:
+                ok, detail = notify_mod.send_one(
+                    cfg, device["token"],
+                    "mplabel is wired up",
+                    "This is the test notification. The three real ones "
+                    "are: a parcel is due, a label never printed, money "
+                    "has no home.")
+            except notify_mod.NotifyError as exc:
+                print(f"push is not configured: {exc}", file=sys.stderr)
+                return 78
+            where = f"{device['token'][:8]}... ({device['environment']})"
+            if ok:
+                print(f"sent to {where}")
+                continue
+            failed += 1
+            print(f"REFUSED for {where}: {detail}", file=sys.stderr)
+            hint = ""
+            if "BadDeviceToken" in str(detail):
+                hint = ("apns_environment does not match the build the "
+                        "token came from - a development build gives a "
+                        "sandbox token")
+            elif "InvalidProviderToken" in str(detail):
+                hint = "apns_key_id or apns_team_id does not match the .p8"
+            elif "TopicDisallowed" in str(detail):
+                hint = "apns_topic must be the app's bundle id"
+            if hint:
+                print(f"  that usually means {hint}.", file=sys.stderr)
+        return 1 if failed else 0
+
     if args.dry_run:
         # `remember_sent=False`, not a rollback: `remember` commits, so a
         # rollback here would leave the notices written and report that
@@ -2265,6 +2313,9 @@ def _main():
                             "has no home")
     p.add_argument("--dry-run", action="store_true",
                    help="print what would be sent and send nothing")
+    p.add_argument("--test", action="store_true",
+                   help="send one deliberate notification to every "
+                        "registered device and report what Apple said")
     p = sub.add_parser("printd", help="run the print service")
     p.add_argument("--bind")
     p.add_argument("--port", type=int)

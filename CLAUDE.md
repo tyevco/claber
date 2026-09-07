@@ -1025,6 +1025,28 @@ computed per request and deliberately not persisted, because an estimate
 in a spreadsheet is one that gets copied somewhere else and stops being
 one.
 
+**The bundle id is `com.marchvector.Sellomatic`, and three things must
+agree on it.** The App ID in the developer account carries the push
+capability; the built app's `PRODUCT_BUNDLE_IDENTIFIER` must match it or
+a *device* build fails provisioning while the simulator carries on
+working; and `apns_topic` on the Pi must be the same string or APNs
+refuses with `TopicDisallowed`. It is set explicitly in `project.yml`
+rather than derived from `bundleIdPrefix`, which had produced
+`com.tyevco.MPLabel` - a plausible identifier that exists nowhere.
+Team ID `43FWY7NGK9`.
+
+Changing it leaves a **stale install on the simulator**, and the symptom
+is not "wrong app": the runner fails to bootstrap with "Test crashed
+with signal term while preparing to run tests". `simctl uninstall` the
+old id and clear derived data.
+
+**The scheme is declared in `project.yml`, not left to Xcode.** Every
+command here says `-scheme MPLabel`, and that worked only because Xcode
+had autocreated one in `xcuserdata` on one machine - which
+`xcodegen generate` then wiped, and which a fresh clone never had. The
+failure reads `does not contain a scheme named "MPLabel"`, which looks
+like a broken project rather than a file nobody generated.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on

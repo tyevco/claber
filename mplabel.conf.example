@@ -218,7 +218,7 @@ apns_key_id     =
 # Membership > Team ID.
 apns_team_id    =
 # The app's bundle id.
-apns_topic      = com.tyevco.MPLabel
+apns_topic      = com.marchvector.Sellomatic
 # sandbox for a build signed with a development profile, production
 # otherwise. A token from one is rejected by the other with
 # BadDeviceToken, which reads like a malformed token rather than one

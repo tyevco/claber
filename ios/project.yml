@@ -28,6 +28,33 @@ options:
     iOS: "26.0"
   createIntermediateGroups: true
 
+# Declared, not left to Xcode.
+#
+# Every command in this repo says `-scheme MPLabel`, and that worked
+# only because Xcode had autocreated a scheme in `xcuserdata` on this
+# machine once - which `xcodegen generate` then wiped, and which a fresh
+# clone never had at all. The failure is `does not contain a scheme
+# named "MPLabel"`, which reads like the project is broken rather than
+# like a file nobody generated.
+schemes:
+  MPLabel:
+    build:
+      targets:
+        MPLabel: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - MPLabelTests
+        - MPLabelUITests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+
 targets:
   MPLabel:
     type: application
@@ -77,6 +104,14 @@ targets:
       path: MPLabel/MPLabel.entitlements
     settings:
       base:
+        # The real App ID, from the developer account - not derived from
+        # `bundleIdPrefix`. `apns_topic` on the Pi must be this string
+        # exactly, and the App ID that carries the push capability is
+        # registered against it: a build whose identifier does not match
+        # fails provisioning on a device while the simulator carries on
+        # working.
+        PRODUCT_BUNDLE_IDENTIFIER: com.marchvector.Sellomatic
+        DEVELOPMENT_TEAM: 43FWY7NGK9
         TARGETED_DEVICE_FAMILY: "1"    # iPhone. There is no iPad layout.
         # The *language mode*, not the compiler version. Valid values
         # are 4, 4.2, 5 and 6 - "5.9" is a compiler release and is not

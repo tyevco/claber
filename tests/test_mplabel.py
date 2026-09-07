@@ -7843,3 +7843,63 @@ def test_a_wedged_lock_is_a_busy_printer_not_a_hang(tmp_path, monkeypatch):
     # And the gate is handed back, or the next request queues behind a
     # holder that never took anything.
     assert gate.released == 1
+
+
+def test_notify_test_says_what_to_do_with_no_devices(tmp_path, capsys):
+    """The first thing that will happen after configuring the Pi: nothing,
+    because nobody has registered yet. That has to say so and say what to
+    do, not print "sent 0" and look successful."""
+    from mplabel import cli, notify
+
+    conn = cli.connect_db(tmp_path)
+    conn.executescript(notify.SCHEMA)
+    conn.commit()
+
+    code = cli.cmd_notify({"apns_topic": "x"}, conn,
+                          argparse.Namespace(dry_run=False, test=True))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "no devices are registered" in out
+    assert "Settings" in out, "say where to turn them on"
+
+
+def test_notify_test_names_the_mistake_behind_a_refusal(tmp_path, capsys,
+                                                        monkeypatch):
+    """BadDeviceToken reads like a malformed token and is almost always
+    the wrong `apns_environment` - a development build gives a sandbox
+    token. Naming that is the difference between a minute and an
+    afternoon."""
+    from mplabel import cli, notify
+
+    conn = cli.connect_db(tmp_path)
+    conn.executescript(notify.SCHEMA)
+    notify.register(conn, "a" * 64, environment="production")
+
+    monkeypatch.setattr(notify, "send_one",
+                        lambda *a, **k: (False, '{"reason":"BadDeviceToken"}'))
+    code = cli.cmd_notify({"apns_topic": "x"}, conn,
+                          argparse.Namespace(dry_run=False, test=True))
+    err = capsys.readouterr().err
+    assert code == 1, "a refusal must not exit 0"
+    assert "apns_environment" in err
+
+
+def test_notify_test_does_not_consume_a_real_notification(tmp_path,
+                                                          monkeypatch):
+    """It is a wire check, not one of the three things. Recording it would
+    silence the real notification about the same parcel."""
+    from mplabel import cli, notify
+
+    conn = cli.connect_db(tmp_path)
+    conn.executescript(notify.SCHEMA)
+    notify.register(conn, "b" * 64)
+    conn.execute(
+        "INSERT INTO sales (message_id, item, code, ship_by, status) VALUES "
+        "('<m>', 'Crock', '7QK', :today, 'to_ship')", _today())
+    conn.commit()
+
+    monkeypatch.setattr(notify, "send_one", lambda *a, **k: (True, "ok"))
+    cli.cmd_notify({"apns_topic": "x"}, conn,
+                   argparse.Namespace(dry_run=False, test=True))
+    assert not notify.already_said(conn, "due", "7QK"), \
+        "the wire check must not silence the real one"
