@@ -291,6 +291,12 @@ def connect_db(home):
         # as it goes, so they have to exist from the start. Both scripts are
         # CREATE TABLE IF NOT EXISTS.
         conn.executescript(listings_mod.SCHEMA)
+        # The in-store half: candidates and the receipt read as lines.
+        # Declared here with the rest so a fresh database and a migrated
+        # one agree, and so nothing has to remember to create them.
+        from . import shopping as shopping_mod
+
+        conn.executescript(shopping_mod.SCHEMA)
         # ...which is exactly why a new column needs saying separately: the
         # database already holds real sales and CREATE TABLE IF NOT EXISTS
         # will not touch them. See MIGRATIONS.
