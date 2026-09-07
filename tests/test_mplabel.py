@@ -3872,9 +3872,39 @@ def test_every_unit_in_the_repo_is_installed_by_the_installer():
     a deployment once already."""
     root = Path(__file__).parent.parent
     installer = (root / "install_pi.sh").read_text()
-    for unit in sorted((root / "systemd").glob("*.service")):
+    # Timers too. This asked only for *.service until a .timer was added
+    # beside one, which would have reached the Pi as a service that
+    # nothing ever ran - the same silent gap in a shape the test did not
+    # look at.
+    units = sorted(list((root / "systemd").glob("*.service"))
+                   + list((root / "systemd").glob("*.timer")))
+    assert units, "no units found - has systemd/ moved?"
+    for unit in units:
         assert unit.name in installer, \
             f"{unit.name} is in the repo but install_pi.sh never writes it"
+
+
+def test_the_notify_timer_survives_a_pi_that_was_switched_off():
+    """A parcel that was due while the Pi was off is still due.
+
+    `Persistent=true` is what runs the missed firing at boot; without it
+    the one morning the Pi was unplugged is the one morning she is not
+    told. And the service is a oneshot whose config refusal (78) counts
+    as success, because a permanent error retried twice a day is a
+    permanent error in the journal twice a day."""
+    root = Path(__file__).parent.parent
+    timer = (root / "systemd" / "mplabel-notify.timer").read_text()
+    assert "Persistent=true" in timer
+    assert timer.count("OnCalendar=") == 2, "morning and evening"
+
+    service = (root / "systemd" / "mplabel-notify.service").read_text()
+    assert "Type=oneshot" in service
+    assert "78" in service, "the config refusal must not read as a failure"
+    # Line-anchored: the unit *comments* on not having a Restart=, and a
+    # substring check matched the explanation rather than a directive.
+    assert not any(line.startswith("Restart=")
+                   for line in service.splitlines()), \
+        "the timer is what makes this recur; a Restart= is a second one"
 
 
 def test_printd_refuses_to_print_to_itself(tmp_path):

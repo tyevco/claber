@@ -1,0 +1,22 @@
+[Unit]
+Description=Say what is worth saying, morning and evening
+
+[Timer]
+# Twice, at the two times the answers are actionable: over breakfast
+# when a parcel is due today, and after work when a label never came out
+# and there is still an evening to fix it. More often than this is how a
+# notification becomes something she swipes away without reading.
+OnCalendar=*-*-* 09:00:00
+OnCalendar=*-*-* 17:00:00
+
+# The Pi is not always on, and a parcel that was due while it was off is
+# still due. Persistent=true runs the missed one at boot.
+Persistent=true
+
+# Both halves of the household get the same notification at the same
+# second otherwise, and the Pi wakes every timer on the machine at
+# exactly 09:00. A minute of jitter costs nothing here.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

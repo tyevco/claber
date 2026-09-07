@@ -56,14 +56,20 @@ An unconfigured install exits **78** (`EX_CONFIG`), the same refusal
 permanent error for ever.
 
 A timer rather than the poll loop, because the useful times to be told
-are not the times mail arrives:
+are not the times mail arrives. `install_pi.sh` writes both units -
+installed and **not enabled**, like `printd` and the web app, because an
+unconfigured `notify` refuses and a timer firing a permanent error twice
+a day is a permanent error in the journal twice a day:
 
-```ini
-# /etc/systemd/system/mplabel-notify.timer
-[Timer]
-OnCalendar=*-*-* 09,17:00:00
-Persistent=true
+```bash
+sudo systemctl enable --now mplabel-notify.timer
+systemctl list-timers mplabel-notify.timer
 ```
+
+It fires at 09:00 and 17:00 - over breakfast when something is due
+today, and after work when a label never came out and there is still an
+evening to fix it. `Persistent=true`, because a parcel that was due
+while the Pi was off is still due.
 
 ## Why curl and openssl instead of libraries
 

@@ -93,6 +93,20 @@ sed -e "s|^User=.*|User=$RUN_USER|" \
     -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA_DIR /run/lock|" \
     systemd/mplabel-web.service > /etc/systemd/system/mplabel-web.service
 
+# Notifications. Installed but not enabled, for the third time and the
+# same reason: `mplabel notify` exits 78 until the APNs key, key id and
+# team id are in the config, and enabling a timer that refuses twice a
+# day would put a permanent error in the journal on a schedule. See
+# docs/notifications.md, then `systemctl enable --now mplabel-notify.timer`.
+sed -e "s|^User=.*|User=$RUN_USER|" \
+    -e "s|^WorkingDirectory=.*|WorkingDirectory=$DEST|" \
+    -e "s|^ExecStart=.*|ExecStart=$DEST/venv/bin/python -m mplabel notify|" \
+    -e "s|^ProtectHome=.*|ProtectHome=false|" \
+    -e "s|^ReadWritePaths=.*|ReadWritePaths=$DATA_DIR|" \
+    systemd/mplabel-notify.service > /etc/systemd/system/mplabel-notify.service
+install -m 644 systemd/mplabel-notify.timer \
+    /etc/systemd/system/mplabel-notify.timer
+
 systemctl daemon-reload
 
 # The raw backends (escpos, tspl, zpl) need usblp, which CUPS unbinds when
