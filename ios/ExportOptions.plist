@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  How `xcodebuild -exportArchive` turns the archive into an upload.
+
+  Committed rather than written by the workflow, for the same reason
+  `project.yml` is: these are decisions with reasons, and a heredoc in a
+  YAML file is where reasons go to die.
+
+  Run by hand from a Mac, if the workflow is not the route today:
+
+      xcodebuild -exportArchive \
+          -archivePath build/MPLabel.xcarchive \
+          -exportPath build/export \
+          -exportOptionsPlist ios/ExportOptions.plist \
+          -allowProvisioningUpdates \
+          -authenticationKeyPath "$PWD/AuthKey_XXXXXXXXXX.p8" \
+          -authenticationKeyID XXXXXXXXXX \
+          -authenticationKeyIssuerID xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+-->
+<plist version="1.0">
+<dict>
+	<!-- `app-store-connect`, not `app-store`. The key was renamed in
+	     Xcode 16; the old spelling is still accepted, and quietly, so a
+	     project that never changed it never finds out. This one is
+	     built by Xcode 26 or later - the deployment target is iOS 26 -
+	     so it uses the name that will still be there. -->
+	<key>method</key>
+	<string>app-store-connect</string>
+
+	<!-- The upload itself, rather than an .ipa somebody then has to
+	     feed to Transporter. `altool --upload-app` is the other route
+	     and it is the deprecated one; this is what Xcode's own
+	     Organizer does, and it authenticates with the same
+	     `-authenticationKey*` flags the archive step already needs. -->
+	<key>destination</key>
+	<string>upload</string>
+
+	<key>teamID</key>
+	<string>43FWY7NGK9</string>
+
+	<!-- Automatic, matching CODE_SIGN_STYLE in project.yml. With
+	     `-allowProvisioningUpdates` and an App Store Connect API key,
+	     xcodebuild asks Apple for the distribution certificate and the
+	     App Store profile and caches them in the keychain - so there is
+	     no .p12 in the repository's secrets to expire in a year and no
+	     .mobileprovision to re-export when the App ID changes. -->
+	<key>signingStyle</key>
+	<string>automatic</string>
+
+	<!-- False, and it is the setting that matters most here.
+
+	     Left true (the default), Xcode picks the build number itself on
+	     the way up - it reads what App Store Connect already has and
+	     increments it. That silently discards
+	     CURRENT_PROJECT_VERSION, so the timestamp the workflow computed
+	     and printed in its log is not the number that appears in
+	     TestFlight, and a build can no longer be traced back to the run
+	     that made it. The numbers are ours; Apple is told them. -->
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+
+	<!-- dSYMs go up with the build, so a crash report from her phone
+	     symbolicates. They are in the archive either way, but only if
+	     somebody still has the archive - and a GitHub artifact expires
+	     where App Store Connect's copy does not. -->
+	<key>uploadSymbols</key>
+	<true/>
+
+	<key>stripSwiftSymbols</key>
+	<true/>
+</dict>
+</plist>

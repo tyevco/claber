@@ -1,0 +1,265 @@
+# Build the iPhone app and put it in TestFlight.
+#
+# Nothing here can be run on a Linux box, which is most of why it exists:
+# the release has always needed a Mac with the right Xcode, the right
+# certificate and somebody remembering to bump the build number, and
+# every one of those is a thing to get wrong on a Saturday.
+#
+# Two ways in:
+#
+#   git tag ios-v1.2.0 && git push origin ios-v1.2.0
+#   ...or Actions > iOS release > Run workflow, and type a version.
+#
+# The tag prefix is `ios-` on purpose. The Pi half of this repo will want
+# release tags of its own one day, and `v1.2.0` on the Python side must
+# not spend an App Store review slot.
+#
+# Signing is Apple's cloud signing: `-allowProvisioningUpdates` with an
+# App Store Connect API key, so the distribution certificate and the
+# App Store profile are fetched from Apple on each run. There is no
+# .p12 in the repository secrets to expire in a year. What that costs is
+# that the API key must have the Admin or App Manager role - a Developer
+# role can upload but cannot mint a certificate, and the failure says
+# neither of those things.
+#
+# The Apple-side setup - the key, the app record, the four secrets - is
+# in docs/ios-release.md. None of it can be done from this repo.
+
+name: iOS release
+
+on:
+  push:
+    tags:
+      - "ios-v*"
+  workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: "Version people see, e.g. 1.2.0. One to three integers."
+        required: true
+        type: string
+      build_number:
+        description: "Build number. Leave empty for the UTC timestamp, which is what a tag uses."
+        required: false
+        type: string
+      skip_tests:
+        description: "Upload without running the suite. For re-cutting a build the tests already passed."
+        required: false
+        default: false
+        type: boolean
+
+# One at a time. Two uploads racing would not corrupt anything - App
+# Store Connect refuses the second build number - but the loser fails
+# after twenty minutes of archiving, which reads as a broken workflow.
+concurrency:
+  group: ios-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Suite
+    # Pinned rather than macos-latest: `latest` moves to a new image
+    # without warning, and the one thing this build cannot survive is an
+    # Xcode older than the iOS 26 deployment target. When this label is
+    # retired, change it here and in ci.yml together.
+    runs-on: macos-26
+    if: ${{ inputs.skip_tests != true }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick an Xcode, and say so
+        run: .github/scripts/select-xcode.sh
+
+      - name: Python, with the dependencies the server needs
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e ".[dev]"
+
+      # First, and on its own step, because it is the fast one and it
+      # holds the test that catches the server's shape drifting away
+      # from the Swift models - which is a failure the Xcode side cannot
+      # see at all.
+      - name: pytest
+        run: .venv/bin/python -m pytest
+
+      - name: xcodegen
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      # Both bundles in one pass: the model fixtures and the eleven UI
+      # journeys, the latter against a real `mplabel serve` on a seeded
+      # temporary database. The script starts and tears that down.
+      - name: Swift tests
+        run: MPLABEL_ONLY_TESTING=all ./ios/run-ui-tests.sh
+
+  release:
+    name: Archive and upload
+    runs-on: macos-26
+    needs: test
+    # `always()` so that a deliberately skipped suite still ships, while
+    # a failed or cancelled one does not. Without it, `skip_tests` would
+    # skip the job it depends on and this one with it, which looks like
+    # the input doing nothing.
+    if: ${{ always() && needs.test.result != 'failure' && needs.test.result != 'cancelled' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick an Xcode, and say so
+        run: .github/scripts/select-xcode.sh
+
+      # Both numbers are decided here and printed, so the log is the
+      # record of what went up. Nothing downstream is allowed to invent
+      # either - see `manageAppVersionAndBuildNumber` in
+      # ios/ExportOptions.plist.
+      - name: Version numbers
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.marketing_version }}
+          INPUT_BUILD: ${{ inputs.build_number }}
+        run: .github/scripts/version.sh >> "$GITHUB_OUTPUT"
+
+      - name: xcodegen
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      # A keychain of this run's own, unlocked, and default for the
+      # session. Cloud signing does not just *read* a certificate, it
+      # creates one and writes the private key - so it needs somewhere
+      # unlocked to put it, and the runner's login keychain is not
+      # reliably that. Made fresh here and thrown away with the machine.
+      - name: A keychain to sign into
+        env:
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/mplabel-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # No auto-lock and no timeout: an archive can take longer than
+          # the five-minute default, and a keychain that locks halfway
+          # through fails at codesign with an error about the user
+          # cancelling something nobody was asked.
+          security set-keychain-settings "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+
+      # Written to disk because `-authenticationKeyPath` takes a path and
+      # nothing else, and decoded with python rather than base64(1): the
+      # BSD base64 on macOS spells the flag -D and the GNU one -d, and
+      # picking wrong writes a zero-byte key whose failure is an
+      # authentication error rather than a decoding one.
+      - name: The App Store Connect key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ASC_KEY_P8:-}" ]; then
+            echo "::error::ASC_KEY_P8 is not set. See docs/ios-release.md." >&2
+            exit 1
+          fi
+          umask 077
+          python3 - <<'PY'
+          import base64, os, pathlib
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "asc.p8"
+          out.write_bytes(base64.b64decode(os.environ["ASC_KEY_P8"]))
+          if not out.read_bytes().startswith(b"-----BEGIN"):
+              raise SystemExit(
+                  "ASC_KEY_P8 decoded to something that is not a PEM private "
+                  "key. It should be `base64 -i AuthKey_XXXXXXXXXX.p8` and "
+                  "nothing else - not the .p8 pasted in as text."
+              )
+          PY
+
+      - name: Archive
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          MARKETING_VERSION: ${{ steps.version.outputs.marketing_version }}
+          CURRENT_PROJECT_VERSION: ${{ steps.version.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project ios/MPLabel.xcodeproj \
+            -scheme MPLabel \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/MPLabel.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$CURRENT_PROJECT_VERSION" \
+            MPLABEL_SOURCE_REVISION="${GITHUB_SHA:0:12}"
+
+      # Read back out of the built app rather than trusted from the
+      # variables above. A build setting that did not reach the plist
+      # produces a perfectly successful archive carrying "1.0" and "1",
+      # and App Store Connect is where that gets discovered.
+      - name: What is actually in the archive
+        run: .github/scripts/check-archive.sh "$RUNNER_TEMP/MPLabel.xcarchive"
+
+      # `destination: upload` in the plist, so this step is the upload.
+      - name: Export and upload to App Store Connect
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/MPLabel.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist ios/ExportOptions.plist \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc.p8" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+      # The dSYMs, not the whole archive: they are the part that is
+      # irreplaceable once the runner is reclaimed, and the part a crash
+      # report from her phone needs. App Store Connect has its own copy
+      # (`uploadSymbols`), which is the one that will still be there in a
+      # year - this is the cheap local answer for the fortnight after a
+      # build goes out.
+      - name: Keep the dSYMs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dSYMs-${{ steps.version.outputs.marketing_version }}-${{ steps.version.outputs.build_number }}
+          path: |
+            ${{ runner.temp }}/MPLabel.xcarchive/dSYMs
+            ${{ runner.temp }}/export/*.plist
+          if-no-files-found: warn
+          retention-days: 14
+
+      # `always()`, and it matters: a failed archive leaves the key on
+      # disk on a runner that is about to be reused for something else.
+      - name: Shred the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/asc.p8"
+
+      - name: Say where it went
+        run: |
+          {
+            echo "### Uploaded to App Store Connect"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${{ steps.version.outputs.marketing_version }}\` |"
+            echo "| Build | \`${{ steps.version.outputs.build_number }}\` |"
+            echo "| Commit | \`${GITHUB_SHA:0:12}\` |"
+            echo
+            echo "Apple processes the build before TestFlight will show it -"
+            echo "usually a few minutes, occasionally an hour. It appears under"
+            echo "TestFlight > iOS Builds, and internal testers get it as soon"
+            echo "as processing finishes."
+          } >> "$GITHUB_STEP_SUMMARY"

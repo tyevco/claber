@@ -1,5 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict/>
+<dict>
+	<!-- aps-environment, and nothing else.
+
+	     This file was an empty dict until now, while project.yml said in
+	     a comment that the entitlement was in it. On the simulator that
+	     is invisible: the simulator has no APNs, and Push.swift's
+	     registration is never exercised there. On a real phone
+	     `registerForRemoteNotifications` fails with "no valid
+	     aps-environment entitlement string found", which reads as a
+	     provisioning problem and is a missing key.
+
+	     `development`, not `production`, and that is deliberate: Xcode
+	     replaces this value with `production` when it re-signs during
+	     `-exportArchive` for App Store distribution, so a TestFlight
+	     build gets a production token and a build run from Xcode onto
+	     the same handset gets a sandbox one. Writing `production` here
+	     would break the second without helping the first.
+
+	     Which environment a token belongs to is sent to the Pi
+	     alongside it - see the note at the top of Push.swift. A sandbox
+	     token offered to the production APNs host comes back
+	     `BadDeviceToken`, which reads as malformed rather than as
+	     addressed to the wrong Apple. -->
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
 </plist>
