@@ -6,11 +6,15 @@
 //  Apple's own decoder, which is the whole reason this target exists.
 
 import SwiftUI
+import UIKit
 
 @main
 @MainActor
 struct MPLabelApp: App {
     @StateObject private var session = Session.shared
+    // The delegate exists only to receive the APNs token - SwiftUI has
+    // no other way to be handed one.
+    @UIApplicationDelegateAdaptor(Push.self) private var push
 
     init() {
         // Before any view reads Settings or the keychain. In release

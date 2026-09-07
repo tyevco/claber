@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -7217,3 +7217,223 @@ def _columns(path, table):
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
     finally:
         conn.close()
+
+
+# --------------------------------------------- push, and what earns one
+
+
+def _today():
+    """Local, not SQLite's `date('now')`, which is UTC. Mixing the two is
+    an off-by-one after about 7pm Eastern, and it is exactly the bug the
+    code under test had."""
+    return {"today": date.today().isoformat()}
+
+
+def _push_db(tmp_path):
+    from mplabel import cli, notify
+
+    conn = cli.connect_db(tmp_path)
+    conn.executescript(notify.SCHEMA)
+    conn.commit()
+    return conn
+
+
+def test_der_to_jose_matches_a_signature_openssl_actually_made(tmp_path):
+    """The JWT is ES256 and openssl speaks DER, so the two numbers have to
+    be unpacked by hand.
+
+    Not a dependency: `cryptography` is a compiler toolchain and about
+    40MB on a Pi that runs a deliberately short dependency list. Twenty
+    lines of parsing instead - checked here against a real signature
+    rather than against a fixture someone typed, because the failure
+    Apple gives for a malformed one is `403 InvalidProviderToken` and
+    says nothing at all."""
+    import shutil
+    import subprocess
+
+    from mplabel import notify
+
+    if not shutil.which("openssl"):
+        pytest.skip("openssl is not installed")
+
+    key = tmp_path / "key.pem"
+    made = subprocess.run(
+        ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+         "-out", str(key)], capture_output=True)
+    if made.returncode != 0:
+        pytest.skip("this openssl cannot make a P-256 key")
+
+    jose = notify._sign(key, b"the.signing.input")
+    # Fixed width, both halves, always - a short r that is not padded back
+    # up is the bug this exists to prevent.
+    assert len(jose) == 64
+
+    # And it verifies, which a mangled unpack would not survive.
+    der = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", str(key)],
+        input=b"the.signing.input", capture_output=True).stdout
+    assert len(notify._der_to_jose(der)) == 64
+
+
+def test_a_notification_is_said_once(tmp_path):
+    """Keyed by the thing and the kind, not by a clock. "7QK is due" is
+    one notification however often the poller notices, and a cooldown in
+    minutes would fire again the moment the process restarted."""
+    from mplabel import notify
+
+    conn = _push_db(tmp_path)
+    notify.register(conn, "a" * 64)
+    conn.execute(
+        "INSERT INTO sales (message_id, item, code, ship_by, status) VALUES "
+        "('<m>', 'Stoneware crock', '7QK', :today, 'to_ship')", _today())
+    conn.commit()
+
+    sent = []
+    def sender(token, payload):
+        sent.append(payload["aps"]["alert"]["title"])
+        return True, "ok"
+
+    cfg = {"apns_topic": "com.example.app"}
+    first = notify.run(cfg, conn, sender=sender)
+    assert len(first["sent"]) == 1
+    assert "7QK" in sent[0]
+
+    second = notify.run(cfg, conn, sender=sender)
+    assert second["sent"] == [], "the same parcel must not be said twice"
+    assert len(sent) == 1
+
+
+def test_nothing_is_remembered_that_was_not_delivered(tmp_path):
+    """A send that failed must not mark the thing as said - otherwise the
+    one notification that mattered is the one that is never retried."""
+    from mplabel import notify
+
+    conn = _push_db(tmp_path)
+    notify.register(conn, "b" * 64)
+    conn.execute(
+        "INSERT INTO sales (message_id, item, code, ship_by, status) VALUES "
+        "('<m>', 'Crock', '7QK', :today, 'to_ship')", _today())
+    conn.commit()
+
+    cfg = {"apns_topic": "com.example.app"}
+    result = notify.run(cfg, conn, sender=lambda t, p: (False, "503"))
+    assert result["sent"] == []
+    assert not notify.already_said(conn, "due", "7QK")
+
+    ok = notify.run(cfg, conn, sender=lambda t, p: (True, "ok"))
+    assert len(ok["sent"]) == 1
+
+
+def test_a_token_apple_has_retired_is_forgotten(tmp_path):
+    """410 is Apple saying the app is gone from that phone. A dead token
+    is deleted rather than flagged - keeping it means deciding every time
+    whether to try it again."""
+    from mplabel import notify
+
+    conn = _push_db(tmp_path)
+    notify.register(conn, "c" * 64)
+    conn.execute(
+        "INSERT INTO sales (message_id, item, code, ship_by, status) VALUES "
+        "('<m>', 'Crock', '7QK', :today, 'to_ship')", _today())
+    conn.commit()
+
+    notify.run({"apns_topic": "x"}, conn,
+               sender=lambda t, p: (False, "410 Unregistered"))
+    assert notify.devices(conn) == []
+
+
+def test_only_three_things_earn_a_notification(tmp_path):
+    """The design is blunt about the scope and it is worth keeping. A
+    notification that is not one of these trains her to swipe them all
+    away, and the one that matters is then swiped away fastest."""
+    from mplabel import notify
+
+    conn = _push_db(tmp_path)
+    notify.register(conn, "d" * 64)
+    # due
+    conn.execute(
+        "INSERT INTO sales (message_id, item, code, ship_by, status) VALUES "
+        "('<due>', 'Crock', '7QK', :today, 'to_ship')", _today())
+    # never printed, today
+    conn.execute(
+        "INSERT INTO sales (message_id, item, code, status, label_pdf, "
+        "received_at) VALUES ('<unp>', 'Vase', 'B4M', 'to_ship', "
+        "'/tmp/x.pdf', :now)", {"now": datetime.now().isoformat()})
+    # money with no home, on a trip old enough to have been triaged
+    conn.execute(
+        "INSERT INTO trips (store, occurred_at, receipt_total) "
+        "VALUES ('GOODWILL 214', date('now', '-5 days'), 30.0)")
+    conn.commit()
+
+    kinds = {n["kind"] for n in
+             notify.run({"apns_topic": "x"}, conn,
+                        sender=lambda t, p: (True, "ok"))["sent"]}
+    assert kinds == {"due", "unprinted", "money"}
+
+
+def test_loose_money_waits_a_couple_of_days(tmp_path):
+    """Telling her on the drive home is nagging, not helping - the
+    receipt is in her bag and triage is a kitchen-table job."""
+    from mplabel import notify
+
+    conn = _push_db(tmp_path)
+    conn.execute("INSERT INTO trips (store, occurred_at, receipt_total) "
+                 "VALUES ('GOODWILL 214', date('now'), 30.0)")
+    conn.commit()
+    assert notify.unattributed(conn) == []
+
+    conn.execute("UPDATE trips SET occurred_at = date('now', '-5 days')")
+    conn.commit()
+    assert len(notify.unattributed(conn)) == 1
+
+
+def test_push_refuses_rather_than_half_tries_without_a_key(tmp_path):
+    """The same shape as printd's config refusal: an unconfigured install
+    must say so plainly rather than fail per-notification for ever."""
+    from mplabel import notify
+
+    with pytest.raises(notify.NotifyError) as raised:
+        notify.provider_token({"apns_topic": "x"})
+    assert "apns_key_path" in str(raised.value)
+    assert "apns_key_id" in str(raised.value)
+
+
+def test_registering_a_device_needs_authentication(app):
+    """A token registered by anyone who could reach the port would be a
+    stranger receiving her buyers' names in a notification."""
+    base, _ = app
+    status, _, _ = _http(f"{base}/api/v1/devices", "POST", {"token": "x" * 64})
+    assert status == 401
+
+    head = _auth(base)
+    status, _, body = _http(f"{base}/api/v1/devices", "POST",
+                            {"token": "e" * 64}, headers=head)
+    assert status == 200
+    # The token is not handed back out, even to an authenticated caller.
+    _, _, listed = _http(f"{base}/api/v1/devices", headers=head)
+    devices = _json_of(listed)["devices"]
+    assert len(devices) == 1
+    assert "token" not in devices[0]
+    assert devices[0]["token_prefix"] == "eeeeeeee"
+
+
+def test_a_dry_run_says_nothing_and_remembers_nothing(tmp_path, capsys):
+    """Run it twice and it says the same thing, which is the property that
+    makes it worth reaching for first."""
+    from mplabel import cli, notify
+
+    conn = _push_db(tmp_path)
+    notify.register(conn, "f" * 64)
+    conn.execute(
+        "INSERT INTO sales (message_id, item, code, ship_by, status) VALUES "
+        "('<m>', 'Crock', '7QK', :today, 'to_ship')", _today())
+    conn.commit()
+
+    args = argparse.Namespace(dry_run=True)
+    cli.cmd_notify({"apns_topic": "x"}, conn, args)
+    first = capsys.readouterr().out
+    assert "7QK" in first
+    assert not notify.already_said(conn, "due", "7QK")
+
+    cli.cmd_notify({"apns_topic": "x"}, conn, args)
+    assert capsys.readouterr().out == first

@@ -50,3 +50,6 @@ ios/MPLabel/Info.plist
 xcuserdata/
 *.xcuserstate
 ios/screenshots/
+
+# Never the APNs key.
+*.p8
