@@ -66,6 +66,27 @@ targets:
       properties:
         CFBundleDisplayName: mplabel
         UILaunchScreen: {}
+        # Both indirected through build settings so that CI can override
+        # them on the xcodebuild command line. XcodeGen's own defaults
+        # are the literals "1.0" and "1", which App Store Connect
+        # accepts exactly once: the second upload is rejected for a
+        # duplicate build number, after the archive has been built and
+        # signed. See `.github/workflows/ios-release.yml` for where the
+        # real numbers come from.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # What code is actually in this build, the same question
+        # `build.py` answers on the Pi - and the same answer when nobody
+        # stamped it. A TestFlight build is the one artifact that
+        # outlives the branch it came from, and "which commit was that?"
+        # has no other source once the tag has moved on.
+        MPLabelSourceRevision: "$(MPLABEL_SOURCE_REVISION)"
+        # Declared here rather than answered by hand on every upload.
+        # The app's own traffic is HTTPS and the Keychain, both of which
+        # are exempt; there is no encryption in this repo that is not
+        # the system's. Without the key every build stops in TestFlight
+        # on "Missing Compliance" and waits for a form.
+        ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
         # Required, and the string is shown to her verbatim the first
@@ -112,6 +133,12 @@ targets:
         # working.
         PRODUCT_BUNDLE_IDENTIFIER: com.marchvector.Sellomatic
         DEVELOPMENT_TEAM: 43FWY7NGK9
+        # Defaults, and they are meant to look like defaults. A release
+        # build overrides all three; a checkout says "checkout" for the
+        # same reason `_build.py` does.
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        MPLABEL_SOURCE_REVISION: checkout
         TARGETED_DEVICE_FAMILY: "1"    # iPhone. There is no iPad layout.
         # The *language mode*, not the compiler version. Valid values
         # are 4, 4.2, 5 and 6 - "5.9" is a compiler release and is not

@@ -184,6 +184,30 @@ what the system knows and what it hopes.
 it; only the detail screen asks for one. Do not add `ship_to` to the list
 row to save a request.
 
+## Releasing it
+
+```bash
+git tag ios-v1.2.0 && git push origin ios-v1.2.0
+```
+
+That builds, signs and uploads to App Store Connect on a GitHub macOS
+runner - no Mac needed, and the whole suite runs first. The Apple-side
+setup is in `docs/ios-release.md`: an App Store Connect API key with the
+**Admin or App Manager** role (a Developer key can upload but cannot mint
+a certificate, and the failure says neither of those things), the app
+record, and three repository secrets.
+
+The version comes off the tag; the build number is a UTC timestamp,
+because App Store Connect refuses a number it has already seen and
+refuses it *after* the upload. Both are read back out of the built app
+before anything is sent - see the note in `CLAUDE.md` about the two
+indirections they pass through.
+
+`./ios/run-ui-tests.sh` takes `MPLABEL_ONLY_TESTING=all` now, which drops
+the `-only-testing` flag so both bundles run in one pass against one
+server and one simulator boot. That is what CI uses. Bare, the script
+still runs the UI tests and nothing else.
+
 ## Pictures of it
 
 ```bash

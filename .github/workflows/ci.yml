@@ -1,0 +1,92 @@
+# What runs on an ordinary push.
+#
+# There was no CI on this repo until now, deliberately - `pytest` on the
+# machine you are sitting at is the gate, and it is a fast one. What
+# changed is that there is a release workflow behind a tag, and finding
+# out at that point that a Swift file does not compile is finding out too
+# late: the tag is already pushed and the version number already spent.
+#
+# So this is the smallest thing that stops that. It does not lint, format
+# or type-check anything - see CLAUDE.md, that is still a decision - it
+# only asks the two questions a tag is about to assume the answer to.
+#
+# The UI tests are not here. They boot a simulator and start a real
+# server, which is two minutes on every push to answer a question that
+# only matters at release, and they run in full in ios-release.yml.
+
+name: CI
+
+on:
+  # main and pull requests, not every branch. A push to a branch that
+  # also has a PR open would otherwise run this twice on two macOS
+  # runners to answer one question. A `branches:` filter excludes tag
+  # pushes on its own, so `ios-v1.2.0` reaches ios-release.yml and only
+  # that - which runs the whole suite itself, UI tests included.
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # The floor from pyproject.toml, not the newest available. This
+          # runs on a Raspberry Pi OS python, and a test that only passes
+          # on 3.13 is one that fails where it matters.
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      # The whole suite - one file, around 520 tests, no hardware and no
+      # network. It carries
+      # test_the_ios_fixtures_are_still_what_the_server_sends, which is
+      # where a drift between web.py and the Swift models is caught; Xcode
+      # cannot see that one at all.
+      - run: python -m pytest
+
+  ios:
+    name: Build and unit-test the app
+    # Pinned, not macos-latest: `latest` moves images without warning and
+    # this app needs an Xcode with the iOS 26 SDK. select-xcode.sh is what
+    # says so out loud when the pin goes stale. Change it here and in
+    # ios-release.yml together.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick an Xcode, and say so
+        run: .github/scripts/select-xcode.sh
+
+      # run-ui-tests.sh needs a python that can import mplabel, and picks
+      # up .venv/bin/python on its own. Needed even for the unit tests:
+      # the script starts the server before it looks at what it was asked
+      # to run.
+      - name: Python, with the dependencies the server needs
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -e ".[dev]"
+
+      # The .xcodeproj is generated and gitignored, so this is not
+      # optional and a fresh clone has never had one.
+      - name: xcodegen
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      # MPLabelTests only. It compiles the app and both test bundles - so
+      # a Swift file that does not build fails here - and then decodes the
+      # committed fixtures into the models.
+      - name: Swift unit tests
+        run: MPLABEL_ONLY_TESTING=MPLabelTests ./ios/run-ui-tests.sh

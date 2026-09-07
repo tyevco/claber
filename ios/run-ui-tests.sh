@@ -211,6 +211,18 @@ if [ -n "${MPLABEL_RESULT_BUNDLE:-}" ]; then
     extra+=(-resultBundlePath "$MPLABEL_RESULT_BUNDLE")
 fi
 
+# `MPLABEL_ONLY_TESTING=all` omits the flag, so the scheme's own test
+# targets run - both bundles, in one pass, against one server and one
+# simulator boot. That is what CI asks for: calling this script twice
+# would seed two databases and boot the simulator twice to answer the
+# same question, and MPLabelTests does not care that a server is up.
+#
+# The default is unchanged. This script is named after the UI tests and
+# running it bare still runs those and nothing else.
+if [ "${MPLABEL_ONLY_TESTING:-MPLabelUITests}" != "all" ]; then
+    extra+=(-only-testing:"${MPLABEL_ONLY_TESTING:-MPLabelUITests}")
+fi
+
 TEST_RUNNER_MPLABEL_UITEST_SERVER="$BASE" \
 TEST_RUNNER_MPLABEL_UITEST_TOKEN="$TOKEN" \
 TEST_RUNNER_MPLABEL_UITEST_PASSWORD="$PASSWORD" \
@@ -219,5 +231,4 @@ xcodebuild test \
     ${extra[@]+"${extra[@]}"} \
     -project "$REPO/ios/MPLabel.xcodeproj" \
     -scheme MPLabel \
-    -destination "platform=iOS Simulator,name=$SIMULATOR" \
-    -only-testing:"${MPLABEL_ONLY_TESTING:-MPLabelUITests}"
+    -destination "platform=iOS Simulator,name=$SIMULATOR"

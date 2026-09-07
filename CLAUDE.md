@@ -35,10 +35,31 @@ SIMULATOR="iPhone 16 Pro" ./ios/run-ui-tests.sh
 python tests/make_ios_fixtures.py          # regenerate ios/MPLabelTests/Fixtures
 ```
 
-There is no linter, formatter or type checker configured, and no CI.
-`pytest` is the gate for the Python side - one test file,
-`tests/test_mplabel.py`, ~520 tests. Do not add tooling without asking;
-the Pi dependency list is kept short on purpose.
+A release to TestFlight is a tag, and needs no Mac at all - it runs on a
+GitHub macOS runner:
+
+```bash
+git tag ios-v1.2.0 && git push origin ios-v1.2.0
+```
+
+The whole suite runs first, then the archive is signed and uploaded to
+App Store Connect. `docs/ios-release.md` has the Apple-side setup - the
+API key, the app record, the three secrets - none of which can be done
+from this repo.
+
+There is no linter, formatter or type checker configured, and that is
+still a decision. `pytest` is the gate for the Python side - one test
+file, `tests/test_mplabel.py`, ~520 tests. Do not add tooling without
+asking; the Pi dependency list is kept short on purpose.
+
+There **is** CI now, and only because there is a release behind a tag.
+`.github/workflows/ci.yml` runs `pytest` on Linux and builds the app
+plus `MPLabelTests` on a macOS runner, on every push and pull request.
+It asks the two questions a tag is about to assume the answer to and
+nothing else - it does not lint or format anything. The UI tests are
+deliberately not in it: they boot a simulator and start a real server,
+which is two minutes on every push for a question that only matters at
+release, and they run in full in the release workflow.
 
 **The Swift fixtures are generated, not written.** `make_ios_fixtures.py`
 runs a real server against a temporary database and saves what it
@@ -214,9 +235,15 @@ ios/                      the native client; see ios/README.md and
   notify.py      push: the three things that earn one, APNs via curl
                  and openssl rather than two large packages
 
-docs/                     ios-handoff, notifications, split-architecture,
-                          supvan-t50m-protocol, phone-access,
-                          phase2-hardware-checklist, ui-design-prompt
+docs/                     ios-handoff, ios-release, notifications,
+                          split-architecture, supvan-t50m-protocol,
+                          phone-access, phase2-hardware-checklist,
+                          ui-design-prompt
+.github/workflows/        ci.yml (every push), ios-release.yml (a tag)
+.github/scripts/          select-xcode, version, check-archive - the
+                          parts of the release with reasoning in them
+ios/ExportOptions.plist   how -exportArchive turns the archive into an
+                          upload
 mplabel.conf.example, systemd/{mplabel,mplabel-web,mplabel-printd}.service
 udev/99-clabel-g4.rules, udev/99-supvan-t50m.rules
 install_pi.sh     Pi bootstrap
@@ -386,6 +413,7 @@ hardware or a real Facebook account.
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | **No email carries the postage charge** | **Verified from the real label email.** It is a *prepaid* label - Facebook pays the carrier and takes it out of the payout - so the one document this system reliably receives says what the parcel weighs and what service it went by, and not what it cost. A test pins that the fixture has no charge in it, because the temptation is to write a parser for a number that is not there. The payout email is the only plausible carrier and **none has ever been seen**, so whether one exists is still open: `mplabel scan` against the real mailbox is what settles it. Until then every figure is typed by a person, and `listings.estimate_postage` derives one only from parcels whose charge she actually confirmed - returning nothing at all when there is no basis, rather than a number that would be indistinguishable from a measured one a week later. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
+| The release workflow | **UNRUN.** Every piece of it is a command that works on a Mac, and none of it has been executed once - not the runner label, not cloud signing, not the upload. The first tag is the experiment. What is checked in software: `version.sh` against good and bad tags, both workflows' shell blocks parse, and `check-archive.sh` refuses XcodeGen's placeholder version numbers. What cannot be: whether the API key's role is sufficient, whether `macos-26` has an iOS 26 SDK today, and whether App Store Connect accepts a three-part build number of this shape. |
 
 When the user reports real-world results, move rows up this table and
 tighten the code around what they saw. Do not quietly delete an
@@ -1168,6 +1196,50 @@ client timed out. `printers.REMOTE_BACKENDS` is what `print_label`
 checks, and two tests pin both halves.
 
 **The parcel code is stamped on a copy, never the archive.** `labels/<ref>_4x6.pdf` stays as Facebook sent it; `print_label` stamps a throwaway file on its way to the printer. That is what makes a reprint safe - there is no way to double-stamp, and no stamped/not-stamped flag to keep straight. It also means the ~15 orders already recorded pick up a code the moment they print.
+
+**A release build's version numbers pass through two indirections, and
+neither fails loudly.** `xcodebuild MARKETING_VERSION=...` sets a build
+setting; `$(MARKETING_VERSION)` in `project.yml`'s `info:` block expands
+it into the plist. Misspell either and the archive builds perfectly,
+carrying XcodeGen's own defaults of `1.0` and `1`. App Store Connect
+accepts the first such build and rejects every one after it for a
+duplicate build number - twenty minutes into a run, after signing. So
+`.github/scripts/check-archive.sh` reads the numbers back out of the
+built app with PlistBuddy and refuses the placeholders, before the
+upload rather than after it. Same shape as asserting on rendered output
+where geometry matters: ask the artifact, do not trust the arithmetic.
+
+**A build number must increase for ever, so it is a timestamp.**
+`github.run_number` is the obvious source and is wrong in a way that
+only bites later: it is per workflow *file*, so renaming the workflow
+restarts it at 1 and every build after that is rejected as older than
+one from last year. A commit count goes backwards the first time a
+branch is rebuilt. `version.sh` emits `YYYY.MMDD.HHMM` in UTC with
+leading zeros stripped - three components because each has to stay
+inside four digits, and `10#` on the strip because bash reads `0907` as
+octal and `09` is not a valid octal digit, so the arithmetic would fail
+outright every September.
+
+**`manageAppVersionAndBuildNumber` defaults to true, and that discards
+your build number.** Left alone, Xcode reads what App Store Connect
+already has on the way up and increments it - so the number the workflow
+computed and printed in its log is not the number in TestFlight, and the
+build can no longer be traced to the run that made it. It is `false` in
+`ios/ExportOptions.plist`. The numbers are ours; Apple is told them.
+
+**`aps-environment` was missing from the entitlements file while a
+comment said it was there.** The file was an empty `<dict/>` from the
+notifications commit onward. The simulator cannot see that - it has no
+APNs and never exercises registration - so it would have presented on a
+real handset as `registerForRemoteNotifications` failing with "no valid
+aps-environment entitlement string found", which reads as a provisioning
+problem. The value is `development`, not `production`, deliberately:
+Xcode rewrites it to `production` when it re-signs during
+`-exportArchive` for the App Store, so a TestFlight build gets a
+production token and a build run from Xcode onto the same phone gets a
+sandbox one. Writing `production` here breaks the second without helping
+the first. Which means `apns_environment` on the Pi has to say
+`production` once she is on a TestFlight build.
 
 **The page is not stored upright.** `to_4x6` leaves a landscape mediabox with `/Rotate 90`, and the mediabox origin is not (0,0) - it is the crop window on the letter page, e.g. `[90 450 522 738]`. So the printed top-right corner is the page's top-*left*, and text there needs a +90 (CCW) matrix, the same convention the label's own text uses. `label._code_placement` owns that; `test_code_lands_in_the_printed_top_right` settles it by rendering the page and looking, rather than by trusting the arithmetic.
 
