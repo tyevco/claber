@@ -56,7 +56,17 @@ struct ProfitView: View {
                                        spacing: MP.S.x4) {
                                     figure(money(latest.gross), "taken")
                                     figure("\(latest.orders ?? 0)", "orders")
-                                    figure(money(latest.avgOrder), "average")
+                                    // "kept" only where anything was
+                                    // costed. `net` over zero costed
+                                    // items is 0.00, which reads as a
+                                    // month that broke even rather than
+                                    // one nobody has costed.
+                                    if (latest.costed ?? 0) > 0 {
+                                        figure(money(latest.net), "kept")
+                                    } else {
+                                        figure(money(latest.avgOrder),
+                                               "average")
+                                    }
                                 }
                             }
                         }
@@ -118,10 +128,14 @@ struct ProfitView: View {
                         }
                     }
 
-                    Text("Gross, not profit - there is no cost basis yet. "
-                         + "And sell-through needs prices on unsold listings "
-                         + "to mean anything; blank prices above mean the "
-                         + "percentages are lying.")
+                    // Was a flat "there is no cost basis yet", which was
+                    // true when it was written and went on being said
+                    // after it stopped being. The server sends the
+                    // fraction now and the sentence follows it.
+                    Text((s.cost?.sentence ?? "")
+                         + " And sell-through needs prices on unsold "
+                         + "listings to mean anything; blank prices above "
+                         + "mean the percentages are lying.")
                         .font(.system(size: 11.5))
                         .foregroundStyle(MP.Palette.subtle)
                         .frame(maxWidth: .infinity, alignment: .leading)

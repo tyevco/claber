@@ -7903,3 +7903,38 @@ def test_notify_test_does_not_consume_a_real_notification(tmp_path,
                    argparse.Namespace(dry_run=False, test=True))
     assert not notify.already_said(conn, "due", "7QK"), \
         "the wire check must not silence the real one"
+def test_stats_says_how_much_of_what_sold_is_costed(app):
+    """`v_monthly` has carried `net` and `costed` since the views were
+    written and `/stats` never selected either - so the profit screen
+    said "there is no cost basis yet" for as long as that was true and
+    then went on saying it.
+
+    The fraction is what decides which sentence is honest: net over two
+    costed listings out of ninety is not a month's profit."""
+    base, conn = app
+    head = _auth(base)
+    conn.executemany(
+        "INSERT INTO listings (listing_id, title, price, paid, state, "
+        "sold_at, listed_at) VALUES (?,?,?,?,'sold',?,?)",
+        [("l1", "Costed", 60.0, 12.0, "2026-07-30", "2026-07-02"),
+         ("l2", "Not costed", 40.0, None, "2026-07-31", "2026-07-03")])
+    conn.commit()
+
+    _, _, body = _http(f"{base}/api/v1/stats", headers=head)
+    cost = _json_of(body)["cost"]
+    # `refresh` folds the fixture's own sale in as a third sold listing,
+    # which is the point of the fraction rather than a nuisance: one
+    # costed item out of several is exactly the state the old flat
+    # sentence could not describe.
+    assert cost["sold"] >= 2
+    assert cost["costed"] == 1
+    assert cost["costed"] < cost["sold"], "the partial case"
+    assert cost["margin"] == 48.0, "the margin of the one that has a cost"
+
+    # And the month carries the same two numbers, which is what stops a
+    # net of 48 reading as the whole month's profit.
+    july = [m for m in _json_of(body)["monthly"]
+            if (m["month"] or "").startswith("2026-07")][0]
+    assert july["costed"] == 1
+    assert july["net"] == 48.0
+    assert july["gross"] == 100.0

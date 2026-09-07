@@ -19,6 +19,36 @@ struct SoldView: View {
     /// keeps the difference visible while there is no cost basis.
     private var takings: Double { rows.compactMap(\.price).reduce(0, +) }
 
+    /// What the number above it is and is not.
+    ///
+    /// This said flatly that there was no cost basis in the database,
+    /// which was true when it was written and went on being said after
+    /// she started entering one. It counts now - and still says what is
+    /// missing, because postage is per parcel and Facebook's fee has
+    /// never been confirmed against a real payout.
+    private var soldCaveat: String {
+        let costed = rows.filter { $0.paid != nil }.count
+        if rows.isEmpty { return "" }
+        if costed == 0 {
+            return "Takings are gross: none of these has a cost against "
+                 + "it, so nothing here is profit. Triage is where cost "
+                 + "gets in."
+        }
+        let kept = rows.compactMap { item -> Double? in
+            guard let price = item.price, let paid = item.paid else {
+                return nil
+            }
+            return price - paid
+        }.reduce(0, +)
+        let scope = costed == rows.count
+            ? "all of them"
+            : "\(costed) of \(rows.count)"
+        return "Kept " + money(kept) + " on " + scope
+             + " after cost. Postage is not in that, and neither is "
+             + "Facebook's fee - no payout has ever been seen to confirm "
+             + "one."
+    }
+
     /// Only over the rows that have both dates. Most of the saved-page
     /// import has neither, so averaging across everything would report a
     /// speed she never achieved.
@@ -63,8 +93,7 @@ struct SoldView: View {
                 }
 
                 if !rows.isEmpty {
-                    Text("Takings are gross. There is no cost basis in the "
-                         + "database yet, so nothing here is profit.")
+                    Text(soldCaveat)
                         .font(.system(size: 11.5))
                         .foregroundStyle(MP.Palette.subtle)
                         .frame(maxWidth: .infinity, alignment: .leading)

@@ -251,13 +251,18 @@ struct MonthRow: Codable, Identifiable {
     let month: String?
     let orders: Int?
     let gross: Double?
+    /// Gross minus what those items cost - and only for the ones that
+    /// *have* a cost, which is what `costed` counts. The view has carried
+    /// both since it was written; `/stats` simply never selected them.
+    let net: Double?
+    let costed: Int?
     let avgOrder: Double?
     let avgDaysToSell: Double?
 
     var id: String { month ?? UUID().uuidString }
 
     enum CodingKeys: String, CodingKey {
-        case month, orders, gross
+        case month, orders, gross, net, costed
         case avgOrder = "avg_order"
         case avgDaysToSell = "avg_days_to_sell"
     }
@@ -285,10 +290,46 @@ struct Stats: Codable {
     let priceBands: [PriceBand]
     let monthly: [MonthRow]
     let aging: [AgingRow]
+    let cost: CostCoverage?
 
     enum CodingKeys: String, CodingKey {
-        case monthly, aging
+        case monthly, aging, cost
         case priceBands = "price_bands"
+    }
+}
+
+/// How much of what sold has a cost against it.
+///
+/// The fraction is what decides which sentence is honest. A net figure
+/// over two costed listings out of ninety is not a month's profit, and
+/// the screen used to solve that by saying there was no cost basis at
+/// all - which stopped being true the moment she typed one in and went
+/// on being said anyway.
+struct CostCoverage: Codable, Equatable {
+    let sold: Int
+    let costed: Int
+    let margin: Double?
+
+    var none: Bool { costed == 0 }
+    var all: Bool { sold > 0 && costed == sold }
+
+    /// What to say under the numbers. Never silent: every one of these
+    /// states is a different degree of trust in the figure above it.
+    var sentence: String {
+        if sold == 0 {
+            return "Nothing has sold yet, so there is nothing to cost."
+        }
+        if none {
+            return "None of what sold has a cost against it, so these are "
+                 + "takings and not profit. Triage is where cost gets in."
+        }
+        if all {
+            return "Every sold item has a cost against it. Postage and "
+                 + "Facebook's fee are still not in this."
+        }
+        return "\(costed) of \(sold) sold items have a cost against them, "
+             + "so this is the margin on those and not on the rest. "
+             + "Postage and Facebook's fee are not in it either."
     }
 }
 

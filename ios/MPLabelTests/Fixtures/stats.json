@@ -1,7 +1,7 @@
 {
   "aging": [
     {
-      "days_listed": 67,
+      "days_listed": 68,
       "inquiries": 0,
       "listing_id": null,
       "price": 28.0,
@@ -9,6 +9,11 @@
       "title": "Hobnail milk glass vase"
     }
   ],
+  "cost": {
+    "costed": 1,
+    "margin": 48.0,
+    "sold": 4
+  },
   "monthly": [
     {
       "avg_days_to_sell": null,
