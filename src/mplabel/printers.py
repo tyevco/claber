@@ -470,7 +470,7 @@ def lock_path(cfg=None, device=None):
 
 
 @contextmanager
-def print_lock(cfg=None, device=None, required=False):
+def print_lock(cfg=None, device=None, required=False, timeout=None):
     """Hold the printer for the length of one job.
 
     More than one thing reaches the printer - the poll loop, the web app,
@@ -480,8 +480,24 @@ def print_lock(cfg=None, device=None, required=False):
     produce one garbage label or a job that silently vanishes. The lock
     spans the settle pause too.
 
-    Blocking, not LOCK_NB: a reprint from her phone should queue behind
-    the poller, never fail.
+    Blocking by default, not LOCK_NB: a reprint from her phone should
+    queue behind the poller, never fail.
+
+    `timeout` bounds that wait, in seconds, and exists because "never
+    fail" is the wrong answer under a deadline. `printd` bounds acquiring
+    its gate with the caller's `X-MPLabel-Deadline` and then took this
+    lock underneath it with no timeout at all - so a lock nobody released
+    stalled the request past the deadline with the device held, which is
+    the same "prints to an empty room" failure the deadline exists to
+    prevent, one layer down. A daemon passes what is left of its budget;
+    the CLI passes nothing and waits, which is right for a person at a
+    terminal who would rather wait than be refused.
+
+    Note a *stale* lock is not a thing that can happen: flock is held by
+    an open file description, so the kernel drops it when a killed
+    process's descriptors close. What survives a kill is the empty file,
+    which holds nothing and locks nobody out. The wedge this guards
+    against is a live process holding the lock, not a dead one.
 
     `required` decides what an unobtainable lock means. For the CLI it is
     a warning: `probe`, `selftest` and `file` deliberately run above
@@ -514,7 +530,29 @@ def print_lock(cfg=None, device=None, required=False):
         except OSError:
             pass          # not the owner; the existing mode has to do
         fh = os.fdopen(fd, "r+")
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        else:
+            # Polled rather than alarm-based: SIGALRM is process-wide and
+            # printd is threaded, so an alarm set here would fire in
+            # whatever thread the kernel chose. A tenth of a second is
+            # far below the time any real job takes and far above the
+            # cost of asking.
+            deadline = time.monotonic() + max(0.0, timeout)
+            while True:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        fh.close()
+                        fh = None
+                        raise PrinterUnavailable(
+                            f"the printer was busy for {timeout:.1f}s "
+                            f"({path} is held by something else)")
+                    time.sleep(0.1)
+    except PrinterUnavailable:
+        raise
     except OSError as exc:
         if fh is not None:
             fh.close()

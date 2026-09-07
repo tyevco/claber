@@ -4227,8 +4227,14 @@ def test_a_tag_print_takes_the_device_lock_exactly_once(printd, monkeypatch):
     taken = []
     real_lock = printers.print_lock
 
-    def counting_lock(cfg=None, device=None, required=False):
+    def counting_lock(cfg=None, device=None, required=False, timeout=None):
+        # `timeout` is part of the contract now: printd passes what is
+        # left of the caller's deadline, and a fake that does not accept
+        # it fails the request rather than the assertion, which is a
+        # confusing way to be told the signature moved.
         taken.append(device)
+        assert timeout is not None, \
+            "printd must bound the wait, not block under a deadline"
         return contextlib.nullcontext()
 
     monkeypatch.setattr(printers, "print_lock", counting_lock)
@@ -7727,3 +7733,94 @@ def test_weight_is_read_the_way_a_label_writes_it():
     assert listings.parse_weight("3") == 3.0, "a bare number is pounds"
     assert listings.parse_weight("heavy") is None
     assert listings.parse_weight(None) is None
+
+
+def test_the_print_lock_can_be_bounded(tmp_path, monkeypatch):
+    """"Never fail" is the wrong answer under a deadline.
+
+    printd bounds acquiring its gate with the caller's deadline and then
+    took this lock underneath it with no timeout at all, so a lock nobody
+    released stalled the request past that deadline with the device held
+    - the same "prints to an empty room" failure the deadline exists to
+    prevent, one layer down."""
+    from mplabel import printers
+
+    if printers.fcntl is None:
+        pytest.skip("no flock on this platform")
+
+    lock = tmp_path / "printer.lock"
+    monkeypatch.setattr(printers, "lock_path", lambda *a, **k: lock)
+
+    # A second open file description in this same process is enough, and
+    # that is not a shortcut: flock conflicts between descriptions even
+    # inside one process, which is the property that produced the printd
+    # self-deadlock in the first place.
+    holder = open(lock, "w")
+    printers.fcntl.flock(holder, printers.fcntl.LOCK_EX)
+    try:
+        started = time.monotonic()
+        with pytest.raises(printers.PrinterUnavailable) as raised:
+            with printers.print_lock(required=True, timeout=0.5):
+                pass
+        waited = time.monotonic() - started
+        assert 0.4 < waited < 5, f"waited {waited:.2f}s, not the budget"
+        assert "busy" in str(raised.value)
+    finally:
+        printers.fcntl.flock(holder, printers.fcntl.LOCK_UN)
+        holder.close()
+
+
+def test_an_unbounded_print_lock_still_waits(tmp_path, monkeypatch):
+    """The CLI passes no timeout on purpose: a person at a terminal would
+    rather queue behind the poller than be refused."""
+    from mplabel import printers
+
+    if printers.fcntl is None:
+        pytest.skip("no flock on this platform")
+
+    lock = tmp_path / "printer.lock"
+    monkeypatch.setattr(printers, "lock_path", lambda *a, **k: lock)
+    # Uncontended, so this is only asserting that the default path is
+    # unchanged and does not raise.
+    with printers.print_lock(required=True):
+        pass
+
+
+def test_a_wedged_lock_is_a_busy_printer_not_a_hang(tmp_path, monkeypatch):
+    """`_Device` turns the refusal into the answer the caller already
+    knows: printer busy, rather than a socket held open past the
+    deadline."""
+    from mplabel import printd, printers
+
+    class _Gate:
+        def __init__(self):
+            self.released = 0
+
+        def acquire(self, timeout=None):
+            return True
+
+        def release(self):
+            self.released += 1
+
+    class _Server:
+        cfg = {}
+        printing_since = None
+
+    class _Refusing:
+        """Raises where the real one does - on `__enter__`."""
+
+        def __enter__(self):
+            raise printers.PrinterUnavailable("the printer was busy for 0.5s")
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(printers, "print_lock",
+                        lambda *a, **k: _Refusing())
+    gate = _Gate()
+    device = printd._Device(_Server(), 0.5, gate=gate)
+    with device as got:
+        assert got is False, "a wedged lock must read as busy"
+    # And the gate is handed back, or the next request queues behind a
+    # holder that never took anything.
+    assert gate.released == 1
