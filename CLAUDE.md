@@ -1132,6 +1132,34 @@ opposite advice. `CancellationError` is now distinguished from a real
 failure, and a real failure is shown on the screen it happened on rather
 than behind whatever is covering it.
 
+**A price from her own sales is evidence; a price from the model is
+not, and they never become one number.** `listings.worth` answers "what
+would this sell for" from listings that **actually sold** - an active
+listing at $45 is an asking price nobody agreed to - and "what should I
+pay" from the margin she has actually been keeping. Both are null unless
+her history supports them: no comparables means no range, and no costed
+sale means no ceiling, because a ceiling from an assumed margin is a
+number this system invented about her business.
+
+The model is asked for a price too, and its answer lives on
+`OnDevice.Suggested.estimate` and is shown on its own line saying it has
+no market data. It is never added to the comparables, averaged with
+them, or shown in the same breath - blending them would launder a guess
+into evidence, and she is standing in a shop about to act on it. The
+instructions tell it to stay quiet about anything collectable, antique
+or unusual, which is exactly where a confident number is worst.
+
+The median, not the mean, for both: one lamp bought for a pound and sold
+for eighty drags an average into fantasy. And the ceiling is built on
+the median comparable rather than the top of the range - pricing the
+next thing off the best day she ever had is how a shelf fills up with
+things that do not move.
+
+**A median helper must not round.** `_median` rounded to two places,
+which is right for money and wrong for the margin *fraction* it also
+serves: 0.625 became 0.62. Rounding belongs where the number is shown,
+which knows what kind of number it is.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on

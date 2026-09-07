@@ -1074,3 +1074,135 @@ def kept(price, postage, paid=None):
     if paid is not None:
         total -= float(paid)
     return round(total, 2)
+
+
+# ------------------------------------------------------- what it is worth
+#
+# Two different questions get asked in a shop, and they want different
+# evidence:
+#
+#   what would this sell for      -> what things like it actually sold for
+#   what should I pay for it      -> that, less the margin she usually gets
+#
+# Both are answered from her own history and neither is invented. Where
+# there is no comparable the answer is "nothing to compare it with",
+# which is a useful thing to be told while holding a $40 lamp.
+#
+# The *model* also has an opinion, and it is kept somewhere else on
+# purpose - see `OnDevice.Suggested.estimate`. It has no market data, no
+# comps and no idea what a thing goes for in her county, so its number
+# and these numbers must never be added, averaged or shown as one
+# figure.
+
+
+def _words(title):
+    """Significant words, for finding something like this one."""
+    stop = {"the", "a", "an", "and", "of", "with", "in", "for", "vintage",
+            "antique", "large", "small", "set", "pair", "old"}
+    return {w for w in re.split(r"\W+", (title or "").lower())
+            if len(w) > 2 and w not in stop}
+
+
+def comparables(conn, category=None, title=None, limit=12):
+    """What things like this actually sold for.
+
+    Category first, then title overlap - a "Home" category covers half
+    the house, so two shared words in the title is the stronger signal
+    when it is there. Sold rows only, and only with a price: an active
+    listing at $45 is an asking price nobody has agreed to.
+    """
+    rows = conn.execute(
+        "SELECT title, category, price, paid, listed_at, sold_at "
+        "FROM listings WHERE state='sold' AND price IS NOT NULL").fetchall()
+    wanted = _words(title)
+    scored = []
+    for row in rows:
+        score = 0
+        if category and row["category"] and \
+                row["category"].lower() == category.lower():
+            score += 1
+        overlap = len(wanted & _words(row["title"])) if wanted else 0
+        score += 2 * overlap
+        if score:
+            scored.append((score, dict(row)))
+    scored.sort(key=lambda pair: -pair[0])
+    return [row for _score, row in scored[:limit]]
+
+
+def _median(values):
+    """The middle one, unrounded.
+
+    Rounding here was wrong: this serves money, day counts and a margin
+    *fraction*, and two decimal places turns a margin of 0.625 into 0.62.
+    Rounding belongs where the number is shown, which knows what kind of
+    number it is.
+    """
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def usual_margin(conn):
+    """The fraction of a sale she has actually been keeping.
+
+    The median rather than the mean: one lamp bought for a pound and sold
+    for eighty would drag an average into fantasy, and the number is here
+    to price the next ordinary thing.
+
+    None when nothing sold has a cost against it - and then there is no
+    ceiling, because a ceiling from an assumed margin is a number this
+    system made up about her business.
+    """
+    fractions = []
+    for row in conn.execute(
+            "SELECT price, paid FROM listings WHERE state='sold' "
+            "AND price IS NOT NULL AND paid IS NOT NULL AND price > 0"):
+        fractions.append((row["price"] - row["paid"]) / row["price"])
+    return _median(fractions)
+
+
+def worth(conn, category=None, title=None):
+    """What it might sell for, and what to pay - or why neither is known.
+
+    Everything here is null unless her own history supports it. That is
+    the whole design: standing in a shop being told "no idea" is worth
+    more than being told a number that came from nowhere, because she
+    will act on the number.
+    """
+    found = comparables(conn, category=category, title=title)
+    prices = [row["price"] for row in found if row["price"] is not None]
+    days = []
+    for row in found:
+        if row["listed_at"] and row["sold_at"]:
+            try:
+                start = datetime.fromisoformat(row["listed_at"][:10])
+                end = datetime.fromisoformat(row["sold_at"][:10])
+                days.append((end - start).days)
+            except ValueError:
+                continue
+
+    margin = usual_margin(conn)
+    middle = _median(prices)
+    # The ceiling is the median comparable less the margin she usually
+    # takes. Deliberately built on the median rather than the top of the
+    # range: pricing the next thing off the best day she ever had is how
+    # a shelf fills up with things that do not move.
+    ceiling = None
+    if middle is not None and margin is not None:
+        ceiling = round(middle * (1 - margin), 2)
+
+    return {
+        "comparables": len(prices),
+        "low": min(prices) if prices else None,
+        "high": max(prices) if prices else None,
+        "median": round(middle, 2) if middle is not None else None,
+        "typical_days": round(_median(days)) if days else None,
+        "usual_margin": round(margin, 3) if margin is not None else None,
+        "pay_under": ceiling,
+        "examples": [{"title": row["title"], "price": row["price"],
+                      "paid": row["paid"]} for row in found[:3]],
+    }

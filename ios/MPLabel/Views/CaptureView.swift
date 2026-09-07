@@ -47,6 +47,10 @@ struct CaptureView: View {
         /// not one tap later.
         var suggested: OnDevice.Suggested?
         var thinking = false
+        /// What her own sold listings say. Kept apart from the model's
+        /// number on purpose - one is evidence and one is a guess, and a
+        /// screen that averaged them would be lying about both.
+        var worth: Worth?
         var candidate: Candidate?
         var decision: String?
 
@@ -290,6 +294,7 @@ struct CaptureView: View {
                         .foregroundStyle(.white.opacity(0.8))
                         .lineLimit(2)
                 }
+                price(shot)
             }
             HStack(spacing: MP.S.x2) {
                 Button { decide(shot, "passed") } label: {
@@ -317,6 +322,62 @@ struct CaptureView: View {
         .background(.black.opacity(0.55),
                     in: RoundedRectangle(cornerRadius: MP.R.card))
         .padding(.horizontal, MP.S.x3)
+    }
+
+    /// The two numbers, kept apart.
+    ///
+    /// The top line is her own sold listings - what things like this
+    /// actually went for, and the most she can pay and still keep the
+    /// margin she usually keeps. That is the number she is deciding
+    /// with, and it is evidence.
+    ///
+    /// The second line is the model's guess, said as a guess. It has no
+    /// market data and no idea what things fetch in her county, so it is
+    /// never added to, averaged with, or shown in the same breath as the
+    /// first - a screen that blended them would launder the guess.
+    @ViewBuilder
+    private func price(_ shot: Shot) -> some View {
+        if let worth = shot.worth, worth.hasEvidence {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(rangeLine(worth))
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(.white)
+                if let ceiling = worth.payUnder {
+                    Text("Pay under " + money(ceiling)
+                         + (worth.usualMargin.map {
+                             " to keep your usual \(Int($0 * 100))%" } ?? ""))
+                        .font(.system(size: 12))
+                        .foregroundStyle(MP.Palette.accent)
+                } else {
+                    Text("No cost on anything sold yet, so no ceiling.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+            }
+        } else if shot.worth != nil {
+            Text("Nothing like this has sold before - no comparison.")
+                .font(.system(size: 11.5))
+                .foregroundStyle(.white.opacity(0.7))
+        }
+
+        if let guess = shot.suggested?.estimate, !guess.isEmpty {
+            Text("The phone guesses $\(guess) - it has no market data.")
+                .font(.system(size: 11))
+                .foregroundStyle(.white.opacity(0.6))
+        }
+    }
+
+    private func rangeLine(_ worth: Worth) -> String {
+        let range: String
+        if let low = worth.low, let high = worth.high, low != high {
+            range = money(low) + "–" + money(high)
+        } else {
+            range = money(worth.median)
+        }
+        let count = worth.comparables == 1
+            ? "1 like it sold for " : "\(worth.comparables) like it sold for "
+        let days = worth.typicalDays.map { ", typically \($0) days" } ?? ""
+        return count + range + days
     }
 
     private var shutter: some View {
@@ -471,6 +532,12 @@ struct CaptureView: View {
                 $0.suggested = found
                 $0.thinking = false
             }
+            // Her own history, asked once the model has said what the
+            // thing is - the category and the title are what make the
+            // comparison possible.
+            let seen = try? await APIClient.shared.worth(
+                category: found?.category, title: found?.title)
+            update(shot) { $0.worth = seen }
         }
     }
 

@@ -567,3 +567,37 @@ struct ReconcileResult: Codable {
     let created: [InventoryItem]
     let trip: Trip?
 }
+
+/// What her own sold listings say something like this is worth.
+///
+/// Every figure is null unless her history supports it. The model's
+/// guess is **not** in here and never will be: it has no market data, so
+/// mixing the two would launder a guess into evidence.
+struct Worth: Codable, Hashable {
+    let comparables: Int
+    let low: Double?
+    let high: Double?
+    let median: Double?
+    let typicalDays: Int?
+    let usualMargin: Double?
+    /// The median comparable less the margin she usually keeps. Null
+    /// when nothing sold has a cost against it - a ceiling from an
+    /// assumed margin is a number invented about her business.
+    let payUnder: Double?
+    let examples: [WorthExample]
+
+    var hasEvidence: Bool { comparables > 0 }
+
+    enum CodingKeys: String, CodingKey {
+        case comparables, low, high, median, examples
+        case typicalDays = "typical_days"
+        case usualMargin = "usual_margin"
+        case payUnder = "pay_under"
+    }
+}
+
+struct WorthExample: Codable, Hashable {
+    let title: String?
+    let price: Double?
+    let paid: Double?
+}
