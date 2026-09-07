@@ -406,6 +406,21 @@ actor APIClient {
 
     // MARK: - the aisle
 
+    /// What her own sold listings say something like this went for.
+    /// Answered from history; the model's guess travels separately.
+    func worth(category: String?, title: String?) async throws -> Worth {
+        var query: [String] = []
+        for (key, value) in [("category", category), ("title", title)] {
+            guard let value, !value.isEmpty,
+                  let escaped = value.addingPercentEncoding(
+                    withAllowedCharacters: .urlQueryAllowed) else { continue }
+            query.append("\(key)=\(escaped)")
+        }
+        let path = "/worth" + (query.isEmpty ? ""
+                               : "?" + query.joined(separator: "&"))
+        return try await send(request(path), as: Worth.self)
+    }
+
     func candidates(trip: Int? = nil,
                     decision: String? = nil) async throws -> [Candidate] {
         var path = "/candidates"

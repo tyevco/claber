@@ -121,6 +121,15 @@ enum OnDevice {
             Clothing, Tools, Toys.
             """)
         var category: String
+
+        @Guide(description: """
+            What this might sell for second-hand, as a plain number of \
+            US dollars with no currency sign - "35". Leave it empty \
+            unless the object is an ordinary thing with an obvious \
+            price. Never guess at anything that might be collectable, \
+            antique or unusual.
+            """)
+        var estimate: String
     }
 
     /// What she typed, as the model gets to see it. A struct rather than
@@ -278,6 +287,12 @@ enum OnDevice {
         value from style alone - leave a field empty rather than fill it \
         with something plausible. Empty is a useful answer and a wrong \
         one is not.
+
+        You have no market data and no idea what things fetch where this \
+        person lives. Offer a price only for an ordinary object with an \
+        obvious one, and leave it empty for anything collectable, \
+        antique or unusual - those are exactly the objects where a \
+        confident number is worst.
         """
 
     /// Title, era, condition and category off a photograph.

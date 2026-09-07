@@ -133,14 +133,18 @@ final class KeychainTests: XCTestCase {
     /// back breaks the build's tests rather than being noticed in review.
     func testTheModelCannotSuggestWhatSomethingCost() throws {
         let suggested = OnDevice.Suggested(title: "", era: "", condition: "",
-                                           category: "")
+                                           category: "", estimate: "")
         let fields = Mirror(reflecting: suggested).children.compactMap(\.label)
         XCTAssertFalse(fields.contains("paid"),
                        "a suggested cost would corrupt every margin")
         XCTAssertFalse(fields.contains("price"),
                        "asking price is hers to set, not the model's")
+        // `estimate` is the model's own guess at a sale price and is
+        // allowed - it is what she might *ask*, offered as a guess and
+        // shown apart from the comparables. `paid` is what she hands
+        // over, and no model gets an opinion about that.
         XCTAssertEqual(Set(fields),
-                       ["title", "era", "condition", "category"])
+                       ["title", "era", "condition", "category", "estimate"])
     }
 
     /// A missing era or condition is **named**, not omitted.
@@ -268,5 +272,51 @@ final class KeychainTests: XCTestCase {
         XCTAssertFalse(OnDevice.canSeePictures,
                        "a build made without the SDK cannot show a picture")
         #endif
+    }
+
+    // MARK: - what it is worth
+
+    /// Evidence and a guess are different things and the screen must
+    /// keep them apart. `Worth` carries only what her own sold listings
+    /// support; the model's number lives on `Suggested` and never gets
+    /// added to, averaged with, or shown as the same figure.
+    func testWorthCarriesNoGuess() {
+        let fields = Mirror(reflecting: Worth(
+            comparables: 0, low: nil, high: nil, median: nil,
+            typicalDays: nil, usualMargin: nil, payUnder: nil,
+            examples: [])).children.compactMap(\.label)
+        XCTAssertFalse(fields.contains("estimate"),
+                       "the model's guess must not ride in with the comps")
+        XCTAssertFalse(fields.contains("guess"))
+    }
+
+    /// No comparables is a real answer. Being told "no idea" while
+    /// holding a $40 lamp is worth more than a number from nowhere,
+    /// because she will act on the number.
+    func testNoComparablesIsAnAnswer() {
+        let empty = Worth(comparables: 0, low: nil, high: nil, median: nil,
+                          typicalDays: nil, usualMargin: nil,
+                          payUnder: nil, examples: [])
+        XCTAssertFalse(empty.hasEvidence)
+
+        let some = Worth(comparables: 2, low: 28, high: 34, median: 31,
+                         typicalDays: 12, usualMargin: 0.6, payUnder: 12.4,
+                         examples: [])
+        XCTAssertTrue(some.hasEvidence)
+    }
+
+    /// A ceiling with no margin behind it is a number invented about her
+    /// business, so the model has to be able to say it does not have one
+    /// while still having comparables.
+    func testAPriceRangeCanExistWithoutACeiling() throws {
+        let json = Data("""
+        {"comparables": 2, "low": 28.0, "high": 34.0, "median": 31.0,
+         "typical_days": 12, "usual_margin": null, "pay_under": null,
+         "examples": []}
+        """.utf8)
+        let worth = try JSONDecoder().decode(Worth.self, from: json)
+        XCTAssertTrue(worth.hasEvidence)
+        XCTAssertNil(worth.payUnder)
+        XCTAssertNil(worth.usualMargin)
     }
 }

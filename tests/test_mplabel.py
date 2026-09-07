@@ -2111,6 +2111,15 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
             if isinstance(rows, list):
                 for row in rows:
                     served |= set(row)
+    # What her own history says a thing is worth. Polled with a real
+    # category so the payload is populated: an empty answer sends the
+    # keys but nothing under them, which is the shape this test exists to
+    # notice going missing.
+    _s, _h, body = _http(
+        base + web_mod.API_PREFIX + "/worth?category=Home&title=Hobnail+vase",
+        cookie=cookie)
+    served |= set(json.loads(body))
+
     # The proposal nests too, and its envelope keys - carted, item_lines,
     # unclaimed_lines - are as much a contract as the row keys.
     _s, _h, body = _http(base + web_mod.API_PREFIX + "/trips/1/reconcile",
@@ -8151,3 +8160,94 @@ def test_the_aisle_routes_need_authentication(app):
         status, _, _ = _http(base + path, method,
                              {} if method == "POST" else None)
         assert status == 401, f"{method} {path} answered without a token"
+
+
+# ------------------------------------ what it might sell for, in the aisle
+
+
+def _sold(db, title, category, price, paid=None, listed=None, sold=None):
+    db.execute(
+        "INSERT INTO listings (listing_id, title, category, price, paid, "
+        "state, listed_at, sold_at) VALUES (?,?,?,?,?,'sold',?,?)",
+        (f"x{title}", title, category, price, paid, listed, sold))
+    db.commit()
+
+
+def test_nothing_comparable_says_nothing(db):
+    """Standing in a shop being told "no idea" is worth more than being
+    told a number that came from nowhere, because she will act on the
+    number."""
+    from mplabel import listings
+
+    out = listings.worth(db, category="Home", title="Milk glass vase")
+    assert out["comparables"] == 0
+    assert out["median"] is None
+    assert out["pay_under"] is None
+
+
+def test_a_price_comes_from_what_actually_sold(db):
+    """Sold rows only. An active listing at $45 is an asking price nobody
+    has agreed to."""
+    from mplabel import listings
+
+    _sold(db, "Hobnail milk glass vase", "Home", 28.0, 6.0,
+          "2026-07-01", "2026-07-13")
+    _sold(db, "Milk glass bowl", "Home", 34.0, 8.0,
+          "2026-07-01", "2026-07-21")
+    db.execute(
+        "INSERT INTO listings (listing_id, title, category, price, state) "
+        "VALUES ('live', 'Milk glass jug', 'Home', 999.0, 'active')")
+    db.commit()
+
+    out = listings.worth(db, category="Home", title="Milk glass vase")
+    assert out["comparables"] == 2
+    assert out["low"] == 28.0 and out["high"] == 34.0
+    assert out["median"] == 31.0
+    assert 999.0 not in [e["price"] for e in out["examples"]], \
+        "an unsold asking price is not evidence"
+
+
+def test_the_ceiling_uses_the_margin_she_actually_gets(db):
+    """Not a target this system invented. And the median, because one
+    lamp bought for a pound and sold for eighty would drag an average
+    into fantasy."""
+    from mplabel import listings
+
+    _sold(db, "Vase one", "Home", 40.0, 10.0)      # 75% kept
+    _sold(db, "Vase two", "Home", 20.0, 10.0)      # 50% kept
+    out = listings.worth(db, category="Home", title="Vase three")
+
+    assert out["usual_margin"] == 0.625            # median of 0.75 and 0.5
+    # Median comparable is 30; pay under 30 * (1 - 0.625).
+    assert out["median"] == 30.0
+    assert out["pay_under"] == 11.25
+
+
+def test_without_a_single_cost_there_is_no_ceiling(db):
+    """A ceiling from an assumed margin is a number this system made up
+    about her business."""
+    from mplabel import listings
+
+    _sold(db, "Vase", "Home", 40.0)                # sold, never costed
+    out = listings.worth(db, category="Home", title="Another vase")
+    assert out["median"] == 40.0
+    assert out["usual_margin"] is None
+    assert out["pay_under"] is None, "no basis, so no number"
+
+
+def test_a_title_match_outweighs_a_broad_category(db):
+    """"Home" covers half the house. Two shared words in the title is the
+    stronger signal when it is there."""
+    from mplabel import listings
+
+    _sold(db, "Cast iron skillet", "Home", 25.0)
+    _sold(db, "Hobnail milk glass vase", "Home", 30.0)
+    found = listings.comparables(db, category="Home",
+                                 title="Milk glass vase, hobnail")
+    assert found[0]["title"] == "Hobnail milk glass vase"
+
+
+def test_worth_needs_authentication(app):
+    base, _ = app
+    status, _, _ = _http(f"{base}/api/v1/worth?category=Home")
+    assert status == 401

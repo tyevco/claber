@@ -388,6 +388,7 @@ class Handler(BaseHTTPRequestHandler):
          True),
         # The aisle: what she pointed the camera at, and what she did
         # about it.
+        ("GET", r"^/api/worth$", "h_worth", True),
         ("GET", r"^/api/candidates$", "h_candidates", True),
         ("POST", r"^/api/candidates$", "h_add_candidate", True),
         ("POST", r"^/api/candidates/(?P<cid>\d+)$", "h_update_candidate",
@@ -692,6 +693,19 @@ class Handler(BaseHTTPRequestHandler):
         return self.json({"ok": True, "id": int(lid), "bin_code": code})
 
     # --- the aisle
+
+    def h_worth(self):
+        """What things like this have actually sold for.
+
+        Answered from her own history and nothing else. The model's guess
+        travels separately and is labelled as a guess - it has no market
+        data, so putting the two in one number would launder one into the
+        other."""
+        qs = parse_qs(urlparse(self.path).query)
+        self.json(listings_mod.worth(
+            self.db(),
+            category=(qs.get("category") or [None])[0],
+            title=(qs.get("title") or [None])[0]))
 
     def h_candidates(self):
         qs = parse_qs(urlparse(self.path).query)
