@@ -3895,6 +3895,25 @@ def test_the_installer_is_executable():
         f"is refused and the units it writes never reach the Pi")
 
 
+def test_every_config_key_is_in_the_example():
+    """A key that exists only in `DEFAULTS` is a key nobody knows to set.
+
+    `/etc/mplabel.conf` is never overwritten by the installer, so the
+    example is the only place a new setting gets announced - and the
+    failure for a missing one is silent: the built-in default fires and
+    looks exactly like a deliberate choice. Five APNs keys and the whole
+    web block were missing when this was written."""
+    from mplabel import cli as cli_mod
+
+    example = (Path(__file__).parent.parent
+               / "mplabel.conf.example").read_text()
+    missing = [key for key in cli_mod.DEFAULTS
+               if not re.search(rf"^\s*#?\s*{re.escape(key)}\s*=",
+                                example, re.M)]
+    assert not missing, \
+        "documented nowhere: " + ", ".join(sorted(missing))
+
+
 def test_every_unit_in_the_repo_is_installed_by_the_installer():
     """A unit that exists in the repo and not in `install_pi.sh` never
     reaches the Pi: the documented update path is a git pull and a pip

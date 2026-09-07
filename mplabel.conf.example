@@ -187,3 +187,40 @@ supvan_density  = 4
 # Dots across the print head. render_bitmap refuses to render wider - the
 # overflow is clipped by the hardware and ejects a second, blank label.
 printer_head_dots = 812
+
+# --------------------------------------------------------------- the phone
+
+# The phone app (`mplabel serve`). It refuses to start without a password
+# hash rather than serve buyers' names and addresses unauthenticated, and
+# that refusal exits 78 so the unit stays dead where it can be seen.
+#   mplabel passwd            writes the hash below
+web_bind        = 127.0.0.1
+web_port        = 8080
+web_password_hash =
+web_session_days = 30
+# auto = Secure only when X-Forwarded-Proto says https, which is right
+# behind a Cloudflare tunnel and wrong on plain loopback.
+web_secure_cookie = auto
+
+# ------------------------------------------------------------ notifications
+
+# Push, for the three things that earn one: a parcel is due, a label
+# never printed, money has no home. All four of the first keys come from
+# the Apple Developer account and none has a working default - an
+# unconfigured `mplabel notify` exits 78 rather than half-trying. See
+# docs/notifications.md.
+#
+# The key is the .p8 downloaded once from Keys; keep it chmod 600 and
+# out of the repo (.gitignore covers *.p8).
+apns_key_path   =
+# The ten characters in AuthKey_XXXXXXXXXX.p8.
+apns_key_id     =
+# Membership > Team ID.
+apns_team_id    =
+# The app's bundle id.
+apns_topic      = com.tyevco.MPLabel
+# sandbox for a build signed with a development profile, production
+# otherwise. A token from one is rejected by the other with
+# BadDeviceToken, which reads like a malformed token rather than one
+# addressed to the wrong Apple.
+apns_environment = sandbox
