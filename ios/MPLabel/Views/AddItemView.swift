@@ -388,12 +388,11 @@ struct AddItemView: View {
         }
     }
 
-    /// Whether this OS can hand the model a picture at all. The text
-    /// half is iOS 26 and the image half is 27.
-    private var canSeePictures: Bool {
-        if #available(iOS 27.0, *) { return true }
-        return false
-    }
+    /// Whether this build *and* this phone can hand the model a
+    /// picture. `OnDevice` owns the answer: the text half is iOS 26, the
+    /// image half is 27, and the image half also needs an SDK that has
+    /// it - which the release runner does not yet have.
+    private var canSeePictures: Bool { OnDevice.canSeePictures }
 
     private func chips(from s: OnDevice.Suggested) -> [(String, String, () -> Void)] {
         var out: [(String, String, () -> Void)] = []
@@ -420,7 +419,7 @@ struct AddItemView: View {
         modelError = nil
         Task {
             do {
-                if #available(iOS 27.0, *) {
+                if #available(iOS 27.0, *), OnDevice.canSeePictures {
                     suggested = try await OnDevice.suggestions(
                         from: cg, typedTitle: title)
                 }

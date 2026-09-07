@@ -248,4 +248,25 @@ final class KeychainTests: XCTestCase {
         XCTAssertEqual(Push.environment, "production")
         #endif
     }
+
+    /// An `@available` annotation cannot rescue a symbol that is absent
+    /// from the SDK's headers. The image API is in a beta Xcode, the
+    /// release runner has whatever ships, and naming the type there does
+    /// not compile - so the *build* has a say as well as the phone.
+    @MainActor
+    func testTheImageApiIsGatedOnTheSdkNotJustTheOs() {
+        #if compiler(>=6.4)
+        // Built with the beta SDK: the answer is then purely about the
+        // phone, and the simulator this runs on is iOS 27.
+        if #available(iOS 27.0, *) {
+            XCTAssertTrue(OnDevice.canSeePictures)
+        } else {
+            XCTAssertFalse(OnDevice.canSeePictures)
+        }
+        #else
+        // Built without it: no phone can make this true.
+        XCTAssertFalse(OnDevice.canSeePictures,
+                       "a build made without the SDK cannot show a picture")
+        #endif
+    }
 }

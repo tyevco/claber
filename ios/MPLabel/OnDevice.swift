@@ -285,9 +285,32 @@ enum OnDevice {
     /// **iOS 27**, not 26: the text model arrived a version before it
     /// could be shown a picture. The caller gates on this, and the
     /// listing kit above deliberately does not depend on it.
+    /// Whether this *build* can show the model a picture at all.
+    ///
+    /// Two conditions of different kinds. `iOS 27` is a runtime question
+    /// about the phone; the compiler check is about the SDK the binary
+    /// was built against - `Attachment` is not in the iOS 26 SDK, so
+    /// code naming it does not compile there, and an `@available`
+    /// annotation cannot rescue a symbol that is absent from the
+    /// headers.
+    ///
+    /// That matters because the release runner has whatever Xcode ships
+    /// and the image API is still in a beta. Without this the whole app
+    /// fails to build on CI - which is what happened the day CI arrived,
+    /// on `main` rather than on anybody's branch.
+    static var canSeePictures: Bool {
+        #if compiler(>=6.4)
+        if #available(iOS 27.0, *) { return true }
+        return false
+        #else
+        return false
+        #endif
+    }
+
     @available(iOS 27.0, *)
     static func suggestions(from image: CGImage,
                             typedTitle: String = "") async throws -> Suggested {
+        #if compiler(>=6.4)
         let session = LanguageModelSession(instructions: lookInstructions)
         let hint = typedTitle.trimmingCharacters(in: .whitespaces)
         do {
@@ -303,5 +326,16 @@ enum OnDevice {
         } catch {
             throw refusal(error)
         }
+        #else
+        // Built against an SDK without the image API. The signature
+        // stays, so callers need no compiler guards of their own, and
+        // the refusal distinguishes the two reasons: a phone that is too
+        // old reads very differently from a build made before the SDK
+        // shipped.
+        throw Refusal(message:
+            "This build cannot show the model a picture - it was made "
+            + "with an SDK that predates that. The written draft still "
+            + "works.")
+        #endif
     }
 }
