@@ -998,6 +998,15 @@ from. There is **no rate card in this repo**: an estimate is derived
 from parcels she has actually confirmed, and where there are none the
 answer is "nobody knows" rather than a plausible number.
 
+The sheet gets `Postage`, `Postage source` and `You keep` - the source
+as its own column rather than a suffix, because a spreadsheet is where a
+figure gets summed, sorted and copied into another cell and
+"12.40 (est.)" is a string that does none of those. Only *stored*
+figures reach it, which means only confirmed ones: the estimate is
+computed per request and deliberately not persisted, because an estimate
+in a spreadsheet is one that gets copied somewhere else and stops being
+one.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on

@@ -33,12 +33,32 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # tab name -> (SQL, column headers)
 TABS = {
+    # Postage and what it leaves behind.
+    #
+    # `postage_source` is a column of its own rather than a suffix on the
+    # number, because a spreadsheet is where a figure gets summed, sorted
+    # and copied into another cell - and "12.40 (est.)" is a string that
+    # does none of those. A blank source is a blank postage: the two are
+    # written and cleared together.
+    #
+    # Only *stored* figures reach here, which means only confirmed ones.
+    # The estimate the order screen offers is computed per request and
+    # deliberately not persisted - an estimate in a spreadsheet is an
+    # estimate that gets copied somewhere else and stops being one.
+    #
+    # `kept` is computed in SQL with the same null-safety as
+    # `v_listing_perf.margin`: unknown in, blank out. A missing postage
+    # read as zero would report the whole price as kept.
     "Sales": (
         """SELECT code, received_at, item, buyer, price, ship_by, tracking,
-                  ship_to, weight, service, status, printed_at
+                  ship_to, weight, service, status, printed_at,
+                  postage, postage_source,
+                  CASE WHEN price IS NOT NULL AND postage IS NOT NULL
+                       THEN ROUND(price - postage, 2) END AS kept
              FROM sales ORDER BY received_at DESC""",
         ["Code", "Sold", "Item", "Buyer", "Price", "Ship by", "Tracking",
-         "Ship to", "Weight", "Service", "Status", "Printed"]),
+         "Ship to", "Weight", "Service", "Status", "Printed",
+         "Postage", "Postage source", "You keep"]),
 
     "Listings": (
         """SELECT listing_id, title, category, price, state, listed_at,
