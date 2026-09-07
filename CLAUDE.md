@@ -1188,11 +1188,23 @@ things came out of settling the rest:
   daily use, ask what that use has already proved before designing an
   experiment for it.
 
-Then the split, in order: #10 loopback, #11 off-loopback over a mesh VPN.
-Both are deployment of code that already exists and is tested against a
-fake device. Hardening that wants doing alongside: #12 (`GET /printed`
-enumerates live parcel codes), #13 (the journal trim is not atomic),
-#14 (no unit for `mplabel serve`), #15 (the installer assumes one host).
+Then the split: #10 loopback is done and #11 - off-loopback over a mesh
+VPN - is deployment rather than code. Of the hardening, #12 (signing
+`GET /printed`) and #13 (the journal) are done; #14 is answered by
+`systemd/mplabel-web.service` existing; #15 (the installer assumes one
+host) is open.
+
+**The journal is the only record there is, so it is written like one.**
+The G4 is write-only - a failed print cannot be detected in software -
+which makes this file the answer to "did that come out?" with no second
+source. So an append is fsynced before the lock is released, the trim
+writes a temp file in the *same directory* and `os.replace`s it (atomic;
+across filesystems it is not, and /tmp usually is one), `since()` reads
+under the lock rather than landing mid-rewrite, and a torn last line
+costs that line rather than the file. The in-memory `_done` set is
+rebuilt from what survives a trim: it used to outlive the file, so a
+trimmed job stayed 409-able until a restart and then silently stopped
+being.
 
 ### The label maker
 
