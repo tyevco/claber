@@ -1366,6 +1366,38 @@ def test_sales_tab_carries_the_parcel_code(db):
     assert db.execute(sql).fetchone()[0] == "042"
 
 
+def test_the_sheet_says_whether_a_postage_figure_was_measured(db):
+    """#3's acceptance, and the same trap one column over: a spreadsheet
+    is where a figure gets summed, sorted and copied into another cell.
+
+    `postage_source` is its own column rather than a suffix on the
+    number, because "12.40 (est.)" is a string that does none of those.
+    And only stored figures reach the sheet - the estimate the order
+    screen offers is computed per request and deliberately not
+    persisted, because an estimate in a spreadsheet is one that gets
+    copied somewhere else and stops being one."""
+    db.executemany(
+        "INSERT INTO sales (message_id, item, price, postage, "
+        "postage_source, code) VALUES (?,?,?,?,?,?)",
+        [("<measured>", "Lamp", 95.0, 22.5, "confirmed", "A1B"),
+         ("<unknown>", "Vase", 28.0, None, None, "C2D")])
+    db.commit()
+
+    sql, headers = sheets.TABS["Sales"]
+    assert "Postage source" in headers
+    assert "You keep" in headers
+    rows = {r["item"]: dict(r) for r in db.execute(sql)}
+
+    assert rows["Lamp"]["postage_source"] == "confirmed"
+    assert rows["Lamp"]["kept"] == 72.5
+
+    # Unknown postage leaves both blank rather than reporting the whole
+    # price as kept - the same failure as a missing cost reading as free.
+    assert rows["Vase"]["postage"] is None
+    assert rows["Vase"]["postage_source"] is None
+    assert rows["Vase"]["kept"] is None
+
+
 def test_sheet_tabs_have_matching_header_widths(db):
     listings.build_views(db)
     for name, (sql, headers) in sheets.TABS.items():
