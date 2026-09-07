@@ -1075,6 +1075,28 @@ had autocreated one in `xcuserdata` on one machine - which
 failure reads `does not contain a scheme named "MPLabel"`, which looks
 like a broken project rather than a file nobody generated.
 
+**`@available` cannot rescue a symbol the SDK does not have.** The
+image half of `FoundationModels` is iOS 27, which means a beta Xcode:
+code naming `Attachment` does not *compile* against the iOS 26 SDK, and
+an availability annotation only guards a runtime call to something the
+headers already declare. So `OnDevice.canSeePictures` asks two questions
+of different kinds - `#available` about the phone, `#if compiler` about
+the build - and the image path throws a sentence saying which is
+missing rather than failing to link. The release runner has whatever
+Xcode ships, so without this the whole app fails to build there, which
+is what happened the day CI arrived and it happened on `main`.
+
+**XcodeGen generates the entitlements file, so a key written into it by
+hand does not survive.** `aps-environment` was hand-written into
+`MPLabel.entitlements` while `project.yml` declared only its `path` -
+and the next `xcodegen generate`, which this repo tells you to run
+whenever a file is added, silently deleted it. On the simulator that is
+invisible: there is no APNs there and the registration is never
+exercised. On a real phone `registerForRemoteNotifications` then fails
+with "no valid aps-environment entitlement string found", which reads
+as a provisioning problem and is a missing key. The properties live in
+`project.yml` now, where the generator can see them.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on

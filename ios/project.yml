@@ -122,7 +122,28 @@ targets:
       # the App ID as well - Xcode's Signing pane adds it, and without it
       # a *device* build fails at signing while the simulator carries on
       # working, which is a confusing way to find out.
+      #
+      # **The properties have to be here, not only in the file.**
+      # XcodeGen *generates* what `path` points at, so an entitlement
+      # written into that file by hand survives exactly until the next
+      # `xcodegen generate` - which this repo tells you to run whenever a
+      # file is added. It was hand-written once and would have been
+      # silently deleted the next time anyone regenerated, taking push on
+      # a real phone with it and leaving the simulator working.
       path: MPLabel/MPLabel.entitlements
+      properties:
+        # `development`, not `production`, deliberately: Xcode replaces
+        # this with `production` when it re-signs during
+        # `-exportArchive` for App Store distribution, so a TestFlight
+        # build gets a production token and a build run from Xcode onto
+        # the same handset gets a sandbox one. Writing `production` here
+        # would break the second without helping the first.
+        #
+        # Which environment a token belongs to travels to the Pi with it
+        # - see Push.swift. A sandbox token offered to the production
+        # host comes back BadDeviceToken, which reads as malformed
+        # rather than as addressed to the wrong Apple.
+        aps-environment: development
     settings:
       base:
         # The real App ID, from the developer account - not derived from
