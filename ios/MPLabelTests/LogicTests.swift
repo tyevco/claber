@@ -214,4 +214,38 @@ final class KeychainTests: XCTestCase {
         XCTAssertTrue(OnDevice.Readiness.ready.canGenerate)
         XCTAssertEqual(OnDevice.Readiness.ready.sentence, "")
     }
+
+    // MARK: - push
+
+    /// Every state has to say something a person can act on. "Not asked
+    /// yet" and "she said no" are different sentences and the fix for one
+    /// is not the fix for the other.
+    @MainActor
+    func testEveryPushStateHasWords() {
+        let states: [Push.State] = [.unknown, .notAsked, .refused,
+                                    .registering, .registered,
+                                    .failed("network")]
+        for state in states {
+            XCTAssertFalse(state.sentence.isEmpty, "\(state) says nothing")
+        }
+        XCTAssertNotEqual(Push.State.notAsked.sentence,
+                          Push.State.refused.sentence,
+                          "not asked and refused need different answers")
+        XCTAssertTrue(Push.State.failed("network").sentence
+            .contains("network"), "the reason has to survive")
+    }
+
+    /// A debug build carries the development entitlement and gets a
+    /// sandbox token, which the production APNs host rejects with
+    /// BadDeviceToken - an error that reads like the token is malformed
+    /// rather than addressed to the wrong Apple. So the environment
+    /// travels with it.
+    @MainActor
+    func testTheEnvironmentTravelsWithTheToken() {
+        #if DEBUG
+        XCTAssertEqual(Push.environment, "sandbox")
+        #else
+        XCTAssertEqual(Push.environment, "production")
+        #endif
+    }
 }

@@ -82,6 +82,15 @@ DEFAULTS = {
     # hidraw0 is only the usual number - another HID device plugged in
     # first takes it and this one becomes hidraw1. Nothing here prints to
     # it; `mplabel supvan-probe` polls its status and moves no paper.
+    # Push. Nothing here has a default that could accidentally work: an
+    # unconfigured install must refuse to notify rather than half-try.
+    # apns_topic is the app's bundle id, and the key is the .p8 from the
+    # developer account - see docs/notifications.md.
+    "apns_key_path": "",
+    "apns_key_id": "",
+    "apns_team_id": "",
+    "apns_topic": "com.tyevco.MPLabel",
+    "apns_environment": "production",
     "supvan_device": "/dev/hidraw0",
     # The label maker's own backend, separate from printer_backend:
     # two devices, and one may be local while the other is not.
@@ -1717,6 +1726,50 @@ def ensure_inventory_codes(conn):
     return len(rows)
 
 
+def cmd_notify(cfg, conn, args):
+    """Send what is worth sending, once each.
+
+    `--dry-run` is the one to reach for first: it goes through the whole
+    decision - what is due, what never printed, what money is loose - and
+    prints it without touching Apple or the `notices` table, so running
+    it twice says the same thing."""
+    from . import notify as notify_mod
+
+    recorded = []
+
+    def dry(token, payload):
+        alert = payload["aps"]["alert"]
+        recorded.append((alert["title"], alert["body"]))
+        return True, "dry run"
+
+    if args.dry_run:
+        # `remember_sent=False`, not a rollback: `remember` commits, so a
+        # rollback here would leave the notices written and report that
+        # they were not.
+        result = notify_mod.run(cfg, conn, sender=dry, remember_sent=False)
+        if not recorded:
+            print("nothing to say"
+                  + (" (no devices registered)" if not result["devices"]
+                     else ""))
+        for title, body in recorded:
+            print(f"{title}\n    {body}")
+        return 0
+
+    try:
+        result = notify_mod.run(cfg, conn)
+    except notify_mod.NotifyError as exc:
+        # A configuration refusal, the same shape printd uses: exit 78 so
+        # a timer or a unit does not retry a permanent error for ever.
+        print(f"push is not configured: {exc}", file=sys.stderr)
+        return 78
+    if not result["devices"]:
+        print("no devices are registered; nothing was sent")
+        return 0
+    print(f"sent {len(result['sent'])} to {result['devices']} device"
+          + ("" if result["devices"] == 1 else "s"))
+    return 0
+
+
 def cmd_inventory(cfg, conn, args):
     """Write a CSV of inventory labels for the label maker.
 
@@ -2191,6 +2244,12 @@ def _main():
                             "that a timeout left looking unprinted")
     p.add_argument("--since", metavar="JOB", help="only jobs after this one")
     p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("notify",
+                       help="say the three things that earn a notification: "
+                            "a parcel is due, a label never printed, money "
+                            "has no home")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print what would be sent and send nothing")
     p = sub.add_parser("printd", help="run the print service")
     p.add_argument("--bind")
     p.add_argument("--port", type=int)
@@ -2328,3 +2387,5 @@ def _main():
         cmd_stats(cfg, conn, args)
     elif args.cmd == "reconcile":
         cmd_reconcile(cfg, conn, args)
+    elif args.cmd == "notify":
+        return cmd_notify(cfg, conn, args)

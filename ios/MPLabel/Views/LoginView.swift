@@ -143,6 +143,7 @@ struct LoginView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var session: Session
+    @StateObject private var push = Push.shared
 
     var body: some View {
         NavigationStack {
@@ -155,6 +156,30 @@ struct SettingsView: View {
                             .foregroundStyle(MP.Palette.fg)
                     }
                 }
+
+                MPCard {
+                    VStack(alignment: .leading, spacing: MP.S.x2) {
+                        MPEyebrow("Notifications")
+                        Text(push.state.sentence)
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(MP.Palette.muted)
+                        // Only three things ever arrive, and saying so
+                        // here is the promise that makes turning them on
+                        // reasonable: a notification she cannot predict
+                        // is one she learns to swipe away.
+                        Text("A parcel is due · a label never printed · "
+                             + "money has no home")
+                            .font(.system(size: 11))
+                            .foregroundStyle(MP.Palette.subtle)
+                        if push.state == .notAsked || push.state == .unknown {
+                            Button("Turn them on") {
+                                Task { await push.ask() }
+                            }
+                            .font(.system(size: 13, weight: .semibold))
+                        }
+                    }
+                }
+                .task { await push.refresh() }
 
                 Button {
                     Settings.serverURL = nil

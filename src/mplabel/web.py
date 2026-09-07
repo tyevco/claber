@@ -370,6 +370,8 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", r"^/api/photos/(?P<pid>\d+)$", "h_photo", True),
         ("POST", r"^/api/photos/(?P<pid>\d+)/attach$", "h_attach_photo",
          True),
+        ("POST", r"^/api/devices$", "h_register_device", True),
+        ("GET", r"^/api/devices$", "h_devices", True),
         ("POST", r"^/api/inventory$", "h_make_item", True),
         ("POST", r"^/api/inventory/(?P<lid>\d+)/fields$", "h_item_fields",
          True),
@@ -658,6 +660,39 @@ class Handler(BaseHTTPRequestHandler):
         body = self.body() or {}
         code = listings_mod.set_bin(self.db(), int(lid), body.get("bin"))
         return self.json({"ok": True, "id": int(lid), "bin_code": code})
+
+    # --- push
+
+    def h_register_device(self):
+        """A phone asking to be told.
+
+        Authenticated like everything else: a token registered by anyone
+        who could reach this port would be a stranger receiving her
+        buyers' names in a notification."""
+        from . import notify as notify_mod
+
+        body = self.body() or {}
+        conn = self.db()
+        conn.executescript(notify_mod.SCHEMA)
+        token = notify_mod.register(
+            conn, body.get("token"),
+            environment=body.get("environment") or "production",
+            label=body.get("label"))
+        self.json({"ok": True, "registered": token[:8] + "..."})
+
+    def h_devices(self):
+        """What is registered, without handing the tokens back out."""
+        from . import notify as notify_mod
+
+        conn = self.db()
+        conn.executescript(notify_mod.SCHEMA)
+        rows = []
+        for device in notify_mod.devices(conn):
+            rows.append({"environment": device["environment"],
+                         "registered_at": device["registered_at"],
+                         "label": device["label"],
+                         "token_prefix": device["token"][:8]})
+        self.json({"devices": rows})
 
     # --- the sourcing half
     #

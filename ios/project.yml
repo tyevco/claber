@@ -69,6 +69,12 @@ targets:
         # tunnel hostname over http still fails.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+    entitlements:
+      # aps-environment, and nothing else. Push needs the capability on
+      # the App ID as well - Xcode's Signing pane adds it, and without it
+      # a *device* build fails at signing while the simulator carries on
+      # working, which is a confusing way to find out.
+      path: MPLabel/MPLabel.entitlements
     settings:
       base:
         TARGETED_DEVICE_FAMILY: "1"    # iPhone. There is no iPad layout.

@@ -101,6 +101,7 @@ run against a real database.
 | `passwd` | set the web password (scrypt), written to the config file |
 | `status` | ask the G4 how it is. **It does not answer** - kept as the record of that, see the table below |
 | `reconcile [--since JOB] [--dry-run]` | reconcile the local DB against printd's journal. The recovery path for an ambiguous print |
+| `notify [--dry-run]` | say the three things that earn a notification. `--dry-run` prints the whole decision and records nothing, so it says the same thing twice. Exit **78** if push is not configured |
 
 `probe`, `selftest`, `supvan-probe` and `file` run above `connect_db` in
 `main()` - see the note below on why.
@@ -178,7 +179,10 @@ tests/make_ios_fixtures.py  captures real server payloads for the Swift tests
 ios/                      the native client; see ios/README.md and
                           docs/ios-handoff.md for what the Windows box
                           could not verify
-docs/                     ios-handoff, split-architecture,
+  notify.py      push: the three things that earn one, APNs via curl
+                 and openssl rather than two large packages
+
+docs/                     ios-handoff, notifications, split-architecture,
                           supvan-t50m-protocol, phone-access,
                           phase2-hardware-checklist, ui-design-prompt
 mplabel.conf.example, systemd/{mplabel,mplabel-web,mplabel-printd}.service
@@ -916,6 +920,39 @@ fold, and both times a screenshot showed it in a second where the
 assertions had nothing to say. Printing and shipping are what an order
 screen is *for*; the label and a correction are repair.
 
+**`date('now')` in SQLite is UTC, and every date in this system is
+local.** A ship-by comes off a Facebook email as a local date and the
+kitchen table is in Eastern; between 7pm and midnight the two disagree,
+so a parcel due tomorrow reads as due now and a label recorded tonight
+is not "today". `notify.due_parcels` and `failed_prints` compare against
+a date computed in Python for that reason. Found by a test that inserted
+with `date('now')` and asserted against `date.today()` - which is the
+same mistake, and is why the fixtures now pass the date in.
+
+**A dry run that calls something which commits is not dry.**
+`mplabel notify --dry-run` first ran the whole decision and then called
+`rollback()`, which did nothing at all: `notify.remember` commits, so the
+notices were already written and the dry run reported that they were not.
+It takes `remember_sent=False` now. A flag, not a transaction - the
+honesty of the thing is the whole feature.
+
+**Push needs two programs, not two packages.** APNs wants HTTP/2 and an
+ES256 JWT; the stdlib has neither and `httpx[http2]` plus `cryptography`
+is a compiler toolchain and about 40MB on this Pi. `notify.py` shells out
+to `curl --http2` and `openssl`, both already on the machine and already
+in this project's own instructions - the same rule that keeps
+`savedpage.py` on stdlib HTMLParser. The cost is that failures are a
+subprocess's, so every call checks its exit status. `openssl` emits DER
+where JOSE wants raw `r||s`, and getting that unpack wrong produces
+`403 InvalidProviderToken` and no other explanation - hence a test
+against a signature openssl actually made.
+
+**A sandbox token is not a bad token.** A build signed with a development
+profile gets a sandbox APNs token, and the production host rejects it
+with `BadDeviceToken` - which reads as malformed rather than as addressed
+to the wrong Apple. The environment is stored with the token and sent by
+the app for exactly that reason.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
@@ -1212,11 +1249,17 @@ was ahead of the app. The label is fetched rather than linked: it needs
 the bearer token and a `Link` cannot carry one, so it would open Safari
 to a 401.
 
-Still missing from the design:
+**Notifications are built**, and that is the design complete.
+`notify.py` decides; the phone only registers. Three things earn one -
+a parcel is due, a label never printed, money has no home - and the
+scope is the point rather than a starting set. See
+`docs/notifications.md` for the Apple-side setup, which cannot be done
+from this repo: an APNs key, a Key ID, a Team ID and the capability on
+the App ID.
 
-- **Notifications**, which needs push and has no backend at all. The
-  design is clear about the scope - a parcel is due, the printer failed,
-  money has no home, and nothing else earns one.
+Note the third trigger is **not** "a print failed". The printer is
+write-only so nothing can know that; what is reported is "recorded and
+never printed", which is the set `mplabel pending` shows.
 
 What is deliberately *not* built: an offline outbox on the phone.
 Uploads go straight up and a failed one keeps its bytes on screen to be

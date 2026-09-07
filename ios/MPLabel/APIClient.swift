@@ -16,6 +16,7 @@
 //    "missing X-Mplabel header".
 
 import Foundation
+import UIKit
 
 actor APIClient {
     static let shared = APIClient()
@@ -263,6 +264,25 @@ actor APIClient {
                 http.statusCode)
         }
         return data
+    }
+
+    /// Ask the Pi to tell this phone things.
+    ///
+    /// The environment travels with the token because a sandbox token is
+    /// meaningless to the production APNs host and vice versa - and the
+    /// rejection reads like a malformed token rather than one addressed
+    /// to the wrong Apple.
+    func registerDevice(token: String, environment: String) async throws {
+        struct Body: Encodable {
+            let token: String
+            let environment: String
+            let label: String
+        }
+        _ = try await send(
+            request("/devices", method: "POST",
+                    body: Body(token: token, environment: environment,
+                               label: UIDevice.current.name)),
+            as: EmptyResponse.self)
     }
 
     // MARK: - the sourcing half
