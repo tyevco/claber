@@ -27,6 +27,7 @@ struct OrderDetailView: View {
     @State private var fixPrice = ""
     @State private var fixShipBy = ""
     @State private var fixNotes = ""
+    @State private var fixPostage = ""
     @State private var label: Data?
     @State private var labelProblem: String?
     @State private var showingLabel = false
@@ -61,12 +62,18 @@ struct OrderDetailView: View {
                         MPRow(label: "Buyer", value: d.buyer ?? "—")
                         if let w = d.weight { MPRow(label: "Weight", value: w) }
                         if let s = d.service { MPRow(label: "Service", value: s) }
+                        MPRow(label: d.postageIsMeasured ? "Postage"
+                                                         : "Postage (est.)",
+                              value: money(d.postage))
+                        MPRow(label: "You keep", value: money(d.kept))
                     }
                 }
 
                 // The address is the one genuinely sensitive thing in
                 // this app, and it is on this screen only - the queue
                 // payload has no such field at all.
+                postageNote(d)
+
                 MPCard {
                     VStack(alignment: .leading, spacing: MP.S.x1) {
                         MPEyebrow("Ships to")
@@ -142,6 +149,32 @@ struct OrderDetailView: View {
         }
         .navigationBarTitleDisplayMode(.inline)
         .task { await load() }
+    }
+
+    /// Says where the number came from, in words.
+    ///
+    /// Postage on a heavy item is routinely the difference between a good
+    /// margin and none, so a figure nobody has checked has to look like
+    /// one - and when there is no figure at all, the screen says that
+    /// rather than showing a confident dash and letting "you keep" read
+    /// as the whole price.
+    private func postageNote(_ d: OrderDetail) -> some View {
+        Group {
+            if d.postage == nil {
+                Text("Nothing knows what the postage cost - the label "
+                     + "email is prepaid and does not carry a charge. Type "
+                     + "it in and this parcel's real margin follows.")
+            } else if !d.postageIsMeasured {
+                Text("That postage is an estimate, worked out from parcels "
+                     + "whose charge you did type in. Correct it when the "
+                     + "real number shows up.")
+            } else {
+                EmptyView()
+            }
+        }
+        .font(.system(size: 11.5))
+        .foregroundStyle(MP.Palette.subtle)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - the label on file
@@ -227,6 +260,8 @@ struct OrderDetailView: View {
                     field("Price", $fixPrice, id: "fix-price",
                           numeric: true)
                     field("Ship by", $fixShipBy, id: "fix-ship-by")
+                    field("Postage", $fixPostage, id: "fix-postage",
+                          numeric: true)
                     field("Note", $fixNotes, id: "fix-notes")
                     MPHoldButton(title: "Hold to correct", enabled: !busy) {
                         applyFix(d)
@@ -262,6 +297,11 @@ struct OrderDetailView: View {
         fixPrice = d.price.map { String(format: "%.2f", $0) } ?? ""
         fixShipBy = d.shipBy ?? ""
         fixNotes = d.notes ?? ""
+        // Only a measured figure is offered back for editing. Prefilling
+        // the estimate would turn accepting the form into confirming a
+        // number nobody checked.
+        fixPostage = d.postageIsMeasured
+            ? (d.postage.map { String(format: "%.2f", $0) } ?? "") : ""
     }
 
     private func applyFix(_ d: OrderDetail) {
@@ -271,7 +311,8 @@ struct OrderDetailView: View {
             do {
                 detail = try await APIClient.shared.correct(
                     order: d.id, item: fixItem, buyer: fixBuyer,
-                    price: fixPrice, shipBy: fixShipBy, notes: fixNotes)
+                    price: fixPrice, shipBy: fixShipBy, notes: fixNotes,
+                    postage: fixPostage)
                 note = "Corrected."
                 fixing = false
                 onChange?()

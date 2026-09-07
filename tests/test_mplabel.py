@@ -7580,3 +7580,118 @@ def test_reading_the_journal_takes_the_lock(tmp_path):
     for t in threads:
         t.join()
     assert seen_short == [], "a reader saw a journal mid-rewrite"
+
+
+# --------------------------------------------------- postage, and its source
+
+
+def test_no_email_carries_the_postage_charge():
+    """The finding this feature was gated on, from the real fixture.
+
+    The label email is a *prepaid* label - Facebook pays the carrier and
+    takes it out of the payout - so the one document this system reliably
+    receives says what the parcel weighs and what service it went by, and
+    not what it cost. Pinned as a test because the temptation is to write
+    a parser for a number that is not there."""
+    raw = (Path(__file__).parent / "fixtures" / "label_email.eml").read_text(
+        errors="replace")
+    assert "prepaid shipping label" in raw
+    assert not re.search(r"postage[^<]{0,40}\$\s*\d", raw, re.I)
+
+
+def test_postage_is_not_estimated_out_of_nothing(db):
+    """A number produced from no observation would be indistinguishable
+    from a measured one a week later - and postage on a heavy item is
+    routinely the difference between a good margin and none."""
+    from mplabel import listings
+
+    guess, source = listings.estimate_postage(db, "11 lb")
+    assert guess is None
+    assert source is None
+
+
+def test_an_estimate_comes_from_what_was_actually_paid(db):
+    """Once a real charge exists, another parcel can be reasoned about -
+    and the answer is still labelled an estimate."""
+    from mplabel import listings
+
+    db.executemany(
+        "INSERT INTO sales (message_id, item, weight, postage, "
+        "postage_source, status) VALUES (?,?,?,?,'confirmed','shipped')",
+        [("<a>", "Light", "2 lb", 8.00),
+         ("<b>", "Heavy", "12 lb", 20.00)])
+    db.commit()
+
+    # Between the two, linear.
+    guess, source = listings.estimate_postage(db, "7 lb")
+    assert source == "estimated"
+    assert guess == pytest.approx(14.0, abs=0.01)
+
+    # Outside them, flat rather than extrapolated off a cliff.
+    assert listings.estimate_postage(db, "40 lb")[0] == 20.00
+    assert listings.estimate_postage(db, "1 lb")[0] == 8.00
+
+
+def test_an_estimate_never_counts_as_confirmed(app):
+    """The trap this issue names: an estimate hardening into a fact."""
+    base, conn = app
+    head = _auth(base)
+    conn.execute(
+        "INSERT INTO sales (message_id, item, price, weight, postage, "
+        "postage_source, status) VALUES ('<known>', 'Lamp', 95.0, '4 lb', "
+        "12.0, 'confirmed', 'shipped')")
+    conn.execute("UPDATE sales SET weight='6 lb' WHERE message_id='<m1>'")
+    conn.commit()
+
+    sid = _json_of(_http(f"{base}/api/v1/orders", headers=head)[2])["orders"][0]["id"]
+    _, _, body = _http(f"{base}/api/v1/orders/{sid}", headers=head)
+    order = _json_of(body)
+    assert order["postage_source"] == "estimated", \
+        "an unmeasured parcel must say so"
+
+    # Typing one makes it measured, and that survives a re-read.
+    _http(f"{base}/api/v1/orders/{sid}/fields", "POST", {"postage": "13.45"},
+          headers=head)
+    _, _, body = _http(f"{base}/api/v1/orders/{sid}", headers=head)
+    order = _json_of(body)
+    assert order["postage"] == 13.45
+    assert order["postage_source"] == "confirmed"
+
+
+def test_clearing_postage_clears_its_provenance(app):
+    """An orphaned 'confirmed' on a null would make the next estimate look
+    as though somebody had checked it."""
+    base, conn = app
+    head = _auth(base)
+    sid = _json_of(_http(f"{base}/api/v1/orders", headers=head)[2])["orders"][0]["id"]
+    _http(f"{base}/api/v1/orders/{sid}/fields", "POST", {"postage": "9.99"},
+          headers=head)
+    _http(f"{base}/api/v1/orders/{sid}/fields", "POST", {"postage": ""},
+          headers=head)
+    row = conn.execute("SELECT postage, postage_source FROM sales WHERE id=?",
+                       (sid,)).fetchone()
+    assert row["postage"] is None
+    assert row["postage_source"] is None
+
+
+def test_what_she_keeps_is_null_when_anything_is_unknown(db):
+    """A missing postage read as zero reports the whole price as kept -
+    the same failure as a missing cost reading as free, and it flatters
+    the numbers in the same direction."""
+    from mplabel import listings
+
+    assert listings.kept(95.0, None) is None
+    assert listings.kept(None, 12.0) is None
+    assert listings.kept(95.0, 12.0) == 83.0
+    assert listings.kept(95.0, 12.0, paid=20.0) == 63.0
+
+
+def test_weight_is_read_the_way_a_label_writes_it():
+    from mplabel import listings
+
+    assert listings.parse_weight("2 lb 3 oz") == pytest.approx(2.188, abs=0.001)
+    assert listings.parse_weight("11 lbs") == 11.0
+    assert listings.parse_weight("16 oz") == 1.0
+    assert listings.parse_weight("3") == 3.0, "a bare number is pounds"
+    assert listings.parse_weight("heavy") is None
+    assert listings.parse_weight(None) is None

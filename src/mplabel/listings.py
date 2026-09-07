@@ -968,3 +968,109 @@ def untriaged(conn, limit=200):
         "WHERE p.listing_id IS NULL AND p.trip_id IS NULL "
         "ORDER BY p.created_at DESC, p.id DESC LIMIT ?", (int(limit),))
     return [dict(r) for r in rows]
+
+
+# ------------------------------------------------------------- postage
+#
+# What a parcel cost to send, and the reason this is careful.
+#
+# **No email carries the charge.** The label email is a *prepaid* label -
+# Facebook pays the carrier and takes it out of the payout - so the one
+# document this system reliably receives says what the parcel weighs and
+# what service it went by, and not what it cost. The payout email is the
+# only plausible carrier and none has ever been seen (see the verified /
+# assumed table). Until one is, every figure here comes from a person.
+#
+# So there is no rate card in this file. Inventing one would produce a
+# number for every parcel, none of them observed, all of them looking
+# exactly like the ones she typed - and postage on a heavy item is
+# routinely the difference between a good margin and none. An estimate is
+# only offered once there is something real to derive it from, and it is
+# labelled for as long as it stays an estimate.
+
+
+def parse_weight(text):
+    """Pounds, from what the label says - "2 lb 3 oz", "11 lbs", "16 oz".
+
+    Returns None rather than a guess. The weight is on the label and the
+    label is verified; a weight this cannot read is a weight nothing
+    should be derived from.
+    """
+    if not text:
+        return None
+    raw = str(text).lower()
+    pounds = re.search(r"([\d.]+)\s*(?:lbs?|pounds?)\b", raw)
+    ounces = re.search(r"([\d.]+)\s*(?:oz|ounces?)\b", raw)
+    total = 0.0
+    if pounds:
+        total += float(pounds.group(1))
+    if ounces:
+        total += float(ounces.group(1)) / 16.0
+    if total:
+        return round(total, 3)
+    bare = re.fullmatch(r"\s*([\d.]+)\s*", raw)
+    # A bare number on a shipping label is pounds; every carrier this
+    # system has seen writes ounces with a unit.
+    return float(bare.group(1)) if bare else None
+
+
+def confirmed_postage(conn):
+    """(pounds, dollars) for every parcel whose postage a person typed."""
+    rows = conn.execute(
+        "SELECT weight, postage FROM sales "
+        "WHERE postage IS NOT NULL AND postage_source = 'confirmed' "
+        "AND weight IS NOT NULL").fetchall()
+    out = []
+    for row in rows:
+        pounds = parse_weight(row["weight"])
+        if pounds:
+            out.append((pounds, float(row["postage"])))
+    return sorted(out)
+
+
+def estimate_postage(conn, weight):
+    """What this one probably cost, from what the others actually did.
+
+    Returns `(dollars, "estimated")`, or `(None, None)` when there is no
+    basis - which is the answer for a database that has never had a real
+    charge typed into it, and it is the right one. A number produced from
+    nothing would be indistinguishable from a measured one a week later.
+
+    Linear between the two nearest confirmed weights, flat outside them.
+    That is a crude model of a rate card and it is meant to be: it exists
+    to be visibly an estimate until she corrects it, not to be right.
+    """
+    pounds = parse_weight(weight)
+    known = confirmed_postage(conn)
+    if pounds is None or not known:
+        return None, None
+    if len(known) == 1:
+        return known[0][1], "estimated"
+
+    below = [k for k in known if k[0] <= pounds]
+    above = [k for k in known if k[0] >= pounds]
+    if not below:
+        return above[0][1], "estimated"
+    if not above:
+        return below[-1][1], "estimated"
+    (w1, p1), (w2, p2) = below[-1], above[0]
+    if w2 == w1:
+        return round((p1 + p2) / 2, 2), "estimated"
+    share = (pounds - w1) / (w2 - w1)
+    return round(p1 + (p2 - p1) * share, 2), "estimated"
+
+
+def kept(price, postage, paid=None):
+    """What the sale actually leaves behind.
+
+    Null in, null out - and deliberately so. A missing postage read as
+    zero reports the whole price as kept, which is the same failure as a
+    missing cost reading as free, and both flatter the numbers in the
+    same direction.
+    """
+    if price is None or postage is None:
+        return None
+    total = float(price) - float(postage)
+    if paid is not None:
+        total -= float(paid)
+    return round(total, 2)
