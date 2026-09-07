@@ -252,6 +252,14 @@ struct AddItemView: View {
                                 thumbnail(photo)
                             }
                             .buttonStyle(.plain)
+                            // On the button, not on the image inside it:
+                            // SwiftUI collapses a button's children into
+                            // one accessibility element, so a label on
+                            // the picture is addressable by nothing.
+                            .accessibilityLabel(
+                                thumbs[photo.id] == nil && thumbsLoaded
+                                ? "photograph missing"
+                                : "photograph")
                         }
                     }
                 }
@@ -275,6 +283,7 @@ struct AddItemView: View {
                             .font(.system(size: 16))
                             .foregroundStyle(MP.Palette.subtle)
                     }
+
                 }
             }
             .frame(width: 64, height: 72)

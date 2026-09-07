@@ -216,33 +216,60 @@ final class FlowTests: XCTestCase {
         app.buttons["Capture"].tap()
         XCTAssertTrue(app.staticTexts["No camera here"]
             .waitForExistence(timeout: 15))
-        app.buttons["Go to triage"].tap()
+        // A candidate with no trip cannot be reconciled against a
+        // receipt later, so the run is asked for rather than inferred -
+        // and until one is picked there is nothing to reconcile against.
+        // The chooser is inline and only appears when there is no run,
+        // which is exactly when she has to answer it.
+        XCTAssertTrue(app.staticTexts["Which shop is this?"]
+            .waitForExistence(timeout: 10))
+        // Waited for, not assumed: the runs are a round trip to the Pi
+        // and the sheet renders before they land.
+        XCTAssertTrue(app.buttons["GOODWILL 214"]
+            .waitForExistence(timeout: 10))
+        app.buttons["GOODWILL 214"].tap()
 
+        // Picking a run pops back to the camera screen, and the tap has
+        // to wait for that rather than race it.
+        let cart = app.buttons["Go to the cart"]
+        XCTAssertTrue(cart.waitForExistence(timeout: 10))
+        var waited = 0
+        while !cart.isEnabled && waited < 10 {
+            sleep(1)
+            waited += 1
+        }
+        cart.tap()
         XCTAssertTrue(app.staticTexts["What did it cost?"]
             .waitForExistence(timeout: 15))
-        // The seeded capture is about nothing yet, so the pile has it.
-        XCTAssertTrue(app.staticTexts["Receipt 1 of 1"].exists)
-        // And the run it might belong to is offered rather than typed.
-        XCTAssertTrue(app.staticTexts["GOODWILL 214"]
+        // Nothing has been read off this run's receipt, and the screen
+        // says so rather than showing an empty list. That path is the
+        // one the old Triage screen used to cover.
+        XCTAssertTrue(app.staticTexts["No receipt yet"]
             .waitForExistence(timeout: 10))
     }
 
-    /// A spinner that never stops is how a row pointing at a file that is
-    /// gone used to present - the same failure `mplabel verify` exists to
-    /// catch for labels. The seeded capture has a row and no file on
-    /// disk, which is exactly that case, so the screen has to say so
-    /// rather than wait for a picture that is never going to arrive.
+    /// A row can outlive its file - the same failure `mplabel verify`
+    /// sweeps the label archive for - and a spinner that never stops is
+    /// how that used to present.
+    ///
+    /// The screen that showed it was Triage, which the in-store flow
+    /// replaced. The behaviour did not go anywhere: the add-item form
+    /// offers the captures as thumbnails, and the seeded one has a row
+    /// and no file on disk. So the assertion moved to where the picture
+    /// is now drawn rather than being deleted with the screen.
     func testAPhotographThatCannotLoadSaysSoRatherThanSpinning() throws {
         let app = try launch()
-        app.buttons["Capture"].tap()
-        XCTAssertTrue(app.staticTexts["No camera here"]
+        app.buttons["Shelf"].tap()
+        XCTAssertTrue(app.staticTexts["Where things are"]
             .waitForExistence(timeout: 15))
-        app.buttons["Go to triage"].tap()
+        app.buttons["Add"].tap()
+        app.buttons["New item"].tap()
+        XCTAssertTrue(app.staticTexts["New item"].waitForExistence(timeout: 10))
+        app.swipeUp()
 
-        XCTAssertTrue(app.staticTexts.containing(
-            NSPredicate(format: "label CONTAINS 'did not load'")
-        ).firstMatch.waitForExistence(timeout: 15),
-        "a missing photo file must be reported, not spun on")
+        XCTAssertTrue(app.buttons["photograph missing"]
+            .waitForExistence(timeout: 15),
+        "a photograph whose file is gone must say so, not spin")
     }
 
     /// Capture took Pending's tab, so the queue's chip is the only way to

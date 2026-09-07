@@ -2084,6 +2084,16 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
                  "WHERE inventory_code='7K2M'")
     conn.commit()
     listings_mod.add_photo(conn, "photos/receipt.jpg", sha256="deadbeef")
+    # And the aisle: a candidate in the cart and a receipt to reconcile
+    # it against, or the proposal payload is empty and sends no keys at
+    # all - which is how this test missed `id` on /lookup once already.
+    from mplabel import shopping as shopping_mod
+
+    conn.executescript(shopping_mod.SCHEMA)
+    shopping_mod.store_receipt(conn, 1, "HOUSEWARES 4.99\nTOTAL 4.99")
+    candidate = shopping_mod.add_candidate(conn, trip_id=1, title="Vase",
+                                           category="Home")
+    shopping_mod.decide(conn, candidate["id"], "carted")
 
     swift = _swift("Models.swift")
     # Only the remapped ones: `case shipBy = "ship_by"`. A key that
@@ -2094,13 +2104,28 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
 
     served = set()
     for path in ("/orders", "/inventory", "/bins", "/pending",
-             "/trips", "/photos"):
+             "/trips", "/photos", "/candidates"):
         _s, _h, body = _http(base + web_mod.API_PREFIX + path, cookie=cookie)
         payload = json.loads(body)
         for rows in payload.values():
             if isinstance(rows, list):
                 for row in rows:
                     served |= set(row)
+    # The proposal nests too, and its envelope keys - carted, item_lines,
+    # unclaimed_lines - are as much a contract as the row keys.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/trips/1/reconcile",
+                         cookie=cookie)
+    proposal = json.loads(body)
+    served |= set(proposal)
+    for row in proposal["proposals"]:
+        served |= set(row)
+    for row in proposal["unclaimed_lines"]:
+        served |= set(row)
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/trips/1/receipt-lines",
+                         cookie=cookie)
+    for row in json.loads(body)["lines"]:
+        served |= set(row)
+
     # A trip's own payload nests: the summary under "trip", the items
     # that came home under "items". Both halves are models here.
     _s, _h, body = _http(base + web_mod.API_PREFIX + "/trips/1", cookie=cookie)
