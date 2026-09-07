@@ -144,6 +144,38 @@ enable or start anything, and the apt and venv steps are idempotent.
 update check by hand that any new key is set. The file beats the built-in
 default.
 
+**The sourcing half needs the installer, not just a pip install.** It
+writes photographs to `<data>/photos/`, and that directory is created by
+`install_pi.sh` so it is owned by the service user rather than by
+whoever happens to upload first. A pull and a `pip install` alone leave
+the routes present and the first upload failing on a directory it cannot
+create. So:
+
+```bash
+cd ~/claber && git pull
+sudo ./install_pi.sh                      # photos/ - not optional
+/opt/mplabel/venv/bin/pip install --force-reinstall --no-deps ~/claber
+sudo systemctl restart mplabel mplabel-web
+```
+
+`mplabel-web` is the unit the phone talks to and it is **installed but
+not enabled** by the installer, like `printd` - `systemctl enable --now
+mplabel-web` is a decision, not a step. Check the deploy landed by
+asking the server rather than by trusting the pull:
+
+```bash
+curl -fsS -X POST localhost:8080/api/login \
+    -H 'Content-Type: application/json' -H 'X-Mplabel: 1' \
+    -d '{"password": "..."}'               # -> {"token": ...}
+curl -fsS localhost:8080/api/v1/trips -H "Authorization: Bearer $TOKEN" \
+    -H 'X-Mplabel: 1'                      # 404 here means old code
+ls -ld ~/marketplace/photos                # must exist, owned by the service user
+```
+
+A 404 on `/api/v1/trips` is the signature of the package having updated
+and the process not having restarted - the same class of failure as the
+version in `pyproject.toml` never moving.
+
 ## Layout
 
 ```
