@@ -80,15 +80,15 @@ final class ScreenshotTests: XCTestCase {
             .waitForExistence(timeout: 15))
         shot("03-capture")
 
-        app.buttons["Go to triage"].tap()
+        _ = app.buttons["GOODWILL 214"].waitForExistence(timeout: 8)
+        shot("04-which-shop")
+        if app.buttons["GOODWILL 214"].exists {
+            app.buttons["GOODWILL 214"].tap()
+        }
+        app.buttons["Go to the cart"].tap()
         XCTAssertTrue(app.staticTexts["What did it cost?"]
             .waitForExistence(timeout: 15))
-        shot("04-triage")
-        if app.staticTexts["GOODWILL 214"].waitForExistence(timeout: 5) {
-            app.staticTexts["GOODWILL 214"].tap()
-            sleep(2)
-            shot("05-triage-run-picked")
-        }
+        shot("05-reconcile")
 
         app.buttons["Shelf"].tap()
         XCTAssertTrue(app.staticTexts["Where things are"]

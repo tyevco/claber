@@ -234,6 +234,8 @@ ios/                      the native client; see ios/README.md and
                           could not verify
   notify.py      push: the three things that earn one, APNs via curl
                  and openssl rather than two large packages
+  shopping.py    the aisle: candidates, the receipt read as lines, and a
+                 proposal that never writes a cost by itself
 
 docs/                     ios-handoff, ios-release, notifications,
                           split-architecture, supvan-t50m-protocol,
@@ -1112,6 +1114,23 @@ exercised. On a real phone `registerForRemoteNotifications` then fails
 with "no valid aps-environment entitlement string found", which reads
 as a provisioning problem and is a missing key. The properties live in
 `project.yml` now, where the generator can see them.
+
+**A presentation dies when the state under it changes.** The run
+chooser was a sheet and then a pushed screen, and both closed themselves:
+the runs arrive from the Pi *after* the screen is up, the parent
+re-renders when they land, and the presentation goes with it. It is
+inline now - no presentation to lose, and it only appears when there is
+no run, which is exactly when the question needs answering. Note the
+symptom is not an error: the screen simply is not there, and a test
+looking for something on it reports that the thing is missing rather
+than that the screen went.
+
+**A cancelled load looks exactly like an empty one.** `runs = (try?
+await trips()) ?? []` turned a cancelled request - the camera check
+flipping the view out from under it - into "no runs yet", which is the
+opposite advice. `CancellationError` is now distinguished from a real
+failure, and a real failure is shown on the screen it happened on rather
+than behind whatever is covering it.
 
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that

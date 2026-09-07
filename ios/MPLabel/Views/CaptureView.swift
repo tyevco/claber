@@ -7,7 +7,7 @@
 //  That ordering is the design's and it is the right way round. What she
 //  is holding - a paper receipt, a thing on a shelf - stops being
 //  available the moment she walks out; the attribution can be done at
-//  the kitchen table and is what TriageView is for. A form first would
+//  the kitchen table and is what ReconcileView is for. A form first would
 //  trade the irrecoverable half for the recoverable one.
 //
 //  Uploads go straight up rather than into a queue on the phone. The
@@ -41,6 +41,14 @@ struct CaptureView: View {
         var photo: Photo?
         var failure: String?
         var sending: Bool
+        /// What the phone made of it, and what she decided. The analysis
+        /// runs on every shot without being asked: she is holding a cart
+        /// and the answer wants to be there by the time she looks down,
+        /// not one tap later.
+        var suggested: OnDevice.Suggested?
+        var thinking = false
+        var candidate: Candidate?
+        var decision: String?
 
         var done: Bool { photo != nil }
     }
@@ -50,6 +58,13 @@ struct CaptureView: View {
     @State private var waiting = 0
     @State private var error: String?
     @State private var showingTriage = false
+    /// The run these belong to. A candidate with no trip cannot be
+    /// reconciled against a receipt later, so this is asked for once at
+    /// the start rather than inferred - "which shop is this" is a
+    /// question she can answer in the car park and nothing else can.
+    @State private var run: Trip?
+    @State private var runs: [Trip] = []
+    @State private var newStore = ""
 
     var body: some View {
         NavigationStack {
@@ -58,27 +73,113 @@ struct CaptureView: View {
                 case .checking:   ProgressView().task { await check() }
                 case .granted:    camera
                 case .denied:     denied
-                case .unsupported: unsupported
+                case .unsupported:
+                    // The chooser belongs here too. A phone with no
+                    // camera can still reconcile a run, and the
+                    // simulator is exactly that phone - so a chooser
+                    // that lives only in the viewfinder is unreachable
+                    // on the one device the tests run on.
+                    VStack(spacing: MP.S.x3) {
+                        unsupported
+                        if run == nil { runChooser }
+                    }
                 }
             }
-            .navigationTitle("Capture")
+            .navigationTitle(run?.store ?? "Capture")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showingTriage = true } label: {
-                        Text(waiting > 0 ? "\(waiting) to triage" : "Triage")
+                        Text(waiting > 0 ? "\(waiting) in the cart"
+                                         : "Reconcile")
                     }
-                    .disabled(waiting == 0)
+                    // Only with a run to reconcile *against*. The receipt
+                    // and the cart have to be the same shop trip or
+                    // there is nothing to lay side by side.
+                    .disabled(run == nil)
                 }
             }
             .navigationDestination(isPresented: $showingTriage) {
-                TriageView()
+                if let run { ReconcileView(trip: run) }
             }
-            .task { await countWaiting() }
+            .task { await loadRuns() }
         }
     }
 
     // MARK: - the states
+
+    /// Which shop, asked once.
+    ///
+    /// A candidate with no trip cannot be reconciled against a receipt
+    /// later, and nothing can infer the shop from a photograph of a
+    /// vase. Today's runs are offered first because the common case is
+    /// walking back in after putting a box in the car.
+    /// Which shop, inline.
+    ///
+    /// This was a sheet and then a pushed screen, and both fought the
+    /// state it depends on: the runs arrive from the Pi *after* the
+    /// screen is up, the parent re-renders when they land, and the
+    /// presentation went with it. Inline has no presentation to lose -
+    /// and it only appears when there is no run, which is exactly when
+    /// she needs to answer the question.
+    private var runChooser: some View {
+        VStack(alignment: .leading, spacing: MP.S.x2) {
+            Text("Which shop is this?")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(MP.Palette.fg)
+            Text("A run is a shop and a day. Everything photographed "
+                 + "attaches to it, and the receipt is reconciled against "
+                 + "it later.")
+                .font(.system(size: 11.5))
+                .foregroundStyle(MP.Palette.muted)
+            if let error { MPError(message: error) }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: MP.S.x2) {
+                    ForEach(runs) { trip in
+                        Button {
+                            run = trip
+                            Task { await countWaiting() }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(trip.store)
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text(trip.occurredAt ?? "—")
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(MP.Palette.muted)
+                            }
+                            .padding(.horizontal, MP.S.x3)
+                            .padding(.vertical, MP.S.x2)
+                            .background(MP.Palette.raised,
+                                        in: RoundedRectangle(
+                                            cornerRadius: MP.R.chip))
+                        }
+                        .buttonStyle(.plain)
+                        // Named, because SwiftUI collapses a button's
+                        // children into one element and the shop's name
+                        // is then addressable by nothing - which is how
+                        // a person finds this row too.
+                        .accessibilityLabel(trip.store)
+                    }
+                }
+            }
+            HStack(spacing: MP.S.x2) {
+                TextField("A new shop", text: $newStore)
+                    .font(.system(size: 14))
+                    .textInputAutocapitalization(.characters)
+                    .accessibilityIdentifier("run-store")
+                Button("Start") { startRun() }
+                    .font(.system(size: 13, weight: .semibold))
+                    .disabled(newStore.trimmingCharacters(
+                        in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(MP.S.x3)
+        .background(MP.Palette.bg,
+                    in: RoundedRectangle(cornerRadius: MP.R.card))
+        .padding(.horizontal, MP.S.x3)
+        .task { await loadRuns() }
+    }
 
     private var camera: some View {
         ZStack(alignment: .bottom) {
@@ -87,7 +188,24 @@ struct CaptureView: View {
 
             VStack(spacing: MP.S.x2) {
                 if let error { MPError(message: error) }
+                // The most recent undecided shot, with what the phone
+                // made of it. One at a time: she is looking at the
+                // object, not at a list, and the decision is about the
+                // thing in her hands.
+                if let pending = shots.last(where: { $0.decision == nil }) {
+                    decisionCard(pending)
+                }
                 if !shots.isEmpty { strip }
+                if run == nil {
+                    runChooser
+                } else if let run {
+                    Text("Run: " + run.store)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(.horizontal, MP.S.x3)
+                        .padding(.vertical, MP.S.x1)
+                        .background(.black.opacity(0.45), in: Capsule())
+                }
                 shutter
             }
             .padding(.bottom, MP.S.x3)
@@ -141,6 +259,64 @@ struct CaptureView: View {
         .overlay(RoundedRectangle(cornerRadius: MP.R.sm)
             .stroke(shot.failure != nil ? MP.Palette.alert : .clear,
                     lineWidth: 1.5))
+    }
+
+    /// Cart it or put it back, with whatever the phone worked out.
+    ///
+    /// The analysis is a starting point and says so - it is wrong often
+    /// enough that presenting it as a finding would train her to ignore
+    /// it. What matters is the decision, which is hers and takes one
+    /// tap either way.
+    private func decisionCard(_ shot: Shot) -> some View {
+        VStack(alignment: .leading, spacing: MP.S.x2) {
+            if shot.thinking {
+                HStack(spacing: MP.S.x2) {
+                    ProgressView().scaleEffect(0.7)
+                    Text("Looking at it…")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.white.opacity(0.9))
+                }
+            } else if let s = shot.suggested {
+                Text(s.title.isEmpty ? "Not sure what this is" : s.title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                let detail = [s.era, s.condition]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " · ")
+                if !detail.isEmpty {
+                    Text(detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.8))
+                        .lineLimit(2)
+                }
+            }
+            HStack(spacing: MP.S.x2) {
+                Button { decide(shot, "passed") } label: {
+                    Text("Put it back")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, MP.S.x3)
+                        .background(.white.opacity(0.15),
+                                    in: RoundedRectangle(cornerRadius: MP.R.chip))
+                        .foregroundStyle(.white)
+                }
+                Button { decide(shot, "carted") } label: {
+                    Text("In the cart")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, MP.S.x3)
+                        .background(MP.Palette.accent,
+                                    in: RoundedRectangle(cornerRadius: MP.R.chip))
+                        .foregroundStyle(MP.Palette.accentInk)
+                }
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(MP.S.x3)
+        .background(.black.opacity(0.55),
+                    in: RoundedRectangle(cornerRadius: MP.R.card))
+        .padding(.horizontal, MP.S.x3)
     }
 
     private var shutter: some View {
@@ -201,7 +377,8 @@ struct CaptureView: View {
             Text("Photographs need a real device. The triage queue still "
                  + "works - anything already captured is waiting in it.")
         } actions: {
-            Button("Go to triage") { showingTriage = true }
+            Button("Go to the cart") { showingTriage = true }
+                .disabled(run == nil)
         }
     }
 
@@ -227,8 +404,102 @@ struct CaptureView: View {
         #endif
     }
 
+    /// How many things are in the cart for this run - which is what the
+    /// reconcile screen is about. Was the untriaged photo pile, which
+    /// counted receipts as things to attribute and was the wrong number
+    /// for this flow.
     private func countWaiting() async {
-        waiting = (try? await APIClient.shared.untriaged().count) ?? 0
+        guard let run else { waiting = 0; return }
+        waiting = (try? await APIClient.shared.candidates(
+            trip: run.id, decision: "carted").count) ?? 0
+    }
+
+    private func loadRuns() async {
+        // Not `try?`. A swallowed failure here is indistinguishable from
+        // "no runs yet", and the two want opposite responses from her -
+        // one is a shop to type in, the other is a Pi that is not
+        // answering. This was exactly that bug: the load was being
+        // cancelled when `check()` flipped the screen out from under it,
+        // and the sheet said there were no runs.
+        do {
+            runs = try await APIClient.shared.trips()
+            error = nil
+        } catch is CancellationError {
+            return                      // the view moved on; not a failure
+        } catch {
+            self.error = error.localizedDescription
+            return
+        }
+        // Today's, if there is one - walking back in after putting a box
+        // in the car is the common case, and asking again would be a
+        // second run for one shop.
+        let today = ISO8601DateFormatter()
+        today.formatOptions = [.withFullDate]
+        let stamp = today.string(from: Date())
+        run = run ?? runs.first { $0.occurredAt == stamp }
+        await countWaiting()
+    }
+
+    private func startRun() {
+        let store = newStore.trimmingCharacters(in: .whitespaces)
+        Task {
+            do {
+                let made = try await APIClient.shared.makeTrip(store: store)
+                run = made
+                runs.insert(made, at: 0)
+                newStore = ""
+                await countWaiting()
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    /// Runs on every shot, without being asked.
+    ///
+    /// She is holding a cart and the answer wants to be there by the time
+    /// she looks down. The cost is a model run on things she immediately
+    /// puts back - which is most of them, and is the right trade: the
+    /// analysis is worth most exactly when she has not decided yet.
+    private func analyse(_ shot: Shot) {
+        guard #available(iOS 27.0, *), OnDevice.readiness.canGenerate,
+              let cg = UIImage(data: shot.data)?.cgImage else { return }
+        update(shot) { $0.thinking = true }
+        Task {
+            let found = try? await OnDevice.suggestions(from: cg)
+            update(shot) {
+                $0.suggested = found
+                $0.thinking = false
+            }
+        }
+    }
+
+    private func decide(_ shot: Shot, _ decision: String) {
+        update(shot) { $0.decision = decision }
+        Task {
+            do {
+                // The candidate is created at the moment of the
+                // decision, not at the moment of the photograph: what
+                // makes it worth a row is that she looked at it and said
+                // something, and a shot she never decided about is just
+                // a picture.
+                let made = try await APIClient.shared.addCandidate(
+                    trip: run?.id, photo: shot.photo?.id,
+                    title: shot.suggested?.title,
+                    era: shot.suggested?.era,
+                    condition: shot.suggested?.condition,
+                    category: shot.suggested?.category)
+                try await APIClient.shared.decide(candidate: made.id,
+                                                  decision)
+                update(shot) { $0.candidate = made }
+            } catch {
+                // Put the decision back so she can try again - a failed
+                // one that looked accepted is a thing in the cart the
+                // reconcile screen will never mention.
+                update(shot) { $0.decision = nil }
+                self.error = error.localizedDescription
+            }
+        }
     }
 
     private func keep(_ data: Data) {
@@ -248,9 +519,11 @@ struct CaptureView: View {
     }
 
     private func send(_ shot: Shot) {
+        analyse(shot)
         Task {
             do {
-                let photo = try await APIClient.shared.uploadPhoto(shot.data)
+                let photo = try await APIClient.shared.uploadPhoto(
+                    shot.data, trip: run?.id)
                 update(shot) { $0.photo = photo; $0.sending = false }
                 await countWaiting()
             } catch {
