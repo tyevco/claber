@@ -8316,3 +8316,51 @@ def test_a_curl_without_http2_is_named(tmp_path, monkeypatch):
     ok, detail = notify.send_one({"apns_topic": "x"}, "a" * 64, "t", "b")
     assert not ok
     assert "HTTP/1.1" in detail, "say which protocol was actually spoken"
+def test_a_shared_category_is_not_a_comparison(db):
+    """From the first real trip: nearly everything she sells is "Home",
+    so matching on category alone put a tumbler, a cabinet and a doorway
+    in one another's comparables - "6 like it sold for $5.00-$235.00",
+    a range so wide it is worse than nothing because it looks like
+    evidence."""
+    from mplabel import listings
+
+    _sold(db, "Wooden cabinet", "Home", 235.0)
+    _sold(db, "Gray tumbler", "Home", 5.0)
+    _sold(db, "Hobnail milk glass vase", "Home", 30.0)
+
+    # A title with nothing in common gets nothing, however many "Home"
+    # rows are sitting there.
+    assert listings.comparables(db, category="Home",
+                                title="Brass candlestick") == []
+
+    # A shared word is a comparison.
+    found = listings.comparables(db, category="Home", title="Glass vase")
+    assert [row["title"] for row in found] == ["Hobnail milk glass vase"]
+
+
+def test_a_wide_range_says_so(db):
+    """Ten dollars to two hundred is not a price. The screen has to be
+    able to say the comparables disagree rather than show a range as
+    though it were guidance."""
+    from mplabel import listings
+
+    _sold(db, "Oak table small", "Home", 20.0)
+    _sold(db, "Oak table large", "Home", 220.0)
+    out = listings.worth(db, category="Home", title="Oak table")
+    assert out["comparables"] == 2
+    assert out["wide"] is True
+
+    _sold(db, "Pine shelf one", "Home", 30.0)
+    _sold(db, "Pine shelf two", "Home", 40.0)
+    tight = listings.worth(db, category="Home", title="Pine shelf")
+    assert tight["wide"] is False
+
+
+def test_with_no_title_the_category_still_helps(db):
+    """The model does not always offer a title. Then a category is all
+    there is, and it is better than refusing to look."""
+    from mplabel import listings
+
+    _sold(db, "Wooden cabinet", "Home", 60.0)
+    found = listings.comparables(db, category="Home", title=None)
+    assert len(found) == 1

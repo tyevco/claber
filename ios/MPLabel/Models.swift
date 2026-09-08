@@ -577,6 +577,10 @@ struct Worth: Codable, Hashable {
     let comparables: Int
     let low: Double?
     let high: Double?
+    /// The comparables disagree badly - the top is more than three times
+    /// the bottom. Ten dollars to two hundred is not a price, and saying
+    /// so is better than showing it as though it were guidance.
+    let wide: Bool?
     let median: Double?
     let typicalDays: Int?
     let usualMargin: Double?
@@ -589,7 +593,7 @@ struct Worth: Codable, Hashable {
     var hasEvidence: Bool { comparables > 0 }
 
     enum CodingKeys: String, CodingKey {
-        case comparables, low, high, median, examples
+        case comparables, low, high, median, examples, wide
         case typicalDays = "typical_days"
         case usualMargin = "usual_margin"
         case payUnder = "pay_under"

@@ -283,7 +283,7 @@ final class KeychainTests: XCTestCase {
     /// added to, averaged with, or shown as the same figure.
     func testWorthCarriesNoGuess() {
         let fields = Mirror(reflecting: Worth(
-            comparables: 0, low: nil, high: nil, median: nil,
+            comparables: 0, low: nil, high: nil, wide: nil, median: nil,
             typicalDays: nil, usualMargin: nil, payUnder: nil,
             examples: [])).children.compactMap(\.label)
         XCTAssertFalse(fields.contains("estimate"),
@@ -295,14 +295,14 @@ final class KeychainTests: XCTestCase {
     /// holding a $40 lamp is worth more than a number from nowhere,
     /// because she will act on the number.
     func testNoComparablesIsAnAnswer() {
-        let empty = Worth(comparables: 0, low: nil, high: nil, median: nil,
-                          typicalDays: nil, usualMargin: nil,
+        let empty = Worth(comparables: 0, low: nil, high: nil, wide: nil,
+                          median: nil, typicalDays: nil, usualMargin: nil,
                           payUnder: nil, examples: [])
         XCTAssertFalse(empty.hasEvidence)
 
-        let some = Worth(comparables: 2, low: 28, high: 34, median: 31,
-                         typicalDays: 12, usualMargin: 0.6, payUnder: 12.4,
-                         examples: [])
+        let some = Worth(comparables: 2, low: 28, high: 34, wide: false,
+                         median: 31, typicalDays: 12, usualMargin: 0.6,
+                         payUnder: 12.4, examples: [])
         XCTAssertTrue(some.hasEvidence)
     }
 
