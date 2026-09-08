@@ -198,24 +198,60 @@ def send_one(cfg, device_token, title, body, thread=None, sender=None):
 
     jwt = provider_token(cfg)
     url = f"https://{_host(cfg)}/3/device/{device_token}"
-    try:
-        done = subprocess.run(
-            ["curl", "--http2", "--silent", "--show-error",
-             "--write-out", "\n%{http_code}",
-             "--header", f"authorization: bearer {jwt}",
-             "--header", f"apns-topic: {topic}",
-             "--header", "apns-push-type: alert",
-             "--data", json.dumps(payload), url],
-            capture_output=True, check=False, timeout=20)
-    except FileNotFoundError:
-        raise NotifyError("curl is not installed, and APNs needs HTTP/2")
-    except subprocess.TimeoutExpired:
-        return False, "APNs did not answer in 20s"
 
-    out = done.stdout.decode().strip().rsplit("\n", 1)
-    status = out[-1] if out else ""
-    detail = out[0] if len(out) > 1 else done.stderr.decode().strip()
-    return status == "200", detail or status
+    # Apple documents 5xx as retryable and means it: a single
+    # InternalServerError says nothing about the request. One retry
+    # distinguishes "Apple had a moment" from "this will never work",
+    # which is the whole question when a notification does not arrive.
+    attempts = 2
+    for attempt in range(attempts):
+        try:
+            done = subprocess.run(
+                ["curl", "--http2", "--silent", "--show-error",
+                 # The version matters: APNs requires HTTP/2, and a curl
+                 # built without it falls back rather than saying so.
+                 "--write-out", "\n%{http_code} %{http_version}",
+                 "--dump-header", "-",
+                 "--header", "content-type: application/json",
+                 "--header", f"authorization: bearer {jwt}",
+                 "--header", f"apns-topic: {topic}",
+                 "--header", "apns-push-type: alert",
+                 "--data", json.dumps(payload), url],
+                capture_output=True, check=False, timeout=20)
+        except FileNotFoundError:
+            raise NotifyError("curl is not installed, and APNs needs HTTP/2")
+        except subprocess.TimeoutExpired:
+            return False, "APNs did not answer in 20s"
+
+        raw = done.stdout.decode(errors="replace").strip()
+        tail = raw.rsplit("\n", 1)[-1].split()
+        status = tail[0] if tail else ""
+        version = tail[1] if len(tail) > 1 else "?"
+        headers, _, body = raw.rpartition("\r\n\r\n")
+        body = body.rsplit("\n", 1)[0].strip()
+        apns_id = ""
+        for line in headers.splitlines():
+            if line.lower().startswith("apns-id:"):
+                apns_id = line.split(":", 1)[1].strip()
+
+        if status == "200":
+            return True, f"apns-id {apns_id}" if apns_id else "sent"
+        if status.startswith("5") and attempt + 1 < attempts:
+            time.sleep(1.0)
+            continue
+
+        detail = body or done.stderr.decode(errors="replace").strip() or status
+        extra = []
+        if version != "2":
+            # The likeliest cause of an unclassifiable refusal: APNs
+            # requires HTTP/2 and this curl did not speak it.
+            extra.append(f"HTTP/{version}, not HTTP/2")
+        if apns_id:
+            extra.append(f"apns-id {apns_id}")
+        if extra:
+            detail += " (" + ", ".join(extra) + ")"
+        return False, f"{status}: {detail}"
+    return False, "APNs kept failing"
 
 
 def devices(conn):

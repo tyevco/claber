@@ -1763,6 +1763,70 @@ def cmd_notify(cfg, conn, args):
         recorded.append((alert["title"], alert["body"]))
         return True, "dry run"
 
+    if getattr(args, "check", False):
+        # Separates "our request is wrong" from "Apple is unhappy", which
+        # a refusal cannot do on its own: APNs answers an unclassifiable
+        # request with InternalServerError and says no more.
+        import base64 as _b64
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        conn.executescript(notify_mod.SCHEMA)
+        conn.commit()
+        print(f"host        : {notify_mod._host(cfg)}")
+        print(f"topic       : {cfg.get('apns_topic') or '(unset)'}")
+        print(f"environment : {cfg.get('apns_environment') or 'production'}")
+
+        key_path = cfg.get("apns_key_path") or ""
+        if key_path and os.path.exists(key_path):
+            mode = oct(os.stat(key_path).st_mode & 0o777)
+            print(f"key         : {key_path} ({mode})")
+        else:
+            print(f"key         : {key_path or '(unset)'} - NOT FOUND")
+
+        curl = _shutil.which("curl")
+        print(f"curl        : {curl or 'MISSING'}")
+        if curl:
+            version = _subprocess.run([curl, "--version"],
+                                      capture_output=True)
+            has_h2 = b"HTTP2" in version.stdout or b"nghttp2" in version.stdout
+            print(f"              HTTP/2 support: "
+                  + ("yes" if has_h2 else "NO - APNs requires it"))
+        print(f"openssl     : {_shutil.which('openssl') or 'MISSING'}")
+
+        try:
+            token = notify_mod.provider_token(cfg, now=time.time())
+        except notify_mod.NotifyError as exc:
+            print(f"jwt         : cannot be signed - {exc}", file=sys.stderr)
+            return 78
+        head, payload, signature = token.split(".")
+
+        def unpad(part):
+            return _b64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+        print(f"jwt header  : {unpad(head).decode()}")
+        print(f"jwt payload : {unpad(payload).decode()}")
+        # 64 bytes is the whole of an ES256 signature; anything else
+        # means the DER unpack is wrong and Apple will refuse it without
+        # explaining which part it disliked.
+        print(f"jwt sig     : {len(unpad(signature))} bytes "
+              + ("(correct for ES256)" if len(unpad(signature)) == 64
+                 else "- WRONG, ES256 is 64"))
+
+        devices = notify_mod.devices(conn)
+        print(f"devices     : {len(devices)}")
+        for device in devices:
+            print(f"              {device['token'][:8]}... "
+                  f"({device['environment']}, {len(device['token'])} chars)")
+            if len(device["token"]) != 64:
+                print("              ^ an APNs token is 64 hex characters",
+                      file=sys.stderr)
+            if device["environment"] != (cfg.get("apns_environment")
+                                         or "production"):
+                print("              ^ registered against a different "
+                      "environment than apns_environment", file=sys.stderr)
+        return 0
+
     if getattr(args, "test", False):
         # The equivalent of `selftest` for the printer: nothing else here
         # can prove the path works, because every real trigger waits on
@@ -2322,6 +2386,9 @@ def _main():
     p.add_argument("--test", action="store_true",
                    help="send one deliberate notification to every "
                         "registered device and report what Apple said")
+    p.add_argument("--check", action="store_true",
+                   help="check the push configuration and the JWT this "
+                        "would sign, and send nothing")
     p = sub.add_parser("printd", help="run the print service")
     p.add_argument("--bind")
     p.add_argument("--port", type=int)

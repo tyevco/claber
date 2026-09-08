@@ -8251,3 +8251,68 @@ def test_worth_needs_authentication(app):
     base, _ = app
     status, _, _ = _http(f"{base}/api/v1/worth?category=Home")
     assert status == 401
+
+
+def _curl_reply(status, body="", version="2", apns_id="ABC-123"):
+    """What curl writes when it has spoken to APNs."""
+    import subprocess as _sp
+
+    headers = f"HTTP/2 {status}\r\napns-id: {apns_id}\r\n\r\n"
+    out = f"{headers}{body}\n{status} {version}".encode()
+    return _sp.CompletedProcess(args=[], returncode=0, stdout=out, stderr=b"")
+
+
+def test_apns_five_hundred_is_retried_once(tmp_path, monkeypatch):
+    """Apple documents 5xx as retryable and means it. A single
+    InternalServerError says nothing about the request, and one retry is
+    what separates "Apple had a moment" from "this will never work" -
+    which is the whole question when a notification does not arrive."""
+    import subprocess
+
+    from mplabel import notify
+
+    monkeypatch.setattr(notify, "provider_token", lambda cfg: "jwt")
+    calls = []
+
+    def flaky(args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            return _curl_reply(500, '{"reason":"InternalServerError"}')
+        return _curl_reply(200)
+
+    monkeypatch.setattr(subprocess, "run", flaky)
+    ok, detail = notify.send_one({"apns_topic": "x"}, "a" * 64, "t", "b")
+    assert ok, detail
+    assert len(calls) == 2, "the first 500 should have been retried"
+    assert "ABC-123" in detail, "the apns-id is what Apple can be asked about"
+
+
+def test_a_refusal_says_the_status_and_what_apple_said(tmp_path, monkeypatch):
+    import subprocess
+
+    from mplabel import notify
+
+    monkeypatch.setattr(notify, "provider_token", lambda cfg: "jwt")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda args, **kw: _curl_reply(400, '{"reason":"BadDeviceToken"}'))
+    ok, detail = notify.send_one({"apns_topic": "x"}, "a" * 64, "t", "b")
+    assert not ok
+    assert "400" in detail and "BadDeviceToken" in detail
+
+
+def test_a_curl_without_http2_is_named(tmp_path, monkeypatch):
+    """APNs requires HTTP/2 and a curl built without it falls back rather
+    than saying so - which arrives as a refusal Apple cannot classify."""
+    import subprocess
+
+    from mplabel import notify
+
+    monkeypatch.setattr(notify, "provider_token", lambda cfg: "jwt")
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda args, **kw: _curl_reply(400, '{"reason":"BadRequest"}',
+                                       version="1.1"))
+    ok, detail = notify.send_one({"apns_topic": "x"}, "a" * 64, "t", "b")
+    assert not ok
+    assert "HTTP/1.1" in detail, "say which protocol was actually spoken"
