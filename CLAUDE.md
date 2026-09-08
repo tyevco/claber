@@ -1210,6 +1210,26 @@ because there was no way to do the first. Tapping the run now offers
 leaving, switching shop, or carrying on, and says what is in the cart and
 what is still undecided before she goes.
 
+**A capture session started once is a camera that works once.**
+`startRunning` was in `viewDidLoad` and `stopRunning` in
+`viewDidDisappear`, so the first trip to Reconcile or to another tab
+killed the preview for the rest of the launch: a black rectangle and a
+shutter that did nothing. It starts in `viewWillAppear` now, which is
+idempotent and is what makes stopping on disappear safe.
+
+The camera is also *taken away* - a phone call, another app, Control
+Centre - and `AVCaptureSession` says so through
+`wasInterrupted`/`interruptionEnded`/`runtimeError`, none of which were
+observed. All three are now, and the screen says "the camera has
+stopped" with a button rather than showing black, because a stopped
+preview is indistinguishable from a dark room until she presses the
+shutter and nothing happens.
+
+Neither half is reachable from the simulator, which has no camera at
+all: every UI test passes with the session in any state. This came from
+the phone, twice - "the viewfinder is black" and then "the camera
+stopped responding".
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on
