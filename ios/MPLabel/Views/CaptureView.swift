@@ -80,6 +80,12 @@ struct CaptureView: View {
     /// be able to go back to the first.
     @State private var selected: UUID?
     @State private var leaving = false
+    /// Whether the preview is live. Starts false and the camera says so
+    /// when it comes up, so this is not a guess about the hardware.
+    @State private var running = false
+    /// Bumped to ask the controller to try again - a value change is how
+    /// a `UIViewControllerRepresentable` is told anything.
+    @State private var restarts = 0
     @State private var run: Trip?
     @State private var runs: [Trip] = []
     @State private var newStore = ""
@@ -240,8 +246,31 @@ struct CaptureView: View {
 
     private var camera: some View {
         ZStack(alignment: .bottom) {
-            CameraStill(onCapture: keep, onFailure: { error = $0 })
+            CameraStill(onCapture: keep, onFailure: { error = $0 },
+                        onRunning: { running = $0 }, restartToken: restarts)
                 .ignoresSafeArea()
+
+            // A stopped preview is a black rectangle, which looks like a
+            // dark room until she presses the shutter and nothing
+            // happens. Say it, and give her the one thing that fixes it.
+            if !running {
+                VStack(spacing: MP.S.x2) {
+                    Image(systemName: "video.slash")
+                        .font(.system(size: 24))
+                    Text("The camera has stopped")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("It gives way to phone calls and other apps, and "
+                         + "does not always come back on its own.")
+                        .font(.system(size: 12))
+                        .multilineTextAlignment(.center)
+                    Button("Start it again") { restarts += 1 }
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                .foregroundStyle(.white)
+                .padding(MP.S.x4)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.black.opacity(0.7))
+            }
 
             VStack(spacing: MP.S.x2) {
                 if let error { MPError(message: error) }
@@ -747,25 +776,41 @@ extension Notification.Name {
 struct CameraStill: UIViewControllerRepresentable {
     let onCapture: (Data) -> Void
     let onFailure: (String) -> Void
+    /// Whether the session is actually running. A preview that has
+    /// stopped is a black rectangle, which is indistinguishable from a
+    /// dark room until she presses the shutter and nothing happens.
+    let onRunning: (Bool) -> Void
+    var restartToken: Int = 0
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onCapture: onCapture, onFailure: onFailure)
+        Coordinator(onCapture: onCapture, onFailure: onFailure,
+                    onRunning: onRunning)
     }
 
     func makeUIViewController(context: Context) -> CameraController {
         CameraController(coordinator: context.coordinator)
     }
 
-    func updateUIViewController(_ vc: CameraController, context: Context) {}
+    func updateUIViewController(_ vc: CameraController, context: Context) {
+        // The only channel SwiftUI has into a controller it already made.
+        if restartToken != context.coordinator.lastRestart {
+            context.coordinator.lastRestart = restartToken
+            vc.restartNow()
+        }
+    }
 
     final class Coordinator: NSObject, AVCapturePhotoCaptureDelegate {
         let onCapture: (Data) -> Void
         let onFailure: (String) -> Void
+        let onRunning: (Bool) -> Void
+        var lastRestart = 0
 
         init(onCapture: @escaping (Data) -> Void,
-             onFailure: @escaping (String) -> Void) {
+             onFailure: @escaping (String) -> Void,
+             onRunning: @escaping (Bool) -> Void) {
             self.onCapture = onCapture
             self.onFailure = onFailure
+            self.onRunning = onRunning
         }
 
         func photoOutput(_ output: AVCapturePhotoOutput,
@@ -789,6 +834,9 @@ final class CameraController: UIViewController {
     private let output = AVCapturePhotoOutput()
     private let coordinator: CameraStill.Coordinator
     private var observer: NSObjectProtocol?
+    /// Nil when the camera could not be opened at all, which is a
+    /// different thing from a session that is merely not running.
+    private var input: AVCaptureDeviceInput?
 
     init(coordinator: CameraStill.Coordinator) {
         self.coordinator = coordinator
@@ -811,6 +859,7 @@ final class CameraController: UIViewController {
             return
         }
         session.addInput(input)
+        self.input = input
         session.addOutput(output)
         // After the output is on the session and before the commit: set
         // earlier it is not yet attached to anything, and a request that
@@ -829,9 +878,33 @@ final class CameraController: UIViewController {
                 self?.shoot()
             }
 
-        // Off the main thread: starting a capture session blocks, and on
-        // a phone that is a visible stall on the screen she just opened.
-        Task.detached { [session] in session.startRunning() }
+        // The camera can be taken away and given back, and both have to
+        // be noticed. A phone call, another app, Control Centre, or the
+        // system deciding the session must stop - each of these leaves a
+        // preview that is black and a shutter that does nothing, and
+        // none of them says so.
+        let centre = NotificationCenter.default
+        for (name, handler) in [
+            (AVCaptureSession.runtimeErrorNotification, #selector(restart)),
+            (AVCaptureSession.wasInterruptedNotification, #selector(stopped)),
+            (AVCaptureSession.interruptionEndedNotification,
+             #selector(restart)),
+        ] {
+            centre.addObserver(self, selector: handler, name: name,
+                               object: session)
+        }
+
+        start()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // **The fix for a camera that stopped responding.** The session
+        // was started once, in `viewDidLoad`, and stopped every time
+        // this screen went away - so the first trip to Reconcile or to
+        // another tab killed the preview for the rest of the session,
+        // leaving a black rectangle and a shutter that did nothing.
+        start()
     }
 
     override func viewDidLayoutSubviews() {
@@ -843,13 +916,39 @@ final class CameraController: UIViewController {
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
-        // A running camera in the background is a battery and a privacy
-        // light for no reason.
+        // A running camera in the background is a battery drain and a
+        // privacy light for no reason. Safe to stop here precisely
+        // because `viewWillAppear` starts it again.
         Task.detached { [session] in session.stopRunning() }
+        coordinator.onRunning(false)
+    }
+
+    /// Idempotent: `startRunning` on a running session is a no-op that
+    /// still blocks, and this is called from three places.
+    private func start() {
+        guard input != nil else { return }        // never configured
+        Task.detached { [session, coordinator] in
+            if !session.isRunning { session.startRunning() }
+            await MainActor.run { coordinator.onRunning(session.isRunning) }
+        }
+    }
+
+    @objc private func restart(_ note: Notification) {
+        start()
+    }
+
+    /// Asked for by the button on the overlay.
+    func restartNow() {
+        start()
+    }
+
+    @objc private func stopped(_ note: Notification) {
+        coordinator.onRunning(false)
     }
 
     deinit {
         if let observer { NotificationCenter.default.removeObserver(observer) }
+        NotificationCenter.default.removeObserver(self)
     }
 
     private func shoot() {
