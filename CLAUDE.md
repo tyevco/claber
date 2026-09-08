@@ -1189,6 +1189,26 @@ out and nothing to say is worse than an error, so `registering` gives up
 after twenty seconds and says what it is usually caused by; and the
 button is offered whenever push is not actually registered, because a
 failure needs a second go more than a fresh install does.
+**A shared category is not a comparison.** Nearly everything she sells
+is "Home", so scoring a category match as evidence put a tumbler, a
+wooden cabinet and a doorway in one another's comparables - "6 like it
+sold for $5.00-$235.00", which is worse than saying nothing because it
+looks like evidence. A title, where the model offered one, now has to
+share a word; category only breaks ties, and only carries the answer on
+its own when there is no title at all. A range whose top is more than
+three times its bottom is flagged `wide` and the screen says to treat it
+as no guide.
+
+Found on the first real trip with the phone, from ten photographs. No
+test could have found it: the fixtures have three listings and no two of
+them are alike, so category-only matching looked precise.
+
+**There has to be a way to stop.** The only exit from the capture screen
+was "Reconcile", which is the kitchen-table job - walking out of a shop
+is not the same thing as sitting down with the receipt, and she noticed
+because there was no way to do the first. Tapping the run now offers
+leaving, switching shop, or carrying on, and says what is in the cart and
+what is still undecided before she goes.
 
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that

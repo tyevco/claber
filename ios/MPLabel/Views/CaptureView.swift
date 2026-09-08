@@ -79,6 +79,7 @@ struct CaptureView: View {
     /// three quick photographs are a normal thing to take and she has to
     /// be able to go back to the first.
     @State private var selected: UUID?
+    @State private var leaving = false
     @State private var run: Trip?
     @State private var runs: [Trip] = []
     @State private var newStore = ""
@@ -120,7 +121,39 @@ struct CaptureView: View {
                 if let run { ReconcileView(trip: run) }
             }
             .task { await loadRuns() }
+            .confirmationDialog("This run", isPresented: $leaving,
+                                titleVisibility: .visible) {
+                Button("Done here - leave the shop") { leave() }
+                Button("Switch to another shop") { run = nil }
+                Button("Keep going", role: .cancel) {}
+            } message: {
+                Text(cartLine)
+            }
         }
+    }
+
+    /// What is still in the cart, said before she walks out. The receipt
+    /// is reconciled against this later, so an undecided photograph is a
+    /// thing that will not be there when she sits down with it.
+    private var cartLine: String {
+        let undecided = shots.filter { $0.decision == nil }.count
+        if undecided > 0 {
+            return "\(waiting) in the cart, and \(undecided) photograph"
+                 + (undecided == 1 ? "" : "s")
+                 + " you have not said yes or no to yet."
+        }
+        return "\(waiting) in the cart. The receipt gets matched against "
+             + "them when you sit down."
+    }
+
+    /// Leave the shop. The run stays - it is a shop and a day, and the
+    /// receipt still has to find it - but this screen stops being about
+    /// it, and the photographs from this visit are cleared off.
+    private func leave() {
+        run = nil
+        shots = []
+        selected = nil
+        Task { await loadRuns() }
     }
 
     private var showingShot: Shot? {
@@ -223,12 +256,19 @@ struct CaptureView: View {
                 if run == nil {
                     runChooser
                 } else if let run {
-                    Text("Run: " + run.store)
-                        .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.85))
-                        .padding(.horizontal, MP.S.x3)
-                        .padding(.vertical, MP.S.x1)
-                        .background(.black.opacity(0.45), in: Capsule())
+                    // Tappable, because there was no way to stop. The
+                    // only exit was Reconcile, which is the kitchen-table
+                    // job - walking out of a shop is not the same thing
+                    // as sitting down with the receipt.
+                    Button { leaving = true } label: {
+                        Text("Run: " + run.store)
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .padding(.horizontal, MP.S.x3)
+                            .padding(.vertical, MP.S.x1)
+                            .background(.black.opacity(0.45), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
                 }
                 shutter
             }
@@ -382,6 +422,11 @@ struct CaptureView: View {
                 Text(rangeLine(worth))
                     .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(.white)
+                if worth.wide == true {
+                    Text("Those disagree a lot - treat it as no guide.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(MP.Palette.warn)
+                }
                 if let ceiling = worth.payUnder {
                     Text("Pay under " + money(ceiling)
                          + (worth.usualMargin.map {

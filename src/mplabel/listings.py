@@ -1117,12 +1117,24 @@ def comparables(conn, category=None, title=None, limit=12):
     wanted = _words(title)
     scored = []
     for row in rows:
-        score = 0
-        if category and row["category"] and \
-                row["category"].lower() == category.lower():
-            score += 1
         overlap = len(wanted & _words(row["title"])) if wanted else 0
-        score += 2 * overlap
+        same_category = bool(
+            category and row["category"]
+            and row["category"].lower() == category.lower())
+
+        # **A shared category is not a comparison.** Nearly everything
+        # she sells is "Home", so matching on it alone put a tumbler, a
+        # cabinet and a doorway in one another's comparables and produced
+        # "6 like it sold for $5.00-$235.00" - a range so wide it is
+        # worse than saying nothing, because it looks like evidence. Seen
+        # on the first real trip with the phone.
+        #
+        # So a title, when there is one, has to share a word. Category
+        # only breaks ties and only helps where no title was offered at
+        # all.
+        if wanted and not overlap:
+            continue
+        score = 2 * overlap + (1 if same_category else 0)
         if score:
             scored.append((score, dict(row)))
     scored.sort(key=lambda pair: -pair[0])
@@ -1195,10 +1207,18 @@ def worth(conn, category=None, title=None):
     if middle is not None and margin is not None:
         ceiling = round(middle * (1 - margin), 2)
 
+    # A range whose top is several times its bottom is not guidance, and
+    # presenting it as one is the failure this whole module is trying to
+    # avoid. Say it is wide rather than quietly averaging it away.
+    low = min(prices) if prices else None
+    high = max(prices) if prices else None
+    wide = bool(low and high and low > 0 and high > 3 * low)
+
     return {
         "comparables": len(prices),
-        "low": min(prices) if prices else None,
-        "high": max(prices) if prices else None,
+        "low": low,
+        "high": high,
+        "wide": wide,
         "median": round(middle, 2) if middle is not None else None,
         "typical_days": round(_median(days)) if days else None,
         "usual_margin": round(margin, 3) if margin is not None else None,
