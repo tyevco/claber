@@ -71,6 +71,31 @@ today, and after work when a label never came out and there is still an
 evening to fix it. `Persistent=true`, because a parcel that was due
 while the Pi was off is still due.
 
+## When it will not send
+
+```bash
+mplabel notify --check      # config, the JWT, curl, the devices. Sends nothing.
+mplabel notify --test       # one deliberate notification, and what Apple said
+```
+
+`--check` exists because a refusal cannot tell you whose fault it is.
+APNs answers a request it cannot classify with
+`{"reason":"InternalServerError"}` and says no more, so the first
+question is whether *our* request is well formed: is the key where the
+config says, is the signature 64 bytes, does this curl speak HTTP/2, is
+the token 64 hex characters, and was it registered against the
+environment being sent to.
+
+What the refusals usually mean:
+
+| reason | usually |
+|---|---|
+| `BadDeviceToken` | `apns_environment` does not match the build the token came from - a development build gives a **sandbox** token |
+| `InvalidProviderToken` | `apns_key_id` or `apns_team_id` does not match the `.p8` |
+| `TopicDisallowed` | `apns_topic` is not the app's bundle id, or the key has no push capability |
+| `InternalServerError` | Apple's, usually - it is retried once automatically. If it persists, run `--check`: an unclassifiable request looks like this too |
+| `ExpiredProviderToken` | the Pi's clock is wrong |
+
 ## Why curl and openssl instead of libraries
 
 APNs wants HTTP/2 and an ES256-signed JWT. The stdlib has neither, and
