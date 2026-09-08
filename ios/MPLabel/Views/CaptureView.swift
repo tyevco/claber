@@ -38,6 +38,14 @@ struct CaptureView: View {
     private struct Shot: Identifiable {
         let id = UUID()
         let data: Data
+        /// A small copy, made once.
+        ///
+        /// The strip used to call `UIImage(data:)` on the full frame for
+        /// every shot on every redraw - a 12-megapixel decode per
+        /// thumbnail per frame, on the main thread, while she is trying
+        /// to take the next photograph. That is what made the screen
+        /// feel like treacle, and it got worse with each shot.
+        var preview: UIImage?
         var photo: Photo?
         var failure: String?
         var sending: Bool
@@ -66,6 +74,11 @@ struct CaptureView: View {
     /// reconciled against a receipt later, so this is asked for once at
     /// the start rather than inferred - "which shop is this" is a
     /// question she can answer in the car park and nothing else can.
+    /// Which shot's card is up. Defaults to the newest undecided one -
+    /// what she just photographed - but a tap on the strip wins, because
+    /// three quick photographs are a normal thing to take and she has to
+    /// be able to go back to the first.
+    @State private var selected: UUID?
     @State private var run: Trip?
     @State private var runs: [Trip] = []
     @State private var newStore = ""
@@ -108,6 +121,13 @@ struct CaptureView: View {
             }
             .task { await loadRuns() }
         }
+    }
+
+    private var showingShot: Shot? {
+        if let selected, let found = shots.first(where: { $0.id == selected }) {
+            return found
+        }
+        return shots.last(where: { $0.decision == nil })
     }
 
     // MARK: - the states
@@ -196,8 +216,8 @@ struct CaptureView: View {
                 // made of it. One at a time: she is looking at the
                 // object, not at a list, and the decision is about the
                 // thing in her hands.
-                if let pending = shots.last(where: { $0.decision == nil }) {
-                    decisionCard(pending)
+                if let showing = showingShot {
+                    decisionCard(showing)
                 }
                 if !shots.isEmpty { strip }
                 if run == nil {
@@ -225,11 +245,19 @@ struct CaptureView: View {
             HStack(spacing: MP.S.x2) {
                 ForEach(shots) { shot in
                     Button {
-                        if shot.failure != nil { retry(shot) }
+                        // Tapping a shot brings its card up. It used to
+                        // do nothing unless the upload had failed, so
+                        // three quick photographs left her able to
+                        // decide only the last one and no way back to
+                        // the others.
+                        if shot.failure != nil {
+                            retry(shot)
+                        } else {
+                            selected = shot.id
+                        }
                     } label: {
                         thumbnail(shot)
                     }
-                    .disabled(shot.failure == nil)
                 }
             }
             .padding(.horizontal, MP.S.x3)
@@ -239,30 +267,42 @@ struct CaptureView: View {
 
     private func thumbnail(_ shot: Shot) -> some View {
         ZStack(alignment: .bottomTrailing) {
-            if let image = UIImage(data: shot.data) {
+            if let image = shot.preview {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFill()
                     .frame(width: 56, height: 64)
                     .clipShape(RoundedRectangle(cornerRadius: MP.R.sm))
+            } else {
+                RoundedRectangle(cornerRadius: MP.R.sm)
+                    .fill(.white.opacity(0.15))
+                    .frame(width: 56, height: 64)
             }
             Group {
-                if shot.sending {
-                    ProgressView().scaleEffect(0.6)
-                } else if shot.failure != nil {
+                if shot.failure != nil {
                     Image(systemName: "arrow.clockwise.circle.fill")
                         .foregroundStyle(MP.Palette.alert)
-                } else {
-                    Image(systemName: "checkmark.circle.fill")
+                } else if shot.decision == "carted" {
+                    Image(systemName: "cart.fill.badge.plus")
                         .foregroundStyle(MP.Palette.accent)
+                } else if shot.decision == "passed" {
+                    Image(systemName: "arrow.uturn.backward.circle.fill")
+                        .foregroundStyle(.white.opacity(0.7))
+                } else if shot.sending {
+                    ProgressView().scaleEffect(0.6)
+                } else {
+                    // Undecided is the state that wants an answer, so it
+                    // is the one that looks unfinished.
+                    Image(systemName: "questionmark.circle.fill")
+                        .foregroundStyle(MP.Palette.warn)
                 }
             }
             .font(.system(size: 15))
             .padding(3)
         }
         .overlay(RoundedRectangle(cornerRadius: MP.R.sm)
-            .stroke(shot.failure != nil ? MP.Palette.alert : .clear,
-                    lineWidth: 1.5))
+            .stroke(borderColour(shot),
+                    lineWidth: selected == shot.id ? 2.5 : 1.5))
     }
 
     /// Cart it or put it back, with whatever the phone worked out.
@@ -378,6 +418,12 @@ struct CaptureView: View {
             ? "1 like it sold for " : "\(worth.comparables) like it sold for "
         let days = worth.typicalDays.map { ", typically \($0) days" } ?? ""
         return count + range + days
+    }
+
+    private func borderColour(_ shot: Shot) -> Color {
+        if shot.failure != nil { return MP.Palette.alert }
+        if selected == shot.id { return .white }
+        return shot.decision == nil ? MP.Palette.warn : .clear
     }
 
     private var shutter: some View {
@@ -524,9 +570,19 @@ struct CaptureView: View {
     /// analysis is worth most exactly when she has not decided yet.
     private func analyse(_ shot: Shot) {
         guard #available(iOS 27.0, *), OnDevice.readiness.canGenerate,
-              let cg = UIImage(data: shot.data)?.cgImage else { return }
+              OnDevice.canSeePictures else { return }
         update(shot) { $0.thinking = true }
         Task {
+            // Decoded here rather than before the Task: a full-frame
+            // decode on the main thread is a visible stall on the screen
+            // she is about to take another photograph with.
+            let data = shot.data
+            guard let cg = await Task.detached(priority: .userInitiated, operation: {
+                UIImage(data: data)?.cgImage
+            }).value else {
+                update(shot) { $0.thinking = false }
+                return
+            }
             let found = try? await OnDevice.suggestions(from: cg)
             update(shot) {
                 $0.suggested = found
@@ -543,6 +599,10 @@ struct CaptureView: View {
 
     private func decide(_ shot: Shot, _ decision: String) {
         update(shot) { $0.decision = decision }
+        // Move to whatever still needs an answer rather than staying on
+        // a card that has been dealt with.
+        selected = shots.last(where: {
+            $0.id != shot.id && $0.decision == nil })?.id
         Task {
             do {
                 // The candidate is created at the moment of the
@@ -569,6 +629,18 @@ struct CaptureView: View {
         }
     }
 
+    /// A small copy for the strip, made once and off the main thread.
+    ///
+    /// 56x64 points on screen, so there is no reason to hold a
+    /// 12-megapixel decode for it. `preparingThumbnail` does the resize
+    /// in one step without ever materialising the full-size image.
+    private static func preview(from data: Data) async -> UIImage? {
+        await Task.detached(priority: .userInitiated) {
+            UIImage(data: data)?.preparingThumbnail(
+                of: CGSize(width: 168, height: 192))
+        }.value
+    }
+
     private func keep(_ data: Data) {
         var shot = Shot(data: data, photo: nil, failure: nil, sending: true)
         shots.append(shot)
@@ -586,6 +658,10 @@ struct CaptureView: View {
     }
 
     private func send(_ shot: Shot) {
+        Task {
+            let small = await Self.preview(from: shot.data)
+            update(shot) { $0.preview = small }
+        }
         analyse(shot)
         Task {
             do {
@@ -691,6 +767,10 @@ final class CameraController: UIViewController {
         }
         session.addInput(input)
         session.addOutput(output)
+        // After the output is on the session and before the commit: set
+        // earlier it is not yet attached to anything, and a request that
+        // asks for higher quality than the output's maximum raises.
+        output.maxPhotoQualityPrioritization = .speed
         session.commitConfiguration()
 
         let preview = AVCaptureVideoPreviewLayer(session: session)
@@ -729,7 +809,12 @@ final class CameraController: UIViewController {
 
     private func shoot() {
         guard session.isRunning else { return }
-        output.capturePhoto(with: AVCapturePhotoSettings(),
-                            delegate: coordinator)
+        // Speed over the last few percent of quality. This is a
+        // photograph of a vase on a shelf, taken to be looked at on a
+        // phone and by a model that resizes it anyway - and the
+        // difference between the two settings is felt on every shot.
+        let settings = AVCapturePhotoSettings()
+        settings.photoQualityPrioritization = .speed
+        output.capturePhoto(with: settings, delegate: coordinator)
     }
 }

@@ -1159,6 +1159,21 @@ things that do not move.
 which is right for money and wrong for the margin *fraction* it also
 serves: 0.625 became 0.62. Rounding belongs where the number is shown,
 which knows what kind of number it is.
+**A thumbnail must not be the full frame.** The capture strip called
+`UIImage(data:)` on each shot's original JPEG *on every redraw* - a
+12-megapixel decode per thumbnail per frame, on the main thread, while
+she is trying to take the next photograph. It got worse with every shot,
+which is what "not very responsive" turned out to mean when the flow was
+first used on a real phone. Each shot now keeps one small copy made once
+by `preparingThumbnail`, off the main thread, and the full-frame decode
+the model needs happens inside its task rather than before it.
+
+Two things about that report are worth keeping. It came from use, not
+from a test - nothing in the suite can feel a dropped frame. And the
+other half of it, "I couldn't click between the photos", was a missing
+affordance rather than a bug: the strip only responded to a failed
+upload, so three quick photographs left her able to decide the last one
+and with no way back to the first.
 
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
