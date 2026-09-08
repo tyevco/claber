@@ -3,6 +3,7 @@
 //  The parts of the app that are decisions rather than drawing, and can
 //  therefore be wrong quietly.
 
+import UIKit
 import XCTest
 @testable import MPLabel
 
@@ -318,5 +319,38 @@ final class KeychainTests: XCTestCase {
         XCTAssertTrue(worth.hasEvidence)
         XCTAssertNil(worth.payUnder)
         XCTAssertNil(worth.usualMargin)
+    }
+
+    /// `@UIApplicationDelegateAdaptor` constructs its own instance of the
+    /// type it is given. Pointing it at `Push` made a second `Push` that
+    /// received every callback while the screen watched `Push.shared` -
+    /// the token arrived and nothing was listening, and Settings sat at
+    /// "Registering…" for ever.
+    ///
+    /// So the delegate is its own type and forwards to the shared one.
+    /// Asserted by reflection rather than by reading, because the
+    /// symptom of getting this wrong is a hang with no error in it.
+    @MainActor
+    func testTheDelegateIsNotTheObservedObject() {
+        XCTAssertFalse(Push.shared is UIApplicationDelegate,
+                       "if Push is the delegate type, the adaptor will "
+                       + "build a second one and the screen watches the "
+                       + "wrong object")
+        XCTAssertTrue(PushDelegate() is UIApplicationDelegate)
+    }
+
+    /// A token handed to the shared object moves it off "Registering…".
+    /// Without a server it lands on `failed`, which is still an answer -
+    /// the state that must never persist is the one with nothing in it.
+    @MainActor
+    func testAReceivedTokenLeavesTheRegisteringState() async {
+        Push.shared.failed(NSError(domain: "test", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "no valid aps-environment"]))
+        if case .failed(let why) = Push.shared.state {
+            XCTAssertTrue(why.contains("aps-environment"),
+                          "Apple's own words survive to the screen")
+        } else {
+            XCTFail("a failure must be a state, not a silence")
+        }
     }
 }

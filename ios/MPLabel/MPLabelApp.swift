@@ -14,7 +14,10 @@ struct MPLabelApp: App {
     @StateObject private var session = Session.shared
     // The delegate exists only to receive the APNs token - SwiftUI has
     // no other way to be handed one.
-    @UIApplicationDelegateAdaptor(Push.self) private var push
+    // `PushDelegate`, not `Push`: the adaptor builds its own instance of
+    // whatever it is given, and pointing it at `Push` made a second one
+    // that got every callback while the screen watched `Push.shared`.
+    @UIApplicationDelegateAdaptor(PushDelegate.self) private var pushDelegate
 
     init() {
         // Before any view reads Settings or the keychain. In release

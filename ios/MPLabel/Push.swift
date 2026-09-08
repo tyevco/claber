@@ -19,8 +19,37 @@ import SwiftUI
 import UIKit
 import UserNotifications
 
+/// The app delegate, which exists only to hand the token over.
+///
+/// **Separate from `Push` on purpose.** `@UIApplicationDelegateAdaptor`
+/// *constructs its own instance* of whatever type it is given, so
+/// pointing it at `Push` produced a second `Push` that received every
+/// callback while the Settings screen watched `Push.shared` - which sat
+/// at "Registering…" for ever, with the token already delivered to an
+/// object nobody could see. It presents as a hang and is two objects.
 @MainActor
-final class Push: NSObject, ObservableObject, UIApplicationDelegate {
+final class PushDelegate: NSObject, UIApplicationDelegate {
+    nonisolated func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken token: Data
+    ) {
+        Task { @MainActor in
+            Push.shared.received(token)
+        }
+    }
+
+    nonisolated func application(
+        _ application: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        Task { @MainActor in
+            Push.shared.failed(error)
+        }
+    }
+}
+
+@MainActor
+final class Push: NSObject, ObservableObject {
     /// Where the registration got to. Four states again, because "not
     /// asked yet" and "she said no" want different sentences.
     enum State: Equatable {
@@ -63,8 +92,26 @@ final class Push: NSObject, ObservableObject, UIApplicationDelegate {
             // Authorised is not the same as registered - the token is a
             // separate round trip and the app has to ask for it again on
             // every launch, because it can change.
-            if state != .registered { state = .registering }
+            if state != .registered {
+                state = .registering
+                giveUpIfSilent()
+            }
             UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
+
+    /// Registration is a round trip through Apple and it does not always
+    /// come back. Sitting at "Registering…" for ever is the one state
+    /// that tells her nothing and offers nothing - so it gives up after
+    /// a while and says what to do.
+    private func giveUpIfSilent() {
+        Task {
+            try? await Task.sleep(for: .seconds(20))
+            if case .registering = state {
+                state = .failed(
+                    "Apple did not answer. That is usually no network, or "
+                    + "a build without the push entitlement. Try again.")
+            }
         }
     }
 
@@ -73,29 +120,27 @@ final class Push: NSObject, ObservableObject, UIApplicationDelegate {
             let granted = try await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound, .badge])
             state = granted ? .registering : .refused
-            if granted { UIApplication.shared.registerForRemoteNotifications() }
+            if granted {
+                UIApplication.shared.registerForRemoteNotifications()
+                giveUpIfSilent()
+            }
         } catch {
             state = .failed(error.localizedDescription)
         }
     }
 
-    // MARK: - UIApplicationDelegate
+    // MARK: - what the delegate hands over
 
-    nonisolated func application(
-        _ application: UIApplication,
-        didRegisterForRemoteNotificationsWithDeviceToken token: Data
-    ) {
+    func received(_ token: Data) {
         let hex = token.map { String(format: "%02x", $0) }.joined()
-        Task { @MainActor in await self.send(hex) }
+        Task { await send(hex) }
     }
 
-    nonisolated func application(
-        _ application: UIApplication,
-        didFailToRegisterForRemoteNotificationsWithError error: Error
-    ) {
-        Task { @MainActor in
-            self.state = .failed(error.localizedDescription)
-        }
+    func failed(_ error: Error) {
+        // Apple's own words. The common one is "no valid aps-environment
+        // entitlement string found", which reads as a provisioning
+        // problem and is a missing key in the entitlements file.
+        state = .failed(error.localizedDescription)
     }
 
     private func send(_ hex: String) async {
