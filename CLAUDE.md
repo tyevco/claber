@@ -1175,6 +1175,21 @@ affordance rather than a bug: the strip only responded to a failed
 upload, so three quick photographs left her able to decide the last one
 and with no way back to the first.
 
+**`@UIApplicationDelegateAdaptor` builds its own instance.** Pointing it
+at `Push` - which was also the `ObservableObject` the Settings screen
+watched via `Push.shared` - produced *two* `Push` objects: Apple's
+callbacks went to the adaptor's, the screen observed the singleton, and
+the token arrived at an object nobody could see. It presents as
+Settings stuck on "Registering…" for ever, with no error anywhere,
+because nothing failed. The delegate is its own type now and forwards to
+the shared one.
+
+Two things follow from the shape of that failure. A state with no way
+out and nothing to say is worse than an error, so `registering` gives up
+after twenty seconds and says what it is usually caused by; and the
+button is offered whenever push is not actually registered, because a
+failure needs a second go more than a fresh install does.
+
 **A served asset missing from `asset_stamp` never reaches the phone.**
 It lists the files whose mtime busts the cache. `marker.js` is on that
 list; anything else added to `static/` must be too, or the phone goes on

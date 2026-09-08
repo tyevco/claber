@@ -171,8 +171,14 @@ struct SettingsView: View {
                              + "money has no home")
                             .font(.system(size: 11))
                             .foregroundStyle(MP.Palette.subtle)
-                        if push.state == .notAsked || push.state == .unknown {
-                            Button("Turn them on") {
+                        // Offered whenever it is not actually
+                        // registered - a failure needs a second go more
+                        // than a fresh install does, and "Registering…"
+                        // that never finished used to offer nothing at
+                        // all.
+                        if push.state != .registered {
+                            Button(push.state == .registering
+                                   ? "Try again" : "Turn them on") {
                                 Task { await push.ask() }
                             }
                             .font(.system(size: 13, weight: .semibold))
