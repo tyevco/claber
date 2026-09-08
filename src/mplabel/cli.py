@@ -1778,9 +1778,32 @@ def cmd_notify(cfg, conn, args):
         print(f"environment : {cfg.get('apns_environment') or 'production'}")
 
         key_path = cfg.get("apns_key_path") or ""
+        key_id = cfg.get("apns_key_id") or ""
         if key_path and os.path.exists(key_path):
             mode = oct(os.stat(key_path).st_mode & 0o777)
             print(f"key         : {key_path} ({mode})")
+            # Apple names both kinds of key `AuthKey_<KEYID>.p8`, so the
+            # id is in the filename and can be checked against the
+            # configured one. A mismatch is usually two keys on the
+            # machine and the wrong id typed.
+            named = re.search(r"AuthKey_([A-Z0-9]{10})\.p8$",
+                              os.path.basename(key_path))
+            if named and key_id and named.group(1) != key_id:
+                print(f"              ^ the filename says "
+                      f"{named.group(1)} and apns_key_id says {key_id}",
+                      file=sys.stderr)
+            head = ""
+            try:
+                with open(key_path) as fh:
+                    head = fh.readline().strip()
+            except OSError:
+                pass
+            if "PRIVATE KEY" not in head:
+                print(f"              ^ does not look like a .p8 key "
+                      f"(first line: {head[:40]!r})", file=sys.stderr)
+            print("              note an App Store Connect API key is "
+                  "also AuthKey_*.p8 and looks identical - APNs needs "
+                  "the one made under Keys with push enabled")
         else:
             print(f"key         : {key_path or '(unset)'} - NOT FOUND")
 
@@ -1862,6 +1885,18 @@ def cmd_notify(cfg, conn, args):
                 continue
             failed += 1
             print(f"REFUSED for {where}: {detail}", file=sys.stderr)
+            if "InternalServerError" in str(detail):
+                # Apple's word for "no, and I will not say why". It is
+                # retried once already, so a second one is either their
+                # bad day or a request they cannot classify - and the
+                # only thing left to do is check our own side rather
+                # than ask for another command to be run.
+                print("  APNs says that when it cannot classify a "
+                      "request, and when it is simply having a bad "
+                      "moment. Our side, for comparison:", file=sys.stderr)
+                checked = argparse.Namespace(dry_run=False, test=False,
+                                             check=True)
+                cmd_notify(cfg, conn, checked)
             hint = ""
             if "BadDeviceToken" in str(detail):
                 hint = ("apns_environment does not match the build the "

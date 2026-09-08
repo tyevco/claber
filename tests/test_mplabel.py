@@ -8364,3 +8364,57 @@ def test_with_no_title_the_category_still_helps(db):
     _sold(db, "Wooden cabinet", "Home", 60.0)
     found = listings.comparables(db, category="Home", title=None)
     assert len(found) == 1
+
+
+def test_the_jwt_signature_verifies_end_to_end(tmp_path):
+    """A signature of the right *length* is not a signature that is
+    right. `_der_to_jose` strips DER's leading zero and pads back to 32,
+    and getting that wrong produces 64 plausible bytes that Apple
+    refuses without saying which part it disliked.
+
+    So this converts back and asks openssl whether it verifies - which
+    is the only check that distinguishes our JWT being wrong from Apple
+    being unhappy about something else."""
+    import shutil
+    import subprocess
+
+    from mplabel import notify
+
+    if not shutil.which("openssl"):
+        pytest.skip("openssl is not installed")
+
+    key = tmp_path / "key.pem"
+    if subprocess.run(["openssl", "ecparam", "-name", "prime256v1",
+                       "-genkey", "-noout", "-out", str(key)],
+                      capture_output=True).returncode != 0:
+        pytest.skip("this openssl cannot make a P-256 key")
+    public = tmp_path / "public.pem"
+    subprocess.run(["openssl", "ec", "-in", str(key), "-pubout",
+                    "-out", str(public)], capture_output=True)
+
+    message = b"header.payload"
+    jose = notify._sign(key, message)
+    assert len(jose) == 64
+
+    # JOSE r||s back to DER, so openssl can check it.
+    def der(raw):
+        def integer(value):
+            value = value.lstrip(b"\x00") or b"\x00"
+            if value[0] & 0x80:
+                value = b"\x00" + value
+            return bytes([0x02, len(value)]) + value
+
+        body = integer(raw[:32]) + integer(raw[32:])
+        return bytes([0x30, len(body)]) + body
+
+    signature = tmp_path / "sig.der"
+    signature.write_bytes(der(jose))
+    message_file = tmp_path / "message"
+    message_file.write_bytes(message)
+
+    done = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-verify", str(public),
+         "-signature", str(signature), str(message_file)],
+        capture_output=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert b"Verified OK" in done.stdout

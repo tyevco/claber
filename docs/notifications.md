@@ -93,7 +93,7 @@ What the refusals usually mean:
 | `BadDeviceToken` | `apns_environment` does not match the build the token came from - a development build gives a **sandbox** token |
 | `InvalidProviderToken` | `apns_key_id` or `apns_team_id` does not match the `.p8` |
 | `TopicDisallowed` | `apns_topic` is not the app's bundle id, or the key has no push capability |
-| `InternalServerError` | Apple's, usually - it is retried once automatically. If it persists, run `--check`: an unclassifiable request looks like this too |
+| `InternalServerError` | Apple's, usually - it is retried once automatically, and `--test` prints `--check` after a second one. An unclassifiable request looks the same, so the first thing to rule out is **the wrong .p8**: an App Store Connect API key is also `AuthKey_*.p8` and is indistinguishable by eye from an APNs auth key. APNs needs the one made under **Keys** with the Apple Push Notifications service ticked |
 | `ExpiredProviderToken` | the Pi's clock is wrong |
 
 ## Why curl and openssl instead of libraries
