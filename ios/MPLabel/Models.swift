@@ -463,6 +463,46 @@ struct PhotosResponse: Codable { let photos: [Photo] }
 struct PhotoResponse: Codable { let photo: Photo }
 struct TripResponse: Codable { let trip: Trip }
 
+/// What the Pi made of a 4x6 PDF it had never seen before.
+///
+/// The server finds the label on the page and turns it upright; this is
+/// its account of what it did, and every field here exists because the
+/// answer can be right in a way that still needs checking. `size_in` is
+/// always 4x6 or the request failed. `rotationSource` is the one to
+/// read: `text` means it was measured off the label's own characters,
+/// `forced` means she chose it, and `aspect` means the label carries no
+/// text at all and the shape was the only evidence - which knows the
+/// label is on its side and cannot know which way up.
+struct PrintedLabel: Codable {
+    let sizeIn: [Double]
+    let rotation: Int
+    let rotationSource: String
+    let page: Int
+    let regionsFound: Int
+    let region: Int
+    let job: String
+    let recorded: String
+    let printed: Bool
+    let dryRun: Bool?
+
+    var wasGuessed: Bool { rotationSource == "aspect" }
+
+    enum CodingKeys: String, CodingKey {
+        case sizeIn = "size_in"
+        case rotation
+        case rotationSource = "rotation_source"
+        case page
+        case regionsFound = "regions_found"
+        case region
+        case job
+        case recorded
+        case printed
+        case dryRun = "dry_run"
+    }
+}
+
+struct PrintedLabelResponse: Codable { let label: PrintedLabel }
+
 // MARK: - the aisle
 
 /// Something she pointed the camera at in a shop.

@@ -35,6 +35,7 @@ import mimetypes
 import re
 import secrets
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -48,6 +49,7 @@ from urllib.parse import urlparse, unquote, parse_qs
 # drift apart from the unit files that honour it.
 from . import printd as printd_mod
 
+from . import label
 from . import listings as listings_mod
 from . import shopping as shopping_mod
 from . import build as build_mod
@@ -83,6 +85,14 @@ MAX_BODY = 2 * 1024 * 1024
 # eight; twelve leaves room without letting any other endpoint become a
 # way to hand the Pi a hundred megabytes.
 MAX_PHOTO = 12 * 1024 * 1024
+
+# A label bought anywhere else. Same reasoning as MAX_PHOTO and the same
+# per-route treatment: a 4x6 of vector text is a few kilobytes, but a
+# carrier that flattens its label to a 300dpi image lands a couple of
+# megabytes, and a US Letter page carrying a packing slip as well can be
+# more. Four is comfortably above anything real and far below the number
+# that stops the printer.
+MAX_LABEL = 4 * 1024 * 1024
 
 # What the camera roll actually produces, and nothing else. The extension
 # is chosen here rather than taken from the request: a filename from a
@@ -375,6 +385,9 @@ class Handler(BaseHTTPRequestHandler):
         ("POST", r"^/api/orders/(?P<sid>\d+)/fields$", "h_fields", True),
         ("POST", r"^/api/orders/(?P<sid>\d+)/print$", "h_print", True),
         ("POST", r"^/api/print/pending$", "h_print_pending", True),
+        # A label from anywhere else. No order behind it and no row after
+        # it - see h_print_label.
+        ("POST", r"^/api/print/label$", "h_print_label", True),
         # The sourcing half. Cost basis enters the system here, which is
         # why every margin in the analytics is null until it does.
         ("GET", r"^/api/trips$", "h_trips", True),
@@ -1374,6 +1387,120 @@ class Handler(BaseHTTPRequestHandler):
                 log.error("print failed for sale %s: %s", row["id"], exc)
                 failed.append({"id": row["id"], "error": str(exc)})
         self.json({"printed": printed, "failed": failed})
+
+    def h_print_label(self):
+        """Print a 4x6 label this system has never seen before.
+
+        Everything else on this server prints a label it already has, off
+        a `sales` row, checked against the address recorded when that sale
+        was filed. This prints a PDF somebody just handed it - eBay,
+        PirateShip, a carrier's own site, a parcel that is not a sale at
+        all - and that difference is the whole design of it:
+
+        Nothing is recorded here. No sales row, no listing, no file kept
+        in `labels/`. There is no order for it to belong to, and inventing
+        one would put a parcel that is not a sale into revenue, into
+        sell-through and into the Sheet. What *is* recorded is printd's
+        journal, which is the only durable record this system has anyway -
+        the G4 is write-only, so a print is at-least-once and the paper is
+        the source of truth. With `printer_backend` pointing straight at a
+        device there is no journal at all, and the answer says so rather
+        than implying a record that does not exist.
+
+        `label_belongs_to` has nothing to check against for the same
+        reason - there is no recorded recipient to compare the PDF with.
+        The backstop here is that a person chose this file a second ago,
+        which is a different guarantee and a weaker one. Do not paper over
+        that by inventing a row to check against.
+
+        Raw bytes with a real Content-Type, like `POST /api/photos` and
+        for the same reason: one file, no other fields, everything else in
+        the query string, and so no multipart parser to add and get wrong.
+        """
+        from . import cli as cli_mod
+
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        if ctype.lower() not in ("application/pdf", "application/x-pdf"):
+            raise ValueError(
+                f"a label must be application/pdf - got {ctype or 'nothing'}")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ValueError("no PDF in the body")
+        if length > MAX_LABEL:
+            raise ValueError(
+                f"that PDF is {length // 1024}kB, over the "
+                f"{MAX_LABEL // 1024 // 1024}MB limit for a label")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("the upload was cut short")
+        if not raw.startswith(b"%PDF"):
+            raise ValueError("that file is not a PDF")
+
+        qs = parse_qs(urlparse(self.path).query)
+
+        def one(name):
+            v = (qs.get(name) or [None])[0]
+            return v
+
+        rotate = one("rotate")
+        if rotate is not None:
+            rotate = int(rotate)
+            if rotate not in (0, 90, 180, 270):
+                raise ValueError("rotate must be 0, 90, 180 or 270")
+        page = int(one("page") or 1)
+        region = one("region")
+        region = int(region) if region else None
+        dry = str(one("dry_run") or "").lower() in ("1", "yes", "true")
+        force = str(one("force") or "").lower() in ("1", "yes", "true")
+
+        # Derived from the bytes, so the same PDF sent twice is the same
+        # job. She is on a phone behind a tunnel; a request that times out
+        # after the label came out is exactly the case printd's journal
+        # exists to answer, and a random id would turn her retry into a
+        # second label instead of a 409. Asking for it again on purpose is
+        # `force`, which is a different intent and gets a different id.
+        digest = hashlib.sha256(raw).hexdigest()
+        job = f"adhoc-{digest[:16]}"
+        if force:
+            job += "-" + secrets.token_hex(4)
+
+        with tempfile.TemporaryDirectory(prefix="mplabel_adhoc_") as tmpdir:
+            src = Path(tmpdir) / "in.pdf"
+            src.write_bytes(raw)
+            out = Path(tmpdir) / "label_4x6.pdf"
+            # Any refusal in here is a ValueError carrying what it
+            # measured, which the dispatcher turns into a 400 with that
+            # sentence in it. That sentence is the whole feature when a
+            # crop cannot be resolved: "this may not be a shipping label"
+            # is actionable and "bad request" is not.
+            info = label.to_4x6(src, out, page_index=page - 1,
+                                force_rotation=rotate, region=region)
+            info["job"] = job
+            info["sha256"] = digest
+            info["bytes"] = len(raw)
+            backend = self.cfg.get("printer_backend")
+            info["recorded"] = ("printd journal"
+                                if backend in printers_mod.REMOTE_BACKENDS
+                                else "nowhere - this backend writes straight "
+                                     "to the device and keeps no journal")
+            if dry:
+                # Converts and measures, opens no device and journals
+                # nothing. This is the cheap way to find out whether a new
+                # seller's PDF crops correctly, and it costs no stock -
+                # which on a printer that cannot report a failure is the
+                # difference between one label and several.
+                info["dry_run"] = True
+                info["printed"] = False
+                return self.json({"ok": True, "label": info})
+
+            try:
+                cli_mod.print_label(self.cfg, str(out), job=job)
+            except printers_mod.PrinterUnavailable as exc:
+                raise PrintError(str(exc))
+            info["printed"] = True
+            log.info("printed ad-hoc label %s (%d bytes, %s)",
+                     job, len(raw), info["size_in"])
+            return self.json({"ok": True, "label": info})
 
     def serve_static(self, path):
         target = safe_static_path(path)

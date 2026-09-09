@@ -41,35 +41,243 @@ def _text_width(text, size):
 
 
 def inspect(pdf_path, page_index=0):
-    """Locate the ink and work out which way the text runs.
+    """Locate the ink on a page and work out which way the text runs.
 
     Returns (bbox, rotation, page_size) with bbox as (x0, y0, x1, y1) in
-    PDF points measured from the bottom-left, and rotation as the clockwise
-    turn needed to make the text read left-to-right."""
+    PDF points measured from the bottom-left, and rotation as the
+    clockwise turn needed to make the text read left-to-right.
+
+    This is the whole page's ink, which is the right answer only when the
+    label has the page to itself. `find_label` is what handles the rest."""
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_index]
-        objs = (page.chars + page.lines + page.rects
-                + page.curves + page.images)
+        objs = _page_objects(page)
         if not objs:
             raise ValueError("no drawable content on that page")
+        extent = _extent(objs)
+        rot, _source = _rotation(page.chars, extent)
+        page_size = (page.width, page.height)
 
-        x0 = min(o["x0"] for o in objs)
-        x1 = max(o["x1"] for o in objs)
-        top = min(o["top"] for o in objs)
-        bottom = max(o["bottom"] for o in objs)
-        pw, ph = page.width, page.height
+    return _to_pdf_space(extent, page_size), rot, page_size
 
-        rot = 0
-        if page.chars:
-            a, b, _c, d = page.chars[0]["matrix"][:4]
-            if abs(a) < 1e-6 and abs(d) < 1e-6:
-                # b > 0 means the baseline runs upward, so turn it clockwise
-                rot = 90 if b > 0 else 270
-            elif a < 0:
-                rot = 180
 
-    # pdfplumber measures down from the top; pypdf measures up from the bottom
-    return (x0, ph - bottom, x1, ph - top), rot, (pw, ph)
+# --------------------------------------------------------------- regions
+#
+# A Marketplace label has its page to itself, so the ink's own bounding
+# box *is* the label and `_snap` can work straight off it. Almost nothing
+# else arrives that way. eBay, PirateShip and the carriers' own sites
+# hand out a US Letter page with the 4x6 label on the top half and a
+# packing slip or a fold-here strip below it, and the ink then spans the
+# whole sheet - which `_snap` refuses, correctly, because a page of ink
+# is not a 4x6 label. The label has to be *found* before it can be
+# cropped to.
+#
+# This is a recursive XY-cut, the oldest trick in document layout:
+# project the ink onto an axis, split it wherever there is a blank band
+# wide enough to be a deliberate separator, and repeat on the pieces. It
+# runs only when the whole page does not already fit, so the one path
+# with real Marketplace labels behind it is not touched by any of it.
+
+# 0.25in. Narrower than this is line spacing and the gaps inside a
+# barcode, not a gutter somebody put there to separate two things.
+MIN_GUTTER = 18.0
+# 1.5in. Below this a block is furniture - a page number, "fold here", a
+# cut line's caption - rather than something that could be a label.
+MIN_REGION = 108.0
+# A runner-up whose area is at least this fraction of the winner's is a
+# coin toss, and a coin toss here prints the packing slip and throws the
+# label away. Refuse, and make the caller say which.
+AMBIGUOUS_AT = 0.60
+
+
+def _page_objects(page):
+    return (page.chars + page.lines + page.rects
+            + page.curves + page.images)
+
+
+def _extent(objs):
+    """Bounding box of some objects, in pdfplumber's top-down space."""
+    return (min(o["x0"] for o in objs), min(o["top"] for o in objs),
+            max(o["x1"] for o in objs), max(o["bottom"] for o in objs))
+
+
+def _to_pdf_space(extent, page_size):
+    """pdfplumber measures down from the top; pypdf measures up from the
+    bottom, and the mediabox this ends up as is pypdf's."""
+    x0, top, x1, bottom = extent
+    _pw, ph = page_size
+    return (x0, ph - bottom, x1, ph - top)
+
+
+def _runs(spans, min_gap):
+    """Contiguous runs of `spans`, broken at every blank band >= min_gap.
+
+    Spans closer together than that become one run: the gaps inside a
+    barcode and between two lines of an address are not separators, and
+    splitting on them would shatter a label into its individual words."""
+    out = []
+    for lo, hi in sorted(spans):
+        if out and lo - out[-1][1] < min_gap:
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return [tuple(r) for r in out]
+
+
+def _cut(objs, axis, min_gap):
+    """Split objects into the bands one axis's blank gutters leave."""
+    lo_key, hi_key = ("top", "bottom") if axis == "y" else ("x0", "x1")
+    runs = _runs([(o[lo_key], o[hi_key]) for o in objs], min_gap)
+    if len(runs) < 2:
+        return [objs]
+    pieces = [[] for _ in runs]
+    for o in objs:
+        # An object cannot straddle a gutter: a gutter is by construction
+        # a band no object's own span reaches into, so its midpoint
+        # settles which run it belongs to.
+        mid = (o[lo_key] + o[hi_key]) / 2
+        for i, (lo, hi) in enumerate(runs):
+            if lo <= mid <= hi:
+                pieces[i].append(o)
+                break
+    return [p for p in pieces if p]
+
+
+def _carve(objs, min_gap, depth=0):
+    """Recursive XY-cut. Horizontal gutters first, because stacked is how
+    a label and its packing slip come out of every site that makes one."""
+    if len(objs) < 2 or depth >= 6:
+        return [objs]
+    for axis in ("y", "x"):
+        pieces = _cut(objs, axis, min_gap)
+        if len(pieces) > 1:
+            out = []
+            for piece in pieces:
+                out.extend(_carve(piece, min_gap, depth + 1))
+            return out
+    return [objs]
+
+
+def _char_rotation(ch):
+    """The clockwise turn that makes one character read left-to-right."""
+    a, b, _c, d = ch["matrix"][:4]
+    if abs(a) < 1e-6 and abs(d) < 1e-6:
+        # b > 0 means the baseline runs upward, so turn it clockwise.
+        return 90 if b > 0 else 270
+    return 180 if a < 0 else 0
+
+
+def _rotation(chars, extent):
+    """Which way this block's text runs, and how good that answer is.
+
+    A majority, not `chars[0]`. The first character is whatever the
+    content stream happened to draw first, and on a page carrying a
+    rotated label above an upright packing slip that is a coin toss
+    between the two orientations - which is exactly the page this
+    function was added for."""
+    votes = {}
+    for ch in chars:
+        r = _char_rotation(ch)
+        votes[r] = votes.get(r, 0) + 1
+    if votes:
+        # Ties go to the smaller turn, so the answer is at least stable.
+        return max(votes.items(), key=lambda kv: (kv[1], -kv[0]))[0], "text"
+
+    # Nothing but barcodes and images: some carriers' labels carry no
+    # extractable text at all, and those used to be called rotation 0 and
+    # then refused for being "6.00 x 4.00 in, larger than the 4 x 6 in
+    # target" - a measurement that is right attached to a diagnosis that
+    # is wrong. The shape is the only evidence left. It says the label is
+    # lying on its side; it cannot say which way up, so this is a guess,
+    # `--rotate` overrides it, and the answer says which it was.
+    x0, top, x1, bottom = extent
+    return (90 if (x1 - x0) > (bottom - top) else 0), "aspect"
+
+
+def _fits(width, height):
+    """Does a block fit inside 4x6, either way round?"""
+    return ((width <= TARGET_W + TOL and height <= TARGET_H + TOL)
+            or (width <= TARGET_H + TOL and height <= TARGET_W + TOL))
+
+
+def _describe(extent):
+    w, h = extent[2] - extent[0], extent[3] - extent[1]
+    return (f"{w / PT_PER_IN:.2f} x {h / PT_PER_IN:.2f} in at "
+            f"({extent[0] / PT_PER_IN:.2f}, {extent[1] / PT_PER_IN:.2f}) in "
+            f"from the top left")
+
+
+def find_label(pdf_path, page_index=0, region=None):
+    """Find the 4x6 label on a page and say which way up it is.
+
+    Returns (extent, rotation, page_size, info), extent in pdfplumber's
+    top-down space. `region` is a 1-based index into the candidates, for
+    the page where more than one block could be the label."""
+    with pdfplumber.open(pdf_path) as pdf:
+        if not 0 <= page_index < len(pdf.pages):
+            raise ValueError(
+                f"there is no page {page_index + 1} in this PDF - it has "
+                f"{len(pdf.pages)}")
+        page = pdf.pages[page_index]
+        objs = _page_objects(page)
+        if not objs:
+            raise ValueError("no drawable content on that page")
+        page_size = (page.width, page.height)
+        chars = page.chars
+
+        whole = _extent(objs)
+        # The label alone on its page: every Marketplace label, and any
+        # PDF that is already a 4x6. Take it without carving, so the one
+        # path with real labels behind it cannot be moved by a layout
+        # heuristic.
+        if _fits(whole[2] - whole[0], whole[3] - whole[1]):
+            rot, source = _rotation(chars, whole)
+            return whole, rot, page_size, {
+                "regions_found": 1, "region": 1, "rotation_source": source}
+
+        found = []
+        for block in _carve(objs, MIN_GUTTER):
+            ext = _extent(block)
+            w, h = ext[2] - ext[0], ext[3] - ext[1]
+            if _fits(w, h) and max(w, h) >= MIN_REGION:
+                found.append((w * h, ext))
+        found.sort(key=lambda t: -t[0])
+
+        if not found:
+            w, h = whole[2] - whole[0], whole[3] - whole[1]
+            raise ValueError(
+                f"ink is {w / PT_PER_IN:.2f} x {h / PT_PER_IN:.2f} in and "
+                f"no block on this page is a 4 x 6 label on its own - this "
+                f"may not be a shipping label, or the label may not be "
+                f"separated from the rest of the page by a clear margin")
+
+        if region is not None:
+            if not 1 <= region <= len(found):
+                raise ValueError(
+                    f"there is no region {region} on this page - it has "
+                    f"{len(found)}")
+            pick = region - 1
+        elif len(found) > 1 and found[1][0] >= found[0][0] * AMBIGUOUS_AT:
+            # Two blocks this alike could both be the label, and guessing
+            # wrong prints the packing slip and spends the stock anyway.
+            # Say where they are and let the caller choose.
+            raise ValueError(
+                f"{len(found)} blocks on this page could be the label and "
+                f"they are too alike to choose between - say which with "
+                f"--region. "
+                + "; ".join(f"{i + 1}: {_describe(e)}"
+                            for i, (_a, e) in enumerate(found)))
+        else:
+            pick = 0
+
+        _area, ext = found[pick]
+        inside = [c for c in chars
+                  if ext[0] <= (c["x0"] + c["x1"]) / 2 <= ext[2]
+                  and ext[1] <= (c["top"] + c["bottom"]) / 2 <= ext[3]]
+        rot, source = _rotation(inside, ext)
+        return ext, rot, page_size, {
+            "regions_found": len(found), "region": pick + 1,
+            "rotation_source": source}
 
 
 def _snap(bbox, rot, page_size):
@@ -96,24 +304,64 @@ def _snap(bbox, rot, page_size):
     return (nx0, ny0, nx0 + want_w, ny0 + want_h)
 
 
-def to_4x6(src, dst, page_index=0, force_rotation=None):
+def _unrotate(box, source_rot, page_size):
+    """A box in pdfplumber's (rotated) view, as pypdf's mediabox sees it.
+
+    pdfplumber applies a page's own /Rotate before reporting coordinates;
+    `page.mediabox` is the unrotated page. Marketplace labels carry no
+    /Rotate, so the two agreed and nothing here had to know this - but an
+    arbitrary label PDF may well carry one, and a mediabox written in the
+    wrong space crops some other corner of the page entirely."""
+    source_rot %= 360
+    if source_rot == 0:
+        return box
+    x0, y0, x1, y1 = box
+    pw, ph = page_size          # as pdfplumber sees it, i.e. already turned
+    if source_rot == 180:
+        return (pw - x1, ph - y1, pw - x0, ph - y0)
+    # At 90 and 270 the page's own axes are swapped, so pdfplumber's
+    # width is the unrotated page's height. /Rotate 90 displays the sheet
+    # turned clockwise, which sends the unrotated (X, Y) to (Y, ph - X);
+    # this is that inverted. The two turns are easy to write down the
+    # wrong way round and the result is a crop of some other corner of
+    # the page, so they are pinned by rendering rather than by argument.
+    if source_rot == 90:
+        return (ph - y1, x0, ph - y0, x1)
+    return (y0, pw - x1, y1, pw - x0)
+
+
+def to_4x6(src, dst, page_index=0, force_rotation=None, region=None):
     """Write a 4 x 6 in, upright version of src to dst.
 
+    Handles a label alone on its page, a label sharing a US Letter sheet
+    with a packing slip, and a label with no extractable text at all.
+    Anything it cannot resolve is refused with what it measured rather
+    than cropped to a guess: a wrong crop spends the stock either way,
+    and a plausible-looking one is worse than an error.
+
     Returns a dict describing what was done, for logging."""
-    bbox, detected_rot, page_size = inspect(src, page_index)
+    extent, detected_rot, page_size, info = find_label(src, page_index,
+                                                       region=region)
     rot = force_rotation if force_rotation is not None else detected_rot
+    if force_rotation is not None:
+        info["rotation_source"] = "forced"
+    bbox = _to_pdf_space(extent, page_size)
     box = _snap(bbox, rot, page_size)
 
     reader = PdfReader(src)
     page = reader.pages[page_index]
 
-    rect = RectangleObject(box)
+    source_rot = int(page.get("/Rotate") or 0) % 360
+    rect = RectangleObject(_unrotate(box, source_rot, page_size))
     page.mediabox = rect
     page.cropbox = rect
     page.trimbox = rect
     page.artbox = rect
     page.bleedbox = rect
     if rot:
+        # `rotate` adds to whatever the page already carried, which is
+        # what is wanted: the detected turn was measured in the rotated
+        # view a reader will already be applying.
         page.rotate(rot)
 
     writer = PdfWriter()
@@ -124,10 +372,13 @@ def to_4x6(src, dst, page_index=0, force_rotation=None):
     w, h = box[2] - box[0], box[3] - box[1]
     if rot in (90, 270):
         w, h = h, w
-    return {"rotation": rot,
-            "ink_bbox": tuple(round(v, 1) for v in bbox),
-            "crop_bbox": tuple(round(v, 1) for v in box),
-            "size_in": (round(w / PT_PER_IN, 3), round(h / PT_PER_IN, 3))}
+    info.update({"rotation": rot,
+                 "page": page_index + 1,
+                 "source_rotation": source_rot,
+                 "ink_bbox": tuple(round(v, 1) for v in bbox),
+                 "crop_bbox": tuple(round(v, 1) for v in box),
+                 "size_in": (round(w / PT_PER_IN, 3), round(h / PT_PER_IN, 3))})
+    return info
 
 
 def _code_placement(mediabox, rot, code, size, margin):
@@ -254,7 +505,16 @@ def extract_label_fields(pdf_4x6):
     import re
 
     with pdfplumber.open(pdf_4x6) as pdf:
-        text = pdf.pages[0].extract_text() or ""
+        page = pdf.pages[0]
+        # Confined to the crop. Cropping a PDF sets the boxes and leaves
+        # the content stream alone - a rasteriser honours that and prints
+        # only the window, but pdfplumber goes on listing every object on
+        # the sheet. On a Marketplace label there is nothing else there,
+        # which is why this never mattered; on a label sharing a page
+        # with a packing slip the last CITY ST ZIP on the page belongs to
+        # the slip, and `ship_to` would come back as an address that is
+        # not on the parcel.
+        text = (page.within_bbox(page.bbox).extract_text() or "")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     out = {}
 

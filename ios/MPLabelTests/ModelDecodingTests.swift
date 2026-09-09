@@ -294,4 +294,52 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertTrue(CostCoverage(sold: 9, costed: 2, margin: 40)
             .sentence.contains("fee"))
     }
+
+    // MARK: - a label from anywhere
+
+    /// The Pi's account of a 4x6 it had never seen before.
+    ///
+    /// The fixture is a dry run, which is the state most of these fields
+    /// exist for: the crop and the rotation are real and nothing was
+    /// printed, so it is the answer she is looking at when deciding
+    /// whether to spend a label on it.
+    func testPrintedLabelDecodes() throws {
+        let out = try decode(PrintedLabelResponse.self, from: "print_label")
+        XCTAssertEqual(out.label.sizeIn, [4.0, 6.0],
+                       "anything else and the raw backends clip it")
+        XCTAssertEqual(out.label.rotation, 90)
+        XCTAssertEqual(out.label.dryRun, true)
+        XCTAssertFalse(out.label.printed)
+        XCTAssertEqual(out.label.regionsFound, 1)
+        XCTAssertFalse(out.label.job.isEmpty)
+    }
+
+    /// `rotation_source` is the difference between an orientation that
+    /// was measured off the label's own text and one guessed from its
+    /// shape - and the shape knows the label is on its side without
+    /// knowing which way up. A guess that decodes as a measurement is an
+    /// upside-down label and a wasted one, so the distinction has to
+    /// survive the wire rather than being flattened to a number.
+    func testAGuessedOrientationIsDistinguishableFromAMeasuredOne() throws {
+        let measured = try decode(PrintedLabelResponse.self,
+                                  from: "print_label").label
+        XCTAssertEqual(measured.rotationSource, "text")
+        XCTAssertFalse(measured.wasGuessed)
+
+        // The other two, which the fixture cannot carry: the synthetic
+        // label has text on it, so the server has no reason to guess.
+        for (source, guessed) in [("aspect", true), ("forced", false)] {
+            let json = Data("""
+                {"label": {"size_in": [4.0, 6.0], "rotation": 90,
+                 "rotation_source": "\(source)", "page": 1,
+                 "regions_found": 1, "region": 1, "job": "adhoc-x",
+                 "recorded": "printd journal", "printed": true}}
+                """.utf8)
+            let out = try JSONDecoder().decode(PrintedLabelResponse.self,
+                                               from: json)
+            XCTAssertEqual(out.label.wasGuessed, guessed)
+            // `dry_run` is absent on a real print, not false.
+            XCTAssertNil(out.label.dryRun)
+        }
+    }
 }

@@ -92,7 +92,8 @@ run against a real database.
 
 | Prints | |
 |---|---|
-| `file <pdf> [-o] [--rotate] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
+| `file <pdf> [-o] [--rotate] [--page N] [--region N] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
+| `send <pdf> [--url] [--rotate] [--page N] [--region N] [--dry-run] [--force]` | send a PDF to the Pi to be printed, from a workstation. Records nothing but printd's journal. No DB |
 | `probe` | printers, USB devices, IEEE-1284 id |
 | `selftest` | tiny text-only TSPL label |
 | `inventory-label --code X [--qr\|--marker] [--size WxH[in]] [--preview PNG]` | draw one inventory label and show what the label maker would burn. `--size 4x1in` for a shelf label. No DB |
@@ -204,7 +205,8 @@ version in `pyproject.toml` never moving.
 src/mplabel/
   cli.py         argparse entrypoint, config, SQLite schema, poll loop
   mailparse.py   Marketplace email -> dict. stdlib HTMLParser, no bs4
-  label.py       letter-size PDF -> exact 4x6, + label-only field extraction
+  label.py       any label PDF -> exact 4x6, upright: finds the label on
+                 the page, works out which way up, + field extraction
   printers.py    TSPL/ZPL raw backends, CUPS backends, rasteriser, probe
   listings.py    listings schema, subject classification, analytics views
   backfill.py    one-off mailbox survey and historical import
@@ -414,6 +416,7 @@ hardware or a real Facebook account.
 | The on-device model | **Verified in the simulator, on real generations.** `FoundationModels` reports `available` and both halves run: the text draft (iOS 26) and the image path (iOS 27), which decoded straight into the `@Generable` type and correctly left `era` and `condition` **empty** on a picture it could not place. So the API, the guided decode and the availability handling are real rather than compiled. **Not** run on the phone, and the model there is the same size but not the same silicon. Nothing about the *quality* of a suggestion is verified - see the two findings below, both of which were measured rather than reasoned. |
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | **No email carries the postage charge** | **Verified from the real label email.** It is a *prepaid* label - Facebook pays the carrier and takes it out of the payout - so the one document this system reliably receives says what the parcel weighs and what service it went by, and not what it cost. A test pins that the fixture has no charge in it, because the temptation is to write a parser for a number that is not there. The payout email is the only plausible carrier and **none has ever been seen**, so whether one exists is still open: `mplabel scan` against the real mailbox is what settles it. Until then every figure is typed by a person, and `listings.estimate_postage` derives one only from parcels whose charge she actually confirmed - returning nothing at all when there is no basis, rather than a number that would be indistinguishable from a measured one a week later. |
+| Printing a label that is not a Marketplace one | **Works end to end against a real server; never against a real seller's PDF.** `mplabel send` posts to `POST /api/v1/print/label`, which crops, orients and prints, and records nothing but printd's journal. Exercised against a live `mplabel serve` on loopback: the login, the token cache, the digest-derived job id, a US Letter page carrying a packing slip, and the refusal on two look-alike blocks with `--region` resolving it. What is **ASSUMED** is the shape real labels come in: every page it has been shown was drawn by `reportlab` in this repo. eBay, PirateShip and the carriers' own PDFs have never been near it, and the first one is the experiment - run it with `--dry-run` first, which is free. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 | The release workflow | **UNRUN.** Every piece of it is a command that works on a Mac, and none of it has been executed once - not the runner label, not cloud signing, not the upload. The first tag is the experiment. What is checked in software: `version.sh` against good and bad tags, both workflows' shell blocks parse, and `check-archive.sh` refuses XcodeGen's placeholder version numbers. What cannot be: whether the API key's role is sufficient, whether `macos-26` has an iOS 26 SDK today, and whether App Store Connect accepts a three-part build number of this shape. |
 
@@ -429,6 +432,39 @@ cropped to ink-plus-2pt margin, which is fine through CUPS but 824 dots
 wide at 203dpi — wider than the 812-dot print head. The overflow rows
 eject a second, near-blank label. `label._snap()` centres the ink in a
 nominal-size window instead. `test_output_is_exactly_4x6` guards this.
+
+**A label that is not a Marketplace one has to be *found* before it can
+be cropped.** `to_4x6` used to take the whole page's ink and snap it to
+4x6, which is exactly right when the label has the page to itself - and
+every Marketplace label does. Almost nothing else does: eBay, PirateShip
+and the carriers' own sites hand out a US Letter page with the label on
+the top half and a packing slip below it, and the ink then spans the
+sheet and is refused. `find_label` runs a recursive XY-cut over the ink
+when, and only when, the whole page does not already fit - so the one
+path with real labels behind it cannot be moved by a layout heuristic.
+
+Three things about it are load bearing. Two blocks that could both be
+the label are **refused** rather than guessed between, because printing
+the packing slip spends the stock either way and the person holding the
+file is the only one who can settle it (`--region`). A label with no
+extractable text - some carriers flatten theirs to one image - gets its
+orientation from its **shape**, which knows the label is on its side and
+cannot know which way up, so the answer carries `rotation_source` and
+the screens say "guessed from its shape" rather than presenting it as
+measured. And rotation is a **majority** of the characters rather than
+`chars[0]`: on a page with an upright slip above a rotated label, the
+first character in the content stream is a coin toss between the two.
+
+**A crop does not remove anything from the page.** It sets the boxes;
+the content stream keeps every object on the sheet. A rasteriser honours
+that - `render_bitmap` output is byte-identical with and without a
+packing slip below the label, which is what says the slip never reaches
+paper - but **pdfplumber does not**, and `extract_label_fields` anchors
+`ship_to` on the *last* CITY ST ZIP on the page. On a Marketplace label
+there is nothing else there, which is why this never mattered; on a
+shared page that last address is the slip's, and `ship_to` is the
+backstop against posting a parcel to a stranger. It reads through
+`page.within_bbox(page.bbox)` now.
 
 **Parse the label after rotation, not before.** `extract_text()` on the
 source PDF returns every line mirrored (`sIPA` for `USPS APIs`) because
@@ -559,6 +595,29 @@ returns and not before, `print_pi_http` deliberately does not retry, and
 its unreachable message says "may or may not have printed - ask it with
 GET /printed" rather than guessing. `mplabel reconcile` is the recovery
 path. Do not add a retry, and do not let a 409 read as a fresh print.
+
+**An ad-hoc label is not a sale, and nothing pretends otherwise.**
+`POST /api/print/label` takes a PDF nobody has seen before, crops it,
+prints it and writes **no row**: not `sales`, not `listings`, no file
+kept in `labels/`. There is no order for it to belong to, and inventing
+one would put a parcel nobody bought into revenue, into sell-through and
+into the Sheet. What records it is printd's journal - which is the only
+durable record this system has anyway, the G4 being write-only - and
+with `printer_backend` pointing straight at a device there is no journal
+at all. The answer says which, in those words, because a caveat that is
+false on this host is worse than no caveat.
+
+Two things follow. `label_belongs_to` has nothing to check against here,
+because there is no recorded recipient to compare the PDF with: the
+backstop is that a person chose the file a second ago, which is a
+weaker guarantee, and `--dry-run` exists so the crop can be checked
+without spending stock. And the job id is the **digest of the PDF**, so
+a request that timed out after the label came out gets a 409 from printd
+rather than a second label - she is on a phone behind a tunnel and the
+retry is the likely case, not the unusual one. Asking again on purpose
+is `--force`, which is a different intent and gets a different id. The
+id rides on the remote backend alone: a local device keeps no journal,
+so there is nothing there that could answer a duplicate.
 
 **The phone app's token is a bearer token, and `/api/v1` is the name
 that will not move.** `issue_token`/`valid_token` were always stateless

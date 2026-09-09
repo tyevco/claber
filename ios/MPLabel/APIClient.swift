@@ -337,6 +337,46 @@ actor APIClient {
         return try await send(req, as: PhotoResponse.self).photo
     }
 
+    /// Print a 4x6 that did not come from a Marketplace email.
+    ///
+    /// The PDF goes up whole and the Pi does the cropping. That is not
+    /// laziness about doing it here: finding the label on a US Letter
+    /// page and working out which way up it is lives in `label.py` next
+    /// to the geometry that has real labels behind it, and a second
+    /// implementation in Swift would be a second thing to be wrong about
+    /// a page nobody can see. Same rule that keeps the raster off the
+    /// wire when a tag is printed.
+    ///
+    /// Nothing is recorded for this label beyond printd's journal - it is
+    /// not a sale and does not become one - so there is no id to come
+    /// back to and no reprint. Sending it again is sending it again.
+    ///
+    /// `dryRun` converts and measures without printing. Worth offering
+    /// prominently rather than hiding: this printer cannot report a
+    /// failure, so a wrong crop costs a label and says nothing.
+    func printLabel(_ pdf: Data,
+                    rotate: Int? = nil,
+                    page: Int = 1,
+                    region: Int? = nil,
+                    dryRun: Bool = false,
+                    force: Bool = false) async throws -> PrintedLabel {
+        var query: [String] = []
+        if let rotate { query.append("rotate=\(rotate)") }
+        if page > 1 { query.append("page=\(page)") }
+        if let region { query.append("region=\(region)") }
+        if dryRun { query.append("dry_run=1") }
+        if force { query.append("force=1") }
+        let path = "/print/label" + (query.isEmpty ? "" : "?" + query.joined(separator: "&"))
+
+        var req = try request(path, method: "POST")
+        req.httpBody = pdf
+        req.setValue("application/pdf", forHTTPHeaderField: "Content-Type")
+        // The upload, the crop and the print are all on this one request,
+        // and the print is a physical thing on the end of a tunnel.
+        req.timeoutInterval = 120
+        return try await send(req, as: PrintedLabelResponse.self).label
+    }
+
     /// The bytes, fetched rather than handed to `AsyncImage`, which
     /// cannot carry the bearer token.
     func photoData(_ id: Int) async throws -> Data {

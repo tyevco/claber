@@ -283,6 +283,33 @@ final class FlowTests: XCTestCase {
             .waitForExistence(timeout: 10))
     }
 
+    /// Printing a label that is not a Marketplace one. Settings is the
+    /// only route to it, the same place the PWA puts it, and a screen
+    /// with no route to it is the quietest kind of deletion.
+    ///
+    /// Read-only on purpose: it stops at the screen rather than choosing
+    /// a file. The simulator's document picker is a system UI this test
+    /// cannot drive, and the print behind it spends real stock - so what
+    /// is checked here is the route and the promise the screen makes,
+    /// and the payload itself is checked in Python and in the decoding
+    /// tests.
+    func testPrintingAnArbitraryLabelIsReachableFromSettings() throws {
+        let app = try launch()
+        XCTAssertTrue(app.staticTexts["To ship"].waitForExistence(timeout: 15))
+        app.buttons["Settings"].tap()
+        XCTAssertTrue(app.staticTexts["Print a label"]
+            .waitForExistence(timeout: 10))
+        app.staticTexts["Print a label"].tap()
+        XCTAssertTrue(app.staticTexts["Choose a PDF"]
+            .waitForExistence(timeout: 10))
+        // The two things this screen has to keep saying: it is not a
+        // sale, and sending the same file twice is not two labels.
+        XCTAssertTrue(app.staticTexts
+            .containing(NSPredicate(format: "label CONTAINS %@",
+                                    "not a sale"))
+            .firstMatch.exists)
+    }
+
     /// The screen a local pickup depends on. It is also the one that puts
     /// a cost in, so the assertion is that the thing comes back with what
     /// it cost - a saved item with a null `paid` is the failure that

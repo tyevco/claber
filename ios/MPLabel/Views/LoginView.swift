@@ -187,6 +187,29 @@ struct SettingsView: View {
                 }
                 .task { await push.refresh() }
 
+                // A push inside this sheet's own NavigationStack, and
+                // the only way to that screen - the PWA puts it in the
+                // same place for the same reason. It is not one of the
+                // four moments the app is for, so it does not earn a
+                // tab; it is a real job, so it does not get buried
+                // deeper than this.
+                NavigationLink {
+                    PrintLabelView()
+                } label: {
+                    MPCard {
+                        HStack {
+                            Text("Print a label")
+                                .font(.system(size: 14))
+                                .foregroundStyle(MP.Palette.fg)
+                            Spacer()
+                            Text("any 4x6 PDF")
+                                .font(.system(size: 12))
+                                .foregroundStyle(MP.Palette.muted)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+
                 Button {
                     Settings.serverURL = nil
                     session.signOut()

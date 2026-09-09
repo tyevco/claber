@@ -20,6 +20,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
+import pdfplumber
 import pytest
 
 from mplabel import (inventory, label, listings, mailparse, marker, qr, rs,
@@ -102,6 +103,9 @@ def test_ship_to_is_recipient_not_sender(tmp_path):
 
 
 def test_oversized_content_rejected(tmp_path):
+    """A page of ink is not a 4x6 label, and cropping to its middle would
+    print a corner of one. Refused - and since the region finder landed,
+    refused by it rather than by _snap, with the size it measured."""
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import letter
     big = tmp_path / "big.pdf"
@@ -109,8 +113,249 @@ def test_oversized_content_rejected(tmp_path):
     c.rect(20, 20, 550, 700)
     c.showPage()
     c.save()
-    with pytest.raises(ValueError, match="larger than"):
+    with pytest.raises(ValueError, match="no block on this page is a 4 x 6"):
         label.to_4x6(big, tmp_path / "o.pdf")
+
+
+# ------------------------------------------- finding the label on a page
+#
+# Every one of these is a shape a non-Facebook label actually arrives in.
+# A Marketplace label has its page to itself and needs none of this; eBay,
+# PirateShip and the carriers' own sites put a packing slip on the same
+# sheet, and cropping to all the ink then refuses a perfectly good label.
+
+
+def _label_block(c, x0=90, y0=450):
+    """The real Marketplace geometry - 432x288pt of ink with its text
+    running bottom-to-top - drawn wherever it is asked for."""
+    c.saveState()
+    c.translate(x0, y0)
+    c.rotate(90)
+    c.rect(0, -432, 288, 432)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(20, -120, "USPS GROUND ADVANTAGE")
+    c.setFont("Helvetica", 9)
+    for i, t in enumerate(["SAM SAMPLE", "9 EXAMPLE ST",
+                           "SHELBYVILLE IN 46176-0002"]):
+        c.drawString(20, -180 - i * 12, t)
+    c.setFont("Helvetica", 11)
+    c.drawString(20, -300, "9400100000000000000000")
+    c.restoreState()
+
+
+def _letter_with_slip(path, slip_first=True, slip=True):
+    """A US Letter sheet: the 4x6 label up top, a packing slip below it.
+
+    The slip is drawn first on purpose. `inspect` used to read the
+    rotation off `chars[0]`, which on this page is the slip's upright
+    text rather than the label's rotated text. It also carries an address
+    of its own, because that is what makes a loose text extraction
+    dangerous rather than merely untidy."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    c = canvas.Canvas(str(path), pagesize=letter)
+
+    def draw_slip():
+        c.setFont("Helvetica", 10)
+        c.drawString(72, 300, "PACKING SLIP - not the label")
+        for i in range(6):
+            c.drawString(72, 270 - i * 14, f"1 x item number {i} SLIPONLY")
+        for i, t in enumerate(["RETURNS DEPT", "5 WAREHOUSE RD",
+                               "NOWHERE OH 44101-0003"]):
+            c.drawString(72, 180 - i * 12, t)
+        c.line(72, 120, 540, 120)
+
+    if slip and slip_first:
+        draw_slip()
+    _label_block(c)
+    if slip and not slip_first:
+        draw_slip()
+    c.showPage()
+    c.save()
+    return path
+
+
+def test_a_label_sharing_a_page_with_a_packing_slip_is_found(tmp_path):
+    """The ink spans the whole sheet, so cropping to it is refused - but
+    the label is right there, separated by a clear gutter. Not finding it
+    is the difference between this working on eBay's labels and not."""
+    src = _letter_with_slip(tmp_path / "slip.pdf")
+    out = tmp_path / "o.pdf"
+    info = label.to_4x6(src, out)
+    assert info["size_in"] == (4.0, 6.0)
+    assert info["crop_bbox"] == (90.0, 450.0, 522.0, 738.0)
+
+
+def test_the_packing_slip_is_not_what_gets_printed(tmp_path):
+    """The failure this guards against is silent: a 4x6 crop of the wrong
+    half of the page looks like a label until it is on a parcel.
+
+    Asked of the raster, not of the crop box. Cropping a PDF sets the
+    boxes and leaves the content stream alone, so "the box is right" and
+    "only the label prints" are two different claims and only the second
+    one is about paper."""
+    from mplabel import printers
+    with_slip = tmp_path / "slip.pdf"
+    alone = tmp_path / "alone.pdf"
+    _letter_with_slip(with_slip)
+    _letter_with_slip(alone, slip=False)
+
+    rasters = []
+    for src in (with_slip, alone):
+        out = src.with_name(src.stem + "_4x6.pdf")
+        label.to_4x6(src, out)
+        rasters.append(bytes(printers.render_bitmap(out, 203)[0]))
+    assert rasters[0] == rasters[1]
+
+
+def test_a_crop_confines_the_field_reader_too(tmp_path):
+    """`ship_to` is the backstop against posting a parcel to a stranger,
+    and it anchors on the last CITY ST ZIP on the page. pdfplumber lists
+    every object on the sheet whatever the crop box says, so on a page
+    with a packing slip below the label that last address is the slip's."""
+    src = _letter_with_slip(tmp_path / "slip.pdf")
+    out = tmp_path / "o.pdf"
+    label.to_4x6(src, out)
+    got = label.extract_label_fields(out)
+    assert got["tracking"] == "9400100000000000000000"
+    assert "SHELBYVILLE IN 46176-0002" in got["ship_to"]
+    assert "NOWHERE" not in got["ship_to"]
+
+
+def test_rotation_is_the_majority_not_the_first_character(tmp_path):
+    """`chars[0]` is whatever the content stream drew first. On a page
+    with an upright slip above a rotated label that is a coin toss, and
+    the wrong answer crops a 6x4 window out of a 4x6 label."""
+    src = _letter_with_slip(tmp_path / "slip.pdf", slip_first=True)
+    info = label.to_4x6(src, tmp_path / "o.pdf")
+    assert info["rotation"] == 90
+    assert info["rotation_source"] == "text"
+
+
+def test_a_label_with_no_text_is_oriented_from_its_shape(tmp_path):
+    """Some carriers' labels are one flattened image and extract no text
+    at all. Those used to be called rotation 0 and then refused for being
+    "6.00 x 4.00 in, larger than the 4 x 6 in target" - a correct
+    measurement wearing a wrong diagnosis."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    src = tmp_path / "image_only.pdf"
+    c = canvas.Canvas(str(src), pagesize=letter)
+    c.rect(90, 450, 432, 288, fill=0)
+    for i in range(20):
+        c.rect(100 + i * 4, 470, 2, 60, fill=1)
+    c.showPage()
+    c.save()
+    info = label.to_4x6(src, tmp_path / "o.pdf")
+    assert info["size_in"] == (4.0, 6.0)
+    assert info["rotation"] == 90
+    # Said out loud, because the shape cannot say which way *up* - only
+    # that the label is on its side. --rotate is the override.
+    assert info["rotation_source"] == "aspect"
+
+
+def test_two_look_alike_blocks_are_refused_rather_than_guessed(tmp_path):
+    """Two 4x6-shaped blocks on one sheet. Picking wrong spends the stock
+    and prints the wrong thing, so this refuses and says where they are."""
+    from reportlab.pdfgen import canvas
+    src = tmp_path / "two.pdf"
+    c = canvas.Canvas(str(src), pagesize=(612, 936))
+    _label_block(c, x0=90, y0=40)
+    _label_block(c, x0=90, y0=500)
+    c.showPage()
+    c.save()
+    with pytest.raises(ValueError, match="--region"):
+        label.to_4x6(src, tmp_path / "o.pdf")
+
+
+def test_a_region_can_be_chosen_when_the_page_holds_two(tmp_path):
+    from reportlab.pdfgen import canvas
+    src = tmp_path / "two.pdf"
+    c = canvas.Canvas(str(src), pagesize=(612, 936))
+    _label_block(c, x0=90, y0=40)
+    _label_block(c, x0=90, y0=500)
+    c.showPage()
+    c.save()
+    first = label.to_4x6(src, tmp_path / "a.pdf", region=1)
+    second = label.to_4x6(src, tmp_path / "b.pdf", region=2)
+    assert first["size_in"] == second["size_in"] == (4.0, 6.0)
+    assert first["crop_bbox"] != second["crop_bbox"]
+    assert first["regions_found"] == 2
+
+
+def test_a_page_can_be_chosen_from_a_multi_page_pdf(tmp_path):
+    """Two labels, one per page - which is how a batch of them is bought."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    src = tmp_path / "pair.pdf"
+    c = canvas.Canvas(str(src), pagesize=letter)
+    _label_block(c, x0=90, y0=450)
+    c.showPage()
+    _label_block(c, x0=100, y0=300)
+    c.showPage()
+    c.save()
+    one = label.to_4x6(src, tmp_path / "a.pdf", page_index=0)
+    two = label.to_4x6(src, tmp_path / "b.pdf", page_index=1)
+    assert one["crop_bbox"] == (90.0, 450.0, 522.0, 738.0)
+    assert two["crop_bbox"] == (100.0, 300.0, 532.0, 588.0)
+    assert two["page"] == 2
+    with pytest.raises(ValueError, match="no page 3"):
+        label.to_4x6(src, tmp_path / "c.pdf", page_index=2)
+
+
+@pytest.mark.parametrize("source_rotation", [90, 180, 270])
+def test_a_page_that_already_carries_a_rotation_still_crops_to_its_label(
+        tmp_path, source_rotation):
+    """pdfplumber applies /Rotate before reporting coordinates and pypdf's
+    mediabox does not, so a box measured in one and written into the other
+    crops a different corner of the page entirely. Marketplace labels
+    carry no /Rotate, which is why nothing here had to know that.
+
+    Asserted by reading the label back rather than by comparing
+    arithmetic to itself: the failure is a crop that lands somewhere
+    plausible, and only the content says whether it landed on the label.
+    """
+    from pypdf import PdfReader, PdfWriter
+    turned = tmp_path / "turned.pdf"
+    reader = PdfReader(str(LABEL_PDF))
+    writer = PdfWriter()
+    page = reader.pages[0]
+    page.rotate(source_rotation)
+    writer.add_page(page)
+    with open(turned, "wb") as fh:
+        writer.write(fh)
+
+    out = tmp_path / "o.pdf"
+    info = label.to_4x6(turned, out)
+    assert info["size_in"] == (4.0, 6.0)
+    assert info["source_rotation"] == source_rotation
+    got = label.extract_label_fields(out)
+    assert got["tracking"] == "9400100000000000000000"
+    assert "SAM SAMPLE" in got["ship_to"]
+
+
+def test_a_label_already_on_a_4x6_page_is_left_alone(tmp_path):
+    """A label bought from PirateShip arrives as a 4x6 page with the ink
+    running to its edges. There is nothing to find and nothing to turn."""
+    from reportlab.pdfgen import canvas
+    src = tmp_path / "already.pdf"
+    c = canvas.Canvas(str(src), pagesize=(288, 432))
+    c.rect(4, 4, 280, 424)
+    c.setFont("Helvetica", 11)
+    c.drawString(20, 300, "9400100000000000000000")
+    c.showPage()
+    c.save()
+    info = label.to_4x6(src, tmp_path / "o.pdf")
+    assert info["size_in"] == (4.0, 6.0)
+    assert info["rotation"] == 0
+    assert info["regions_found"] == 1
+
+
+def test_a_forced_rotation_says_it_was_forced(tmp_path):
+    """--rotate is the override for the case the shape cannot settle, so
+    the answer has to distinguish it from something that was measured."""
+    info = label.to_4x6(LABEL_PDF, tmp_path / "o.pdf", force_rotation=90)
+    assert info["rotation_source"] == "forced"
 
 
 # ----------------------------------------------------------- parcel code
@@ -2178,6 +2423,16 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
                          {"ids": [], "dry_run": True}, cookie=cookie,
                          headers={"X-Mplabel": "1"})
     served |= set(json.loads(body))
+    # A label from anywhere else. A dry run: the crop and the measurement
+    # are real and no stock is spent, which is the whole point of the
+    # flag - and without it `rotation_source` looks like a key the server
+    # never sends, when it is the one that says whether an orientation
+    # was measured or guessed.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/print/label?dry_run=1",
+                         "POST", raw=LABEL_PDF.read_bytes(), cookie=cookie,
+                         headers={"X-Mplabel": "1",
+                                  "Content-Type": "application/pdf"})
+    served |= set(json.loads(body)["label"])
     # `expires_in` only appears on login, which the fixture did above.
     served.add("expires_in")
 
@@ -7257,6 +7512,259 @@ def test_an_oversized_photo_is_refused_before_it_is_read(app):
         pass
 
     assert conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0] == 0
+
+
+# ------------------------------------------------- a label from anywhere
+#
+# Everything else on this server prints a label it already has, off a
+# sales row, checked against the address recorded when that sale was
+# filed. This route prints a PDF somebody just handed it and records
+# nothing beyond printd's journal, and every test here is about one of
+# those two halves staying true.
+
+def _adhoc(base, headers, body, query=""):
+    head = dict(headers or {})
+    head["Content-Type"] = "application/pdf"
+    return _http(f"{base}/api/v1/print/label{query}", "POST", raw=body,
+                 headers=head)
+
+
+def test_an_arbitrary_label_prints_through_the_same_path_as_everything_else(
+        app, monkeypatch):
+    """Not a reimplementation of printing. `cli.print_label` is what knows
+    to take the flock on a local backend and to skip it on a remote one,
+    and a second copy of that decision is how the loopback deadlock got
+    reintroduced against the second device."""
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+
+    sent = []
+    monkeypatch.setattr(cli, "print_label",
+                        lambda *a, **k: sent.append((a, k)))
+    status, _, body = _adhoc(base, head, LABEL_PDF.read_bytes())
+    assert status == 200
+    info = _json_of(body)["label"]
+    assert info["printed"] is True
+    assert info["size_in"] == [4.0, 6.0]
+    assert len(sent) == 1
+    # (cfg, path) and a job id, and no parcel code: codes come off the
+    # sales table and this has no row in it, so stamping one would put a
+    # parcel that does not exist on a real label.
+    assert len(sent[0][0]) == 2
+    assert sent[0][1] == {"job": info["job"]}
+
+
+def test_an_arbitrary_label_leaves_no_row_behind(app, monkeypatch):
+    """It is not a sale. A row here would put a parcel nobody bought into
+    revenue, into sell-through and into the Sheet, and `verify` would
+    then be checking a label against a buyer who does not exist."""
+    from mplabel import cli
+
+    base, conn = app
+    head = _auth(base)
+    before = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+    assert _adhoc(base, head, LABEL_PDF.read_bytes())[0] == 200
+    assert conn.execute("SELECT count(*) FROM sales").fetchone()[0] == before
+    assert conn.execute("SELECT count(*) FROM listings").fetchone()[0] == 0
+
+
+def test_the_same_pdf_twice_is_one_job(app, monkeypatch):
+    """She is on a phone behind a tunnel and the request timed out. A
+    random job id would turn her retry into a second label; the digest
+    lets printd answer 409 instead. Asking again on purpose is --force,
+    which is a different intent and gets a different id."""
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+
+    body = LABEL_PDF.read_bytes()
+    first = _json_of(_adhoc(base, head, body)[2])["label"]
+    again = _json_of(_adhoc(base, head, body)[2])["label"]
+    forced = _json_of(_adhoc(base, head, body, "?force=1")[2])["label"]
+
+    assert first["job"] == again["job"]
+    assert forced["job"] != first["job"]
+    assert first["job"].startswith("adhoc-")
+
+
+def test_the_job_id_reaches_the_printer_or_it_dedupes_nothing(tmp_path,
+                                                              monkeypatch):
+    """Deriving the id from the digest is only worth anything if printd
+    is the thing that sees it. It rides on the remote backend alone: a
+    local device keeps no journal, so there is nothing there that could
+    answer a duplicate."""
+    from mplabel import cli, printers
+
+    calls = []
+    monkeypatch.setattr(printers, "send",
+                        lambda path, backend, **kw: calls.append((backend, kw)))
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+
+    cli.print_label({"printer_backend": "pi-http", "printd_url": "http://x",
+                     "printd_secret": "s", "home": str(tmp_path)},
+                    str(pdf), job="adhoc-deadbeef")
+    assert calls[-1][1]["job"] == "adhoc-deadbeef"
+
+    cli.print_label({"printer_backend": "tspl", "printer_device": "/dev/null",
+                     "home": str(tmp_path)}, str(pdf), job="adhoc-deadbeef")
+    assert "job" not in calls[-1][1]
+
+
+def test_a_dry_run_prints_nothing_and_still_says_what_it_would_do(
+        app, monkeypatch):
+    """On a printer that cannot report a failure, the cheap way to find
+    out whether a new seller's PDF crops correctly has to cost no stock."""
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+
+    status, _, body = _adhoc(base, head, LABEL_PDF.read_bytes(), "?dry_run=1")
+    assert status == 200
+    info = _json_of(body)["label"]
+    assert sent == []
+    assert info["printed"] is False and info["dry_run"] is True
+    assert info["size_in"] == [4.0, 6.0]
+    assert info["rotation"] == 90
+
+
+@pytest.mark.parametrize("backend,expected", [("tspl", "nowhere"),
+                                              ("pi-http", "printd journal")])
+def test_the_answer_says_where_the_record_went(tmp_path, backend, expected):
+    """Journal-only is the whole design, so "which journal" has to be
+    answerable - and pointed straight at a device the honest answer is
+    "nowhere", not a quieter wording of it. A caveat that stops being
+    true, or was never true on this host, is worse than no caveat."""
+    import threading
+
+    from mplabel import cli, web
+
+    cli.connect_db(tmp_path)
+    cfg = {"home": str(tmp_path), "printer_backend": backend,
+           "web_password_hash": web.hash_password("hunter2"),
+           "web_secure_cookie": "no"}
+    srv = web.Server(("127.0.0.1", 0), cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        info = _json_of(_adhoc(base, _auth(base), LABEL_PDF.read_bytes(),
+                               "?dry_run=1")[2])["label"]
+        assert expected in info["recorded"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_body_that_is_not_a_pdf_is_refused_before_anything_opens(
+        app, monkeypatch):
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+
+    status, _, body = _adhoc(base, head, b"this is not a pdf at all")
+    assert status == 400
+    assert "not a PDF" in _json_of(body)["error"]
+
+    # And a PDF announced as something else. The type is checked as well
+    # as the magic, because the type is what says how to read the body.
+    status, _, _ = _http(f"{base}/api/v1/print/label", "POST",
+                         raw=b"%PDF-1.4\n",
+                         headers=dict(head, **{"Content-Type": "text/plain"}))
+    assert status == 400
+    assert sent == []
+
+
+def test_a_label_that_cannot_be_cropped_says_why(app, tmp_path, monkeypatch):
+    """"This may not be a shipping label" is actionable, "bad request" is
+    not, and this is the one screen where the reason *is* the feature -
+    the person holding the file is the only one who can resolve it."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+
+    src = tmp_path / "full.pdf"
+    c = canvas.Canvas(str(src), pagesize=letter)
+    c.rect(20, 20, 550, 700)
+    c.showPage()
+    c.save()
+
+    status, _, body = _adhoc(base, head, src.read_bytes())
+    assert status == 400
+    assert "4 x 6" in _json_of(body)["error"]
+
+
+def test_a_page_and_a_region_can_be_chosen_over_the_wire(app, tmp_path,
+                                                         monkeypatch):
+    """The server refuses to guess between two look-alike blocks, so the
+    way to resolve that has to survive the trip from the phone."""
+    from reportlab.pdfgen import canvas
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+
+    src = tmp_path / "two.pdf"
+    c = canvas.Canvas(str(src), pagesize=(612, 936))
+    _label_block(c, x0=90, y0=40)
+    _label_block(c, x0=90, y0=500)
+    c.showPage()
+    c.save()
+    body = src.read_bytes()
+
+    status, _, answer = _adhoc(base, head, body)
+    assert status == 400 and "--region" in _json_of(answer)["error"]
+
+    one = _json_of(_adhoc(base, head, body, "?region=1&dry_run=1")[2])["label"]
+    two = _json_of(_adhoc(base, head, body, "?region=2&dry_run=1")[2])["label"]
+    assert one["crop_bbox"] != two["crop_bbox"]
+    assert one["regions_found"] == 2
+
+    status, _, answer = _adhoc(base, head, body, "?region=9")
+    assert status == 400 and "no region 9" in _json_of(answer)["error"]
+
+
+def test_an_oversized_upload_is_refused_on_content_length(app, monkeypatch):
+    """Refused before a byte is read, like the photo route: pulling a
+    hundred megabytes into memory on a Pi is how the OOM killer gets to
+    stop the label printer."""
+    import urllib.error
+
+    from mplabel import cli, web
+
+    base, _conn = app
+    head = _auth(base)
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+    assert web.MAX_LABEL < web.MAX_PHOTO
+
+    try:
+        status, _, _ = _adhoc(base, head, b"%PDF-1.4\n" + b"\0" * web.MAX_LABEL)
+        assert status in (400, 413)
+    except (urllib.error.URLError, ConnectionError, BrokenPipeError):
+        pass
+    assert sent == []
+
+
+def test_the_ad_hoc_route_needs_authentication(app):
+    base, _conn = app
+    assert _adhoc(base, {"X-Mplabel": "1"}, b"%PDF-1.4\n")[0] == 401
 
 
 def test_the_sourcing_routes_need_authentication(app):

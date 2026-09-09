@@ -21,7 +21,12 @@ var S = {
   /* The shelf: what is where. `focusId` survives a re-render - screens
      rerender into innerHTML, which drops focus and the caret with it,
      and a search box that loses focus every keystroke is unusable. */
-  inv: [], invQ: '', bins: [], item: null, bin: null, focusId: null
+  inv: [], invQ: '', bins: [], item: null, bin: null, focusId: null,
+  /* The chosen PDF and what the server said about it, while the
+     Print-a-label screen is up. Never persisted: the file is the
+     one thing here that cannot be re-fetched, and a half-remembered
+     one across a reload would print something she did not pick. */
+  send: null
 };
 
 var app = document.getElementById('app');
@@ -51,6 +56,14 @@ async function api(path, opts) {
   if (opts.body !== undefined) {
     init.body = JSON.stringify(opts.body);
     init.headers['Content-Type'] = 'application/json';
+  }
+  /* Raw bytes with a real type, for the routes that take a file: a
+     photograph and a label PDF. Deliberately not multipart - one file
+     and no other fields, so the query string carries the rest and there
+     is no parser on either end to get wrong. */
+  if (opts.raw !== undefined) {
+    init.body = opts.raw;
+    init.headers['Content-Type'] = opts.type || 'application/octet-stream';
   }
   var res = await fetch(path, init);
   if (res.status === 401) { S.authed = false; render(); throw new Error('401'); }
@@ -507,6 +520,9 @@ function settingsView() {
             (S.theme === 'dark' ? 'light' : 'dark') + '\')">' +
             '<span>Appearance</span><span class="val">' +
             (S.theme === 'dark' ? 'Dark' : 'Light') + '</span></button>' +
+          '<button class="item" onclick="go(\'sendlabel\')">' +
+            '<span>Print a label</span>' +
+            '<span class="val">any 4x6 PDF →</span></button>' +
           '<button class="item" onclick="logout()">' +
             '<span>Sign out</span><span class="val">→</span></button>' +
         '</div>' +
@@ -767,6 +783,171 @@ function tabs(active) {
   }).join('') + '</nav>';
 }
 
+/* ------------------------------------------------- a label from anywhere */
+/*
+ * Print a 4x6 that did not come from a Marketplace email - eBay, a
+ * carrier's own site, a parcel that is not a sale at all. The server
+ * finds the label on the page and turns it the right way up; nothing
+ * here knows anything about geometry, and nothing is recorded for it
+ * beyond printd's journal.
+ *
+ * The dry run is not a nicety. This printer cannot report a failure, so
+ * a wrong crop costs a label and says nothing, and a new seller's PDF is
+ * exactly where a wrong crop comes from. Checking first is free.
+ */
+
+function pickLabel(input) {
+  var f = input.files && input.files[0];
+  if (!f) return;
+  S.send = { name: f.name, file: f, dry: true, rotate: '', page: 1,
+             region: '', result: null, error: '', busy: false };
+  render();
+}
+
+function sendOpt(key, value) {
+  if (!S.send) return;
+  S.send[key] = value;
+  /* Any option changes what the answer would be, so the old one stops
+     being about this. Showing a stale crop next to a changed rotation is
+     how somebody prints the thing they were just told not to. */
+  S.send.result = null;
+  S.send.error = '';
+  render();
+}
+
+async function sendLabel() {
+  var pick = S.send;
+  if (!pick || !pick.file || pick.busy) return;
+  pick.busy = true; pick.error = ''; render();
+
+  var q = [];
+  if (pick.rotate !== '') q.push('rotate=' + pick.rotate);
+  if (pick.page > 1) q.push('page=' + pick.page);
+  if (pick.region !== '') q.push('region=' + pick.region);
+  if (pick.dry) q.push('dry_run=1');
+  try {
+    var body = await pick.file.arrayBuffer();
+    /* Unversioned, like every other call here. `/api/v1` exists for a
+   client that cannot change in the same commit as a route; this
+   file ships with the server and always can. */
+    var d = await api('/api/print/label' + (q.length ? '?' + q.join('&') : ''),
+                      { method: 'POST', raw: body, type: 'application/pdf' });
+    pick.result = d.label;
+    if (!pick.dry) toast('Printed ' + pick.name);
+  } catch (e) {
+    /* The server's sentence, not a status code. "This may not be a
+       shipping label" and "say which with --region" are the whole point
+       of the message - only the person holding the file can act on
+       either, and neither survives being turned into "failed". */
+    pick.error = e.message;
+  }
+  pick.busy = false;
+  render();
+}
+
+function sendLabelView() {
+  var pick = S.send;
+  var r = pick && pick.result;
+
+  var chooser = '<label class="card" style="align-items:center;cursor:pointer">' +
+    '<div class="code" style="width:54px;height:40px;font-size:18px">PDF</div>' +
+    '<div class="meta"><div class="distinct">' +
+      (pick ? esc(pick.name) : 'Choose a PDF') + '</div>' +
+      '<div class="lead">' + (pick ? 'Tap to choose another' :
+        'From Files, or whatever the seller emailed') + '</div></div>' +
+    '<input type="file" accept="application/pdf,.pdf" ' +
+      'style="position:absolute;width:1px;height:1px;opacity:0" ' +
+      'onchange="pickLabel(this)"></label>';
+
+  var opts = '';
+  if (pick) {
+    var turns = [['', 'Work it out'], ['0', '0°'], ['90', '90°'],
+                 ['180', '180°'], ['270', '270°']];
+    opts = '<div class="panel list" style="padding:0">' +
+      '<button class="item" onclick="sendOpt(\'dry\',' + (pick.dry ? 'false' : 'true') +
+        ')"><span>Check only</span><span class="val">' +
+        (pick.dry ? 'On - no label used' : 'Off - it will print') + '</span></button>' +
+      '<div class="item"><span>Turn</span><span class="val">' +
+        turns.map(function (t) {
+          return '<button class="link" style="padding:0 6px' +
+            (pick.rotate === t[0] ? ';font-weight:700' : ';opacity:.55') +
+            '" onclick="sendOpt(\'rotate\',\'' + t[0] + '\')">' +
+            t[1] + '</button>';
+        }).join('') + '</span></div>' +
+      '<div class="item"><span>Page</span><span class="val">' +
+        '<button class="link" onclick="sendOpt(\'page\',' +
+          Math.max(1, (pick.page || 1) - 1) + ')">−</button>' +
+        '<b style="padding:0 8px">' + esc(pick.page || 1) + '</b>' +
+        '<button class="link" onclick="sendOpt(\'page\',' +
+          ((pick.page || 1) + 1) + ')">+</button></span></div>' +
+      '</div>';
+  }
+
+  /* Only offered once the server has said the page holds more than one
+     candidate. Before that it is a question about something she has not
+     been told exists. */
+  var regions = '';
+  if (r && r.regions_found > 1) {
+    var buttons = '';
+    for (var i = 1; i <= r.regions_found; i++) {
+      buttons += '<button class="link" style="padding:0 8px' +
+        (String(pick.region) === String(i) || (pick.region === '' && r.region === i)
+          ? ';font-weight:700' : ';opacity:.55') +
+        '" onclick="sendOpt(\'region\',\'' + i + '\')">' + i + '</button>';
+    }
+    regions = '<div class="panel list" style="padding:0">' +
+      '<div class="item"><span>Which block</span>' +
+      '<span class="val">' + buttons + '</span></div></div>' +
+      '<div class="note">This page has ' + esc(r.regions_found) +
+      ' things on it that could be the label. Check each one before ' +
+      'printing.</div>';
+  }
+
+  var answer = '';
+  if (pick && pick.error) {
+    answer = '<div class="note" style="color:var(--bad)">' + esc(pick.error) +
+      '</div>';
+  } else if (r) {
+    answer = '<div class="panel list" style="padding:0">' +
+      item('Size', r.size_in[0] + ' x ' + r.size_in[1] + ' in') +
+      item('Turned', r.rotation + '° (' +
+        (r.rotation_source === 'aspect' ? 'guessed from its shape'
+          : r.rotation_source === 'forced' ? 'you chose it'
+          : 'read off the text') + ')') +
+      item('Page', r.page) +
+      (r.dry_run ? '' : item('Job', r.job)) +
+      (r.dry_run ? '' : item('Recorded in', r.recorded)) +
+      '</div>' +
+      (r.rotation_source === 'aspect'
+        ? '<div class="note">There is no text on this label to read an ' +
+          'orientation from, so that is the shape talking. It knows the ' +
+          'label is on its side and not which way up - check it, and use ' +
+          'Turn if it is upside down.</div>'
+        : '') +
+      (r.dry_run ? '<div class="note">Nothing printed. Turn off ' +
+        '<b>Check only</b> when it looks right.</div>' : '');
+  }
+
+  return '<div class="screen">' +
+    '<div class="head head--row head--rule">' +
+      '<button class="iconbtn" onclick="go(\'settings\')" aria-label="Back">←</button>' +
+      '<div style="flex:1"><div class="eyebrow">Any 4x6</div>' +
+        '<div class="title title--sm">Print a label</div></div>' +
+    '</div>' +
+    '<div class="scroll" style="gap:12px;padding-bottom:190px">' +
+      '<div class="note">A shipping label from anywhere else. It is not a ' +
+        'sale and nothing here records it as one - it prints and that is ' +
+        'all.</div>' +
+      chooser + opts + regions + answer +
+    '</div>' +
+    (pick ? '<div class="dock">' +
+      '<button class="hold hold--wide" id="h-send"' +
+        (pick.busy ? ' disabled' : '') + '><span class="fill"></span><span>' +
+        (pick.busy ? 'Working…' : pick.dry ? 'Hold to check' : 'Hold to print') +
+        '</span></button></div>' : '') +
+    tabs('settings') + '</div>';
+}
+
 /* ----------------------------------------------------------- scanning */
 /*
  * Reading a shelf marker off a box. The decoder is marker.js, ported
@@ -940,6 +1121,7 @@ function render() {
   else if (S.screen === 'shelf') body = shelfView();
   else if (S.screen === 'item') body = itemView();
   else if (S.screen === 'bin') body = binView();
+  else if (S.screen === 'sendlabel') body = sendLabelView();
   else body = shipView();
 
   if (S.toast) {
@@ -977,7 +1159,8 @@ function wireHolds() {
   var pairs = [
     ['h-ship', function () { markShipped(d.id, d.code); }],
     ['h-print', function () { reprint(d.id); }],
-    ['h-batch', batchPrint]
+    ['h-batch', batchPrint],
+    ['h-send', sendLabel]
   ];
   pairs.forEach(function (p) {
     var el = document.getElementById(p[0]);

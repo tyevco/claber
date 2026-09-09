@@ -22,6 +22,7 @@ import email
 import hashlib
 import imaplib
 import io
+import json
 import logging
 import os
 import random
@@ -132,6 +133,11 @@ DEFAULTS = {
     # Empty means the app refuses to start rather than run unauthenticated.
     "web_password_hash": "",
     "web_session_days": "30",
+    # Where `mplabel send` posts a label from another machine. The same
+    # address the phone app uses - a tunnel hostname, or http://pi:8080
+    # on the LAN. Empty on the Pi itself, which has no reason to send
+    # anything to itself.
+    "web_url": "",
     # yes | no | auto. auto sets the cookie's Secure flag when the request
     # arrived over HTTPS, which behind cloudflared means trusting
     # X-Forwarded-Proto. Forcing yes on a plain-HTTP LAN test makes the
@@ -552,9 +558,20 @@ def label_belongs_to(row):
 print_lock = printers.print_lock
 
 
-def print_label(cfg, pdf_path, code=None):
+def print_label(cfg, pdf_path, code=None, job=None):
+    """Print one 4x6 PDF, whatever it is a label for.
+
+    `job` names the print for printd's journal. Left alone it is random
+    per call, which is right for a label off a sale: the parcel code is
+    already the handle and a reprint is a deliberate second label. A
+    caller with a *stable* id - the digest of an uploaded PDF, say - can
+    pass it here, and printd then answers a retry with 409 instead of
+    printing again. It reaches only the backends that keep a journal;
+    writing straight to a device records nothing either way."""
     backend = cfg["printer_backend"]
     kwargs = printers.backend_kwargs(cfg, backend, code=code)
+    if job and backend in printers.REMOTE_BACKENDS:
+        kwargs["job"] = job
 
     # Stamp a throwaway copy rather than the archive, so a reprint cannot
     # double-stamp and labels/<ref>_4x6.pdf stays as Facebook sent it.
@@ -800,17 +817,169 @@ def loop(cfg, conn, do_print):
 def cmd_file(cfg, args):
     src = Path(args.pdf)
     out = Path(args.output) if args.output else src.with_name(src.stem + "_4x6.pdf")
-    info = label.to_4x6(src, out, force_rotation=args.rotate)
+    info = label.to_4x6(src, out, page_index=getattr(args, "page", 1) - 1,
+                        force_rotation=args.rotate,
+                        region=getattr(args, "region", None))
     if getattr(args, "code", None):
         # Handy for checking placement on a real label without printing.
         label.stamp_code(out, out, args.code,
                          size=float(cfg.get("label_code_size", 8)))
     print(f"{out}  {info['size_in'][0]} x {info['size_in'][1]} in  "
-          f"(rotated {info['rotation']})")
+          f"(rotated {info['rotation']}, from {info['rotation_source']})")
+    if info["regions_found"] > 1:
+        # Said out loud: the page held more than one thing that could
+        # have been the label, and which one this is matters.
+        print(f"  page held {info['regions_found']} candidate blocks; "
+              f"this is region {info['region']}")
     for k, v in label.extract_label_fields(out).items():
         print(f"  {k}: {v}")
     if args.print_it:
         print_label(cfg, out)
+
+
+def token_path():
+    """Where `send` keeps its bearer token.
+
+    Not in mplabel.conf. This command runs on a workstation rather than
+    on the Pi, `config` is a file that gets pasted into a chat window
+    when something is wrong, and a session token is a credential with
+    nothing else in that file's class. It is also disposable: delete it
+    and the next send logs in again."""
+    return Path.home() / ".config" / "mplabel.token"
+
+
+def _api(url, path, token=None, data=None, ctype=None, timeout=120):
+    """One request to the phone app's server, as the phone makes it.
+
+    urllib rather than requests, like every other HTTP call in this
+    project. Returns (status, parsed-or-raw)."""
+    import urllib.error
+    import urllib.request
+
+    headers = {"X-Mplabel": "1"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if ctype:
+        headers["Content-Type"] = ctype
+    req = urllib.request.Request(url.rstrip("/") + path, data=data,
+                                 headers=headers,
+                                 method="POST" if data is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            return res.status, json.loads(res.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        try:
+            body = json.loads(body)
+        except ValueError:
+            pass
+        return exc.code, body
+    except urllib.error.URLError as exc:
+        raise SystemExit(
+            f"could not reach {url}: {exc.reason}. The label did not print.")
+
+
+def _login(url):
+    """Swap the password for a token and keep the token.
+
+    The password is asked for interactively unless the environment
+    carries one, because the alternative is a password in shell history
+    on a machine that is not the Pi."""
+    import getpass
+
+    password = os.environ.get("MPLABEL_WEB_PASSWORD")
+    if not password:
+        password = getpass.getpass(f"password for {url}: ")
+    status, body = _api(url, "/api/login",
+                        data=json.dumps({"password": password}).encode(),
+                        ctype="application/json", timeout=30)
+    if status != 200 or not isinstance(body, dict) or not body.get("token"):
+        detail = body.get("error") if isinstance(body, dict) else body
+        raise SystemExit(f"login failed: {detail}")
+    path = token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body["token"], encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        # Windows, where the mode is not the mechanism. Not worth failing
+        # a print over; the file is under the user's own profile either way.
+        pass
+    return body["token"]
+
+
+def cmd_send(cfg, args):
+    """Send one PDF to the Pi to be printed, from anywhere.
+
+    The label is converted *there*, not here: `to_4x6` needs pdfplumber
+    and pypdf, the print needs the roll and the darkness and the gap
+    distance, and every one of those is a fact about the machine with the
+    printer attached. What crosses is the PDF and what to do with it -
+    the same rule that keeps the raster off the wire in `print_tag`.
+
+    Nothing is recorded for this label beyond printd's journal. It is not
+    a sale, and it does not become one."""
+    url = args.url or cfg.get("web_url") or ""
+    if not url:
+        raise SystemExit(
+            "no server to send to - pass --url https://... or set web_url "
+            "in mplabel.conf. That is the same address the phone app uses.")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    pdf = Path(args.pdf)
+    if not pdf.is_file():
+        raise SystemExit(f"no such file: {pdf}")
+    body = pdf.read_bytes()
+    if not body.startswith(b"%PDF"):
+        raise SystemExit(f"{pdf} is not a PDF")
+
+    query = []
+    if args.rotate is not None:
+        query.append(f"rotate={args.rotate}")
+    if args.page != 1:
+        query.append(f"page={args.page}")
+    if args.region:
+        query.append(f"region={args.region}")
+    if args.dry_run:
+        query.append("dry_run=1")
+    if args.force:
+        query.append("force=1")
+    path = "/api/v1/print/label" + ("?" + "&".join(query) if query else "")
+
+    token = None
+    try:
+        token = token_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    if not token:
+        token = _login(url)
+
+    status, reply = _api(url, path, token=token, data=body,
+                         ctype="application/pdf")
+    if status == 401:
+        # Expired, or the password changed - which invalidates every
+        # token, by design. One retry, then give up rather than loop.
+        token = _login(url)
+        status, reply = _api(url, path, token=token, data=body,
+                             ctype="application/pdf")
+
+    if status != 200:
+        detail = reply.get("error") if isinstance(reply, dict) else reply
+        raise SystemExit(f"{url} said {status}: {detail}")
+
+    info = (reply or {}).get("label") or {}
+    w, h = info.get("size_in", ("?", "?"))
+    print(f"{pdf.name} -> {w} x {h} in, rotated {info.get('rotation')} "
+          f"({info.get('rotation_source')})")
+    if info.get("regions_found", 1) > 1:
+        print(f"  page held {info['regions_found']} candidate blocks; "
+              f"printed region {info['region']} (--region to choose)")
+    if info.get("dry_run"):
+        print("  dry run - nothing printed")
+    else:
+        print(f"  printed. job {info.get('job')}, recorded in "
+              f"{info.get('recorded')}")
 
 
 def cmd_supvan_probe(cfg, args):
@@ -2104,9 +2273,37 @@ def _main():
     p.add_argument("pdf")
     p.add_argument("-o", "--output")
     p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270])
+    p.add_argument("--page", type=int, default=1,
+                   help="which page of the PDF (default %(default)s)")
+    p.add_argument("--region", type=int,
+                   help="which block on the page is the label, when more "
+                        "than one could be and it refused to guess")
     p.add_argument("--print", dest="print_it", action="store_true")
     p.add_argument("--code", help="stamp this parcel code on the label, to "
                                   "check placement without printing")
+    p = sub.add_parser("send",
+                       help="send a PDF to the Pi to be printed, from "
+                            "anywhere - a label that is not a Marketplace "
+                            "one")
+    p.add_argument("pdf")
+    p.add_argument("--url", help="the phone app's address; defaults to "
+                                 "web_url in mplabel.conf")
+    p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270],
+                   help="override the detected orientation. Needed when "
+                        "the label carries no text to read one off, where "
+                        "its shape says it is on its side but not which "
+                        "way up")
+    p.add_argument("--page", type=int, default=1,
+                   help="which page of the PDF (default %(default)s)")
+    p.add_argument("--region", type=int,
+                   help="which block on the page is the label, when more "
+                        "than one could be and the server refused to guess")
+    p.add_argument("--dry-run", action="store_true",
+                   help="convert and measure, print nothing. What to run "
+                        "on a new seller's PDF before spending a label")
+    p.add_argument("--force", action="store_true",
+                   help="print it again. The same PDF twice is one job by "
+                        "design, so a retry cannot double-print")
     sub.add_parser("list", help="outstanding orders")
     ref_help = ("parcel code from the label, or listing id, order id or "
                 "tracking number")
@@ -2484,6 +2681,13 @@ def _main():
         return
     if args.cmd == "file":
         cmd_file(cfg, args)
+        return
+    if args.cmd == "send":
+        # Above connect_db for the same reason as `file`: this talks to a
+        # server over HTTP and has no business needing a local database.
+        # It is also the command most likely to be run on a laptop that
+        # has never had one.
+        cmd_send(cfg, args)
         return
     if args.cmd == "passwd":
         cmd_passwd()
