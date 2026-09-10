@@ -1,46 +1,16 @@
 /* mplabel PWA — ported from the March Vector design system.
  *
- * Two deliberate departures from the source design:
+ * The palette and the type stacks are in tokens.css, which the desk
+ * portal loads too. Everything below is the phone: fixed pixel widths, a
+ * bottom tab bar and safe-area insets, and not one media query on
+ * purpose. The desk is a different shape and lives in desk.css.
  *
- * 1. No webfonts. colors_and_type.css pulls Fraunces, EB Garamond and
- *    JetBrains Mono from fonts.googleapis.com and Inter from a bundled
- *    variable TTF. This is served by a Raspberry Pi that must not depend
- *    on the internet at render time, so the stacks below fall back to
- *    system faces. The design's optical-size axis (`opsz`) goes with
- *    them; the type scale and weights are kept.
- * 2. The iOS device frame in the source is canvas chrome - bezel,
- *    dynamic island, a drawn keyboard. On a real iPhone iOS supplies all
- *    of that, so drawing it would put a fake phone inside a real one.
- *    What is kept from it is the safe-area padding it stood in for.
+ * The departure from the source design that this file still stands for:
+ * the iOS device frame in it is canvas chrome - bezel, dynamic island, a
+ * drawn keyboard. On a real iPhone iOS supplies all of that, so drawing
+ * it would put a fake phone inside a real one. What is kept from it is
+ * the safe-area padding it stood in for.
  */
-
-:root {
-  --mv-font-sans: ui-sans-serif, system-ui, -apple-system, "SF Pro Text",
-                  "Segoe UI", Roboto, sans-serif;
-  --mv-font-display: ui-serif, Georgia, "Times New Roman", serif;
-  --mv-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-}
-
-/* Dark is the default, not the alternate: she uses this in the evening
-   and in badly lit shops. */
-[data-mp] {
-  --bg:#100e09; --rai:#1b180f; --sun:#0a0906; --elev:#252017;
-  --fg:#f4efe6; --mut:#a89f8b; --sub:#6b6355;
-  --bd:#2f2a22; --bds:#4a4338;
-  --ac:#6ebd72; --aci:#0e0c07; --act:#1a2f1c;
-  --al:#ff7a5c; --alt:#2b1611; --ale:#7a3423;
-  --wa:#d4b25a; --wat:#292013;
-  --cbg:#f4efe6; --cfg:#12100b;
-}
-[data-mp="light"] {
-  --bg:#fbf8f2; --rai:#ffffff; --sun:#f4efe6; --elev:#f4efe6;
-  --fg:#1b180f; --mut:#6b6355; --sub:#a89f8b;
-  --bd:#e6dfd0; --bds:#d0c5af;
-  --ac:#3d9a46; --aci:#ffffff; --act:#dcecda;
-  --al:#ad2a1b; --alt:#faeae5; --ale:#e0b6a9;
-  --wa:#8a6a1e; --wat:#f7edd6;
-  --cbg:#1b180f; --cfg:#fbf8f2;
-}
 
 * { box-sizing: border-box; }
 

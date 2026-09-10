@@ -19,6 +19,7 @@ sell-through chart.
 
 import csv
 import hashlib
+import io
 import json
 import re
 import zipfile
@@ -93,7 +94,13 @@ CREATE TABLE IF NOT EXISTS listings (
     removed_at    TEXT,
     renewed_count INTEGER DEFAULT 0,
     inquiries     INTEGER DEFAULT 0,
-    state         TEXT DEFAULT 'active',   -- active | sold | expired | removed
+    -- active | sold | expired | removed | draft
+    --
+    -- `draft` is a thing photographed and costed and never written up.
+    -- It is kept out of `v_listing_perf`, and so out of sell-through:
+    -- it was never for sale, and counting it would drag the percentage
+    -- down exactly the way her own purchases would.
+    state         TEXT DEFAULT 'active',
     source        TEXT,                    -- email | dyi | csv | manual
     first_seen    TEXT,
     last_seen     TEXT,
@@ -129,7 +136,29 @@ CREATE TABLE IF NOT EXISTS listings (
     -- tidying up a record of a shop visit, not disowning the things.
     trip_id       INTEGER REFERENCES trips(id) ON DELETE SET NULL,
 
-    notes         TEXT
+    notes         TEXT,
+
+    -- What the carrier took, and whether anybody actually knows it.
+    --
+    -- The same pair as on `sales`, and the same reason: a number without
+    -- its provenance is an estimate that the next screen reads as a
+    -- fact. They are here because a spreadsheet of old sales is the only
+    -- place postage has ever been written down for a listing that never
+    -- came through the mailbox - and without it `kept` is unknowable
+    -- rather than merely unknown.
+    --
+    -- Note `margin` deliberately does not use them. See v_listing_perf.
+    postage        REAL,
+    postage_source TEXT,
+
+    -- The listing copy: what gets pasted into Marketplace.
+    --
+    -- Not `notes`, which is the scribble field - "handle is loose",
+    -- "buyer asked about the maker". One column for both means writing
+    -- a description silently eats a note, and the two are read at
+    -- completely different moments: the note when the thing is in her
+    -- hand, the description when it is being posted.
+    description   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_listing_state ON listings(state);
 CREATE INDEX IF NOT EXISTS idx_listing_sold  ON listings(sold_at);
@@ -275,7 +304,12 @@ def upsert_listing(conn, listing_id, source, **fields):
     updates, vals = {"last_seen": now}, []
     existing = dict(row)
     # 'sold' is terminal and beats anything else we might later infer.
-    rank = {"active": 0, "expired": 1, "removed": 2, "sold": 3}
+    #
+    # 'draft' is below everything, so nothing can demote a real listing
+    # back to one. A draft becoming active is progress and the reverse is
+    # not a thing that happens by observation - only by her saying so,
+    # which goes through `h_item_fields`, not here.
+    rank = {"draft": -1, "active": 0, "expired": 1, "removed": 2, "sold": 3}
     for k, v in fields.items():
         if v is None:
             continue
@@ -678,27 +712,199 @@ def _coerce_time(v):
     return str(v)
 
 
-def import_csv(conn, path):
-    """Import a hand-maintained CSV. Any subset of these columns:
-    listing_id,title,price,category,condition,listed_at,sold_at,state"""
-    n = 0
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        for row in csv.DictReader(fh):
-            row = {k.strip().lower(): (v.strip() or None)
-                   for k, v in row.items() if k}
-            lid = row.get("listing_id") or (
-                "csv:" + re.sub(r"\W+", "-", (row.get("title") or "")[:60].lower()))
-            upsert_listing(conn, lid, "csv",
-                           title=row.get("title"),
-                           price=_coerce_price(row.get("price")),
-                           category=row.get("category"),
-                           condition=row.get("condition"),
-                           listed_at=row.get("listed_at"),
-                           sold_at=row.get("sold_at"),
-                           state=row.get("state") or ("sold" if row.get("sold_at") else "active"))
-            n += 1
+# What an imported column can become. The key is what goes into the
+# database; the value is what the mapping screen calls it, plus the
+# header names worth guessing from.
+#
+# `postage` is here even though it is money the carrier took rather than
+# money she spent, because a spreadsheet of old sales is the only place
+# it has ever been written down - and `kept` is null without it.
+IMPORT_FIELDS = {
+    # Facebook's own id, where the file happens to carry one. It is a
+    # real key and it wins over `title_key`, which exists for rows that
+    # have no key rather than as a replacement for one that does -
+    # keying a row on its title when the id is right there in the column
+    # beside it is inventing a second identity for the same listing.
+    "listing_id": ("Listing id", ("listing_id", "id", "item_id",
+                                  "listing", "fb_id")),
+    "title":     ("Title", ("title", "item", "item_title", "name",
+                            "description", "product")),
+    "sold_at":   ("Date sold", ("sold_at", "sale_date", "date", "sold",
+                                "date_sold", "when")),
+    "price":     ("Sold for", ("price", "gross", "sold_for", "amount",
+                               "sale_price", "total")),
+    "paid":      ("What you paid", ("paid", "cost", "my_cost", "purchase",
+                                    "purchase_price", "bought_for")),
+    "postage":   ("Postage", ("postage", "shipping", "shipping_paid",
+                              "ship_cost", "postage_paid")),
+    "listed_at": ("Date listed", ("listed_at", "listed", "date_listed")),
+    "category":  ("Category", ("category", "type")),
+    "condition": ("Condition", ("condition",)),
+    "era":       ("Era", ("era", "period", "age")),
+}
+
+
+def guess_mapping(headers):
+    """Match each column to a field by name, or to nothing.
+
+    Deliberately a guess with an empty answer available: the header names
+    in a spreadsheet somebody has kept by hand for two years are whatever
+    they were on the day, and a mapping that silently attaches
+    `shipping_paid` to nothing is how the postage column in the preview
+    ends up displayed and dropped."""
+    used, out = set(), {}
+    for header in headers:
+        key = re.sub(r"\W+", "_", (header or "").strip().lower()).strip("_")
+        match = None
+        for field, (_label, aliases) in IMPORT_FIELDS.items():
+            if field in used:
+                continue
+            if key in aliases:
+                match = field
+                break
+        if match:
+            used.add(match)
+        out[header] = match
+    return out
+
+
+def read_csv(text):
+    """Headers, a guessed mapping and the rows, as they are in the file.
+
+    Writes nothing. Same shape as `shopping.propose` and
+    `savedpage.extract`: the screen that shows this has not committed to
+    anything yet, and the parse has to be answerable twice with the same
+    answer."""
+    reader = csv.reader(io.StringIO(text.lstrip("﻿"), newline=""))
+    rows = [r for r in reader if any((c or "").strip() for c in r)]
+    if not rows:
+        return {"headers": [], "mapping": {}, "rows": [], "count": 0}
+    headers = [(h or "").strip() for h in rows[0]]
+    body = [dict(zip(headers, r + [""] * (len(headers) - len(r))))
+            for r in rows[1:]]
+    return {"headers": headers, "mapping": guess_mapping(headers),
+            "rows": body, "count": len(body)}
+
+
+def plan_import(conn, text, mapping=None):
+    """What committing this file would do, without doing any of it.
+
+    Every row carries its own warnings rather than the whole file
+    carrying a count, because the thing she has to decide is per row:
+    this one has no postage, that one is already here and will not be
+    corrected. A summary would tell her something is wrong and not which.
+    """
+    read = read_csv(text)
+    mapping = mapping or read["mapping"]
+    planned, seen = [], {}
+    for raw in read["rows"]:
+        row, warnings = {}, []
+        for header, field in mapping.items():
+            if not field:
+                continue
+            value = (raw.get(header) or "").strip()
+            if not value:
+                continue
+            if field in ("price", "paid", "postage"):
+                money = _coerce_price(value)
+                if money is None:
+                    warnings.append(f"{IMPORT_FIELDS[field][0]}: "
+                                    f"cannot read {value!r} as a number")
+                    continue
+                row[field] = money
+            else:
+                row[field] = value
+
+        title = row.get("title")
+        key = row.pop("listing_id", None)
+        if not key and not title:
+            warnings.append("no title and no listing id, so there is "
+                            "nothing to key it on")
+            planned.append({"row": row, "key": None, "warnings": warnings,
+                            "outcome": "skipped"})
+            continue
+
+        # Failing a real id, the same derivation the saved-page import
+        # and `create_item` use - so an imported row and a later real
+        # sale of the same title reconcile through `link_sales` instead
+        # of sitting beside each other.
+        key = key or title_key(title)
+        if key in seen:
+            warnings.append(f"same title as row {seen[key] + 1}; the two "
+                            f"become one listing")
+        else:
+            seen[key] = len(planned)
+
+        existing = conn.execute(
+            "SELECT * FROM listings WHERE listing_id=?", (key,)).fetchone()
+        if existing is None:
+            outcome = "created"
+        else:
+            # `upsert_listing` fills blanks and does not overwrite, so a
+            # corrected spreadsheet cannot fix a figure that is already
+            # there. Saying so here is the difference between an import
+            # that did nothing and an import that looked like it worked.
+            fills = [f for f in row
+                     if f != "title" and not dict(existing).get(f)]
+            outcome = "enriched" if fills else "unchanged"
+            if outcome == "unchanged":
+                warnings.append("already here with those fields filled in; "
+                                "importing again will not change it")
+
+        if "postage" not in row:
+            warnings.append("no postage, so what you kept stays unknown "
+                            "rather than becoming the whole price")
+        planned.append({"row": row, "key": key, "warnings": warnings,
+                        "outcome": outcome})
+
+    return {"headers": read["headers"], "mapping": mapping,
+            "fields": {k: v[0] for k, v in IMPORT_FIELDS.items()},
+            "rows": planned,
+            "created": sum(1 for p in planned if p["outcome"] == "created"),
+            "enriched": sum(1 for p in planned if p["outcome"] == "enriched"),
+            "unchanged": sum(1 for p in planned if p["outcome"] == "unchanged"),
+            "skipped": sum(1 for p in planned if p["outcome"] == "skipped")}
+
+
+def commit_import(conn, text, mapping=None, state=None):
+    """Write what `plan_import` described.
+
+    These become **listings, not sales**. A `sales` row is the record of
+    a Facebook order that produced a label email - keyed on a UNIQUE
+    message_id, carrying a parcel code, a tracking number and an
+    archived PDF - and a spreadsheet row has none of those. Inventing a
+    message_id would put a fake email in the table the poller
+    de-duplicates against, and `sales.code` is worse: it is a live parcel
+    handle recycled the moment a parcel ships, so a row about last
+    November must never mint one.
+
+    `listings` already has the right shape for a thing that sold, and
+    every view Month-end reads is built on it, which is the whole point
+    of importing."""
+    plan = plan_import(conn, text, mapping)
+    written = 0
+    for entry in plan["rows"]:
+        if entry["outcome"] == "skipped":
+            continue
+        row = dict(entry["row"])
+        row["state"] = state or ("sold" if row.get("sold_at") else "active")
+        upsert_listing(conn, entry["key"], "csv", **row)
+        written += 1
     conn.commit()
-    return n
+    plan["written"] = written
+    plan.pop("rows", None)
+    return plan
+
+
+def import_csv(conn, path, state=None):
+    """Import a hand-maintained CSV.
+
+    Sits on the same parser the web wizard uses, so `mplabel import
+    --format csv` and the screen cannot disagree about what a column
+    means - the rule `title_key` already follows for both sides of
+    reconciliation."""
+    text = Path(path).read_text(encoding="utf-8-sig")
+    return commit_import(conn, text, state=state)["written"]
 
 
 # ------------------------------------------------------------- analytics
@@ -708,11 +914,25 @@ DROP VIEW IF EXISTS v_listing_perf;
 CREATE VIEW v_listing_perf AS
 SELECT
     listing_id, title, category, price, state, inquiries, renewed_count,
-    listed_at, sold_at, paid, trip_id,
+    listed_at, sold_at, paid, trip_id, postage, postage_source,
     -- Null unless both halves are known. A missing cost must not read as
     -- a cost of zero, which would report the whole price as profit.
     CASE WHEN price IS NOT NULL AND paid IS NOT NULL
          THEN ROUND(price - paid, 2) END AS margin,
+    -- What the sale actually left behind, once the carrier is paid.
+    --
+    -- A *new* column rather than postage folded into `margin`, and the
+    -- distinction is the whole point: `COALESCE(postage, 0)` would read
+    -- an unknown postage as free and report the whole price as kept,
+    -- which is the failure the comment above and `listings.kept` were
+    -- both written about. So `margin` is exactly what it always was, and
+    -- this is null until all three figures are actually known.
+    --
+    -- `sheets.TABS` selects from these views by column name, so adding
+    -- one is safe and renaming one breaks the spreadsheet silently.
+    CASE WHEN price IS NOT NULL AND paid IS NOT NULL
+              AND postage IS NOT NULL
+         THEN ROUND(price - paid - postage, 2) END AS kept,
     CASE WHEN sold_at IS NOT NULL AND listed_at IS NOT NULL
          THEN CAST(julianday(sold_at) - julianday(listed_at) AS INTEGER)
     END AS days_to_sell,
@@ -727,7 +947,16 @@ SELECT
         WHEN price < 100        THEN '$50-100'
         ELSE '$100+'
     END AS price_band
-FROM listings;
+-- A draft is a thing photographed and costed and never written up. It
+-- was never for sale, so counting it would drag sell-through down the
+-- same way her own purchases would - the failure `BUYER_KINDS` exists
+-- to prevent, arriving from the other direction.
+--
+-- Filtered here rather than in each view on purpose: `v_price_band`,
+-- `v_monthly`, `v_aging` and `sheets.TABS` are all built on this one,
+-- so they become right together and cannot drift apart.
+FROM listings
+WHERE state IS NULL OR state != 'draft';
 
 DROP VIEW IF EXISTS v_price_band;
 CREATE VIEW v_price_band AS
@@ -858,7 +1087,7 @@ def create_item(conn, title, **fields):
         raise ValueError("an item needs a title")
 
     allowed = ("price", "paid", "category", "condition", "era", "notes",
-               "state", "listed_at", "trip_id")
+               "description", "state", "listed_at", "trip_id")
     clean = {k: v for k, v in fields.items() if k in allowed and v not in (None, "")}
     for money in ("price", "paid"):
         if money in clean:
@@ -942,6 +1171,25 @@ def attach_photo(conn, photo_id, listing_id=None, trip_id=None):
     row = conn.execute("SELECT * FROM photos WHERE id=?",
                        (int(photo_id),)).fetchone()
     return dict(row) if row else None
+
+
+def photos_for(conn, listing_id, limit=50):
+    """The photographs of one thing, oldest first.
+
+    Oldest first because the first one taken is the one she framed
+    deliberately, and the writer screen offers the first as the cover -
+    the picture buyers see in the feed. `idx_photo_listing` already
+    exists, so this is a lookup rather than a scan.
+
+    The counterpart of `untriaged`: that one finds photos about nothing,
+    this one finds photos about a specific thing. Between them there is
+    still no state column saying which a photo is."""
+    rows = conn.execute(
+        "SELECT id, path, sha256, taken_at, created_at, trip_id "
+        "FROM photos WHERE listing_id=? "
+        "ORDER BY COALESCE(taken_at, created_at), id LIMIT ?",
+        (int(listing_id), int(limit))).fetchall()
+    return [dict(r) for r in rows]
 
 
 def untriaged(conn, limit=200):

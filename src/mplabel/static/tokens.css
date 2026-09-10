@@ -1,0 +1,55 @@
+/* mplabel — the palette and the type stacks, ported from the March Vector
+ * design system.
+ *
+ * One file because there are two clients now: the phone app (app.css) and
+ * the desk portal (desk.css). A hex changed for one of them and not the
+ * other is a drift nothing would report - the two screens are never open
+ * side by side, so nobody would see them disagree.
+ *
+ * Two deliberate departures from the source design, both inherited from
+ * the phone app and both still true:
+ *
+ * 1. No webfonts. colors_and_type.css pulls Fraunces, EB Garamond and
+ *    JetBrains Mono from fonts.googleapis.com and Inter from a bundled
+ *    variable TTF. This is served by a Raspberry Pi that must not depend
+ *    on the internet at render time, so the stacks below fall back to
+ *    system faces. The design's optical-size axis (`opsz`) goes with
+ *    them; the type scale and weights are kept.
+ * 2. The device frames in the source - an iPhone bezel, a Chrome window
+ *    with a URL bar - are canvas chrome. The browser supplies the real
+ *    ones, so drawing them would put a fake window inside a real one.
+ */
+
+:root {
+  --mv-font-sans: ui-sans-serif, system-ui, -apple-system, "SF Pro Text",
+                  "Segoe UI", Roboto, sans-serif;
+  --mv-font-display: ui-serif, Georgia, "Times New Roman", serif;
+  --mv-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+/* Dark is the default, not the alternate: she uses this in the evening
+   and in badly lit shops. */
+[data-mp] {
+  --bg:#100e09; --rai:#1b180f; --sun:#0a0906; --elev:#252017;
+  --fg:#f4efe6; --mut:#a89f8b; --sub:#6b6355;
+  --bd:#2f2a22; --bds:#4a4338;
+  --ac:#6ebd72; --aci:#0e0c07; --act:#1a2f1c;
+  --al:#ff7a5c; --alt:#2b1611; --ale:#7a3423;
+  --wa:#d4b25a; --wat:#292013;
+  --cbg:#f4efe6; --cfg:#12100b;
+  /* Faint enough to read as hover rather than as selection. The desk's
+     inventory table is forty rows of the same weight and the pointer is
+     the only thing saying which one it is on. The phone has no pointer
+     and does not use it. */
+  --row:rgba(244,239,230,.035);
+}
+[data-mp="light"] {
+  --bg:#fbf8f2; --rai:#ffffff; --sun:#f4efe6; --elev:#f4efe6;
+  --fg:#1b180f; --mut:#6b6355; --sub:#a89f8b;
+  --bd:#e6dfd0; --bds:#d0c5af;
+  --ac:#3d9a46; --aci:#ffffff; --act:#dcecda;
+  --al:#ad2a1b; --alt:#faeae5; --ale:#e0b6a9;
+  --wa:#8a6a1e; --wat:#f7edd6;
+  --cbg:#1b180f; --cfg:#fbf8f2;
+  --row:rgba(27,24,15,.022);
+}

@@ -232,6 +232,15 @@ MIGRATIONS = [
     # see the note in `listings.estimate_postage`.
     ("sales", "postage", "REAL"),
     ("sales", "postage_source", "TEXT"),
+    # The listing copy, for the desk's writer screen. Separate from
+    # `notes` on purpose - see the comment on the column in
+    # listings.SCHEMA.
+    ("listings", "description", "TEXT"),
+    # Postage on a listing, mirroring the pair on `sales`. A spreadsheet
+    # of old sales is the only place this has ever been recorded for
+    # something that never came through the mailbox.
+    ("listings", "postage", "REAL"),
+    ("listings", "postage_source", "TEXT"),
 ]
 
 
@@ -2755,7 +2764,8 @@ def _main():
                       "includes what you tick when requesting the download - "
                       "re-request it with the Marketplace section selected.")
         else:
-            print(f"imported {listings_mod.import_csv(conn, args.path)} row(s)")
+            n = listings_mod.import_csv(conn, args.path, state=args.state)
+            print(f"imported {n} row(s)")
         listings_mod.refresh(conn)
     elif args.cmd == "pending":
         cmd_pending(cfg, conn, args)

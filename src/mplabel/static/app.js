@@ -10,12 +10,17 @@
  * arrive from Facebook emails, which means their content is chosen by
  * someone else - a listing titled `<img onerror=...>` would otherwise run
  * here, inside the session that can reach every customer address.
+ *
+ * esc(), api(), money(), due() and split() live in common.js, which the
+ * shell loads first: the desk portal renders the same rows out of the
+ * same endpoints, and a second copy of the escape function is one that
+ * gets fixed in only one place.
  */
 
 var S = {
   screen: 'ship', orders: [], pending: [], stats: null, system: null,
   detail: null, sel: [], dry: false, toast: null, undo: null,
-  theme: localStorage.getItem('mp-theme') || 'dark',
+  theme: savedTheme(),
   authed: false, loginError: '', busy: false,
   scan: null,  /* {stream, timer, status, code} while the camera is live */
   /* The shelf: what is where. `focusId` survives a re-render - screens
@@ -33,45 +38,9 @@ var app = document.getElementById('app');
 
 /* ------------------------------------------------------------ plumbing */
 
-function esc(v) {
-  if (v === null || v === undefined) return '';
-  return String(v).replace(/[&<>"']/g, function (c) {
-    return { '&': '&amp;', '<': '&lt;', '>': '&gt;',
-             '"': '&quot;', "'": '&#39;' }[c];
-  });
-}
-
-function money(n) {
-  if (n === null || n === undefined || n === '') return '—';
-  return '$' + Number(n).toFixed(2);
-}
-
-async function api(path, opts) {
-  opts = opts || {};
-  var init = {
-    method: opts.method || 'GET',
-    headers: { 'X-Mplabel': '1' },
-    credentials: 'same-origin'
-  };
-  if (opts.body !== undefined) {
-    init.body = JSON.stringify(opts.body);
-    init.headers['Content-Type'] = 'application/json';
-  }
-  /* Raw bytes with a real type, for the routes that take a file: a
-     photograph and a label PDF. Deliberately not multipart - one file
-     and no other fields, so the query string carries the rest and there
-     is no parser on either end to get wrong. */
-  if (opts.raw !== undefined) {
-    init.body = opts.raw;
-    init.headers['Content-Type'] = opts.type || 'application/octet-stream';
-  }
-  var res = await fetch(path, init);
-  if (res.status === 401) { S.authed = false; render(); throw new Error('401'); }
-  var data = null;
-  try { data = await res.json(); } catch (e) { data = null; }
-  if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
-  return data;
-}
+/* common.js does the fetch; this is the half of it that only this client
+   knows - which screen to show when the session has gone. */
+MP.onUnauthorized = function () { S.authed = false; render(); };
 
 function toast(msg, opts) {
   opts = opts || {};
@@ -81,37 +50,9 @@ function toast(msg, opts) {
   toast._t = setTimeout(function () { S.toast = null; render(); }, 4000);
 }
 
-/* Ship-by is a hard Facebook commitment, so the queue sorts by urgency
-   and says it in words rather than making her subtract dates. */
-function due(shipBy) {
-  if (!shipBy) return { label: '—', cls: '' };
-  var today = new Date(); today.setHours(0, 0, 0, 0);
-  var d = new Date(shipBy + 'T00:00:00');
-  var days = Math.round((d - today) / 86400000);
-  if (days < 0) return { label: 'OVERDUE', cls: 'due--now' };
-  if (days === 0) return { label: 'TODAY', cls: 'due--now' };
-  if (days === 1) return { label: 'TOMORROW', cls: 'due--soon' };
-  return { label: days + ' DAYS', cls: '' };
-}
-
-/* Her titles run long and share their first sixty characters, so the
-   shared opening becomes a quiet lead line and the part that actually
-   tells two listings apart gets the weight. */
-function split(title) {
-  var t = title || '';
-  var cut = t.indexOf(' — ');
-  if (cut > 0 && cut < 60) {
-    return { lead: t.slice(0, cut + 2), distinct: t.slice(cut + 3) };
-  }
-  return { lead: '', distinct: t };
-}
-
 function setTheme(next) {
   S.theme = next;
-  localStorage.setItem('mp-theme', next);
-  document.documentElement.setAttribute('data-mp', next);
-  var meta = document.querySelector('meta[name=theme-color]');
-  if (meta) meta.setAttribute('content', next === 'light' ? '#fbf8f2' : '#100e09');
+  applyTheme(next);
   render();
 }
 
