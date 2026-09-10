@@ -33,7 +33,10 @@ apns_key_path = /etc/mplabel/AuthKey_XXXXXXXXXX.p8
 apns_key_id = XXXXXXXXXX
 apns_team_id = YYYYYYYYYY
 apns_topic = com.marchvector.Sellomatic
-apns_environment = sandbox     ; production once the app is not a dev build
+# sandbox while the build is a development one; production after that.
+# Note the comment is on its own line: configparser does NOT strip an
+# inline one, so `sandbox ; like this` is a value that is not "sandbox".
+apns_environment = sandbox
 ```
 
 `apns_environment` matters more than it looks. A build signed with a

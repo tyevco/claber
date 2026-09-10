@@ -25,6 +25,7 @@ import io
 import logging
 import os
 import random
+import re
 import socket
 import sqlite3
 import sys
@@ -1541,6 +1542,23 @@ def cmd_config(args):
         shown = "<set>" if (value and key in SECRET_KEYS) else value
         print(f"  {key:<{width}}  {shown or '':<28}  {origin}")
 
+    # An inline comment is not a comment. `configparser` keeps it, so
+    # `apns_environment = sandbox ; production later` is a value that is
+    # not "sandbox" - and that one chose the wrong APNs host and produced
+    # a refusal that named nothing. Flagged for every key, because the
+    # next one will be somewhere else.
+    suspect = [(key, value) for key, value, origin in rows
+               if origin == "file" and value
+               and re.search(r"\s[;#]", str(value))]
+    if suspect:
+        print("\nThese values contain what looks like an inline comment,"
+              " and configparser keeps it:", file=sys.stderr)
+        for key, value in suspect:
+            head = str(value).split(None, 1)[0]
+            print(f"  {key} = {value!r}\n    -> put the comment on its own"
+                  f" line, or this stays {head!r} plus the rest",
+                  file=sys.stderr)
+
     if not args.all:
         n = sum(1 for _k, _v, o in rows if o == "default")
         print(f"\n{n} more at their built-in default; --all shows them.")
@@ -1775,7 +1793,13 @@ def cmd_notify(cfg, conn, args):
         conn.commit()
         print(f"host        : {notify_mod._host(cfg)}")
         print(f"topic       : {cfg.get('apns_topic') or '(unset)'}")
-        print(f"environment : {cfg.get('apns_environment') or 'production'}")
+        # As the sender resolves it, not as it was typed: the two
+        # differed, and the difference chose the wrong host.
+        resolved = notify_mod.environment(cfg)
+        typed = str(cfg.get("apns_environment") or "production")
+        print(f"environment : {resolved}"
+              + (f"   (config says {typed!r})" if typed.strip() != resolved
+                 else ""))
 
         key_path = cfg.get("apns_key_path") or ""
         key_id = cfg.get("apns_key_id") or ""
@@ -1844,8 +1868,7 @@ def cmd_notify(cfg, conn, args):
             if len(device["token"]) != 64:
                 print("              ^ an APNs token is 64 hex characters",
                       file=sys.stderr)
-            if device["environment"] != (cfg.get("apns_environment")
-                                         or "production"):
+            if device["environment"] != notify_mod.environment(cfg):
                 print("              ^ registered against a different "
                       "environment than apns_environment", file=sys.stderr)
         return 0
