@@ -23,8 +23,14 @@ usermod -aG lp,lpadmin "$RUN_USER"
 # photos/ beside labels/: the sourcing capture writes there, and the
 # handler creating it on demand would create it owned by whoever ran
 # the request first rather than by $RUN_USER.
+#
+# ebay/ is the same story with a sharper edge: it holds the OAuth
+# tokens, so it is created 0700 here rather than left to whichever
+# process first runs `mplabel ebay auth`. A pull and a pip install do
+# not run this script, which is how photos/ went wrong once already.
 install -d -o "$RUN_USER" -g "$RUN_USER" "$DEST" "$DATA_DIR/labels" \
     "$DATA_DIR/photos"
+install -d -m 700 -o "$RUN_USER" -g "$RUN_USER" "$DATA_DIR/ebay"
 cp -r src pyproject.toml requirements.txt "$DEST"/
 
 # Stamp what is actually being installed. The version in pyproject.toml
