@@ -45,6 +45,7 @@ except ImportError:
     fcntl = None
 
 from . import backfill as backfill_mod
+from . import goodwill as goodwill_mod
 from . import label
 from . import listings as listings_mod
 from . import mailparse
@@ -356,6 +357,27 @@ def upsert(conn, rec):
     conn.commit()
 
 
+# Every sender the poller cares about. Facebook mail is what she sold;
+# ShopGoodwill mail is what she bought, and it is the only sourcing
+# event that arrives as a document rather than as a receipt in a bag.
+MAIL_DOMAINS = tuple(mailparse.SENDER_DOMAINS) + tuple(goodwill_mod.SENDER_DOMAINS)
+
+
+def imap_or_from(domains):
+    """`OR` over a FROM per domain, as plain IMAP wants it.
+
+    IMAP's OR is binary and prefix, so three terms is `OR (OR a b) c`
+    rather than a list - and getting that wrong is not a soft failure:
+    the server rejects the whole SEARCH and `candidate_ids` falls
+    through to the UNSEEN query, which is the one that hid eight
+    labels."""
+    terms = [f'(FROM "{d}")' for d in domains]
+    expr = terms[0]
+    for term in terms[1:]:
+        expr = f"(OR {expr} {term})"
+    return expr
+
+
 def candidate_ids(imap, cfg, host):
     """Which messages to consider this poll.
 
@@ -370,13 +392,12 @@ def candidate_ids(imap, cfg, host):
     places, and labelling one message must not be able to hide its eight
     siblings."""
     days = int(cfg.get("lookback_days") or 7)
-    doms = " OR ".join(mailparse.SENDER_DOMAINS)
+    doms = " OR ".join(MAIL_DOMAINS)
     queries = []
     if "gmail" in host:
         queries.append(f'(X-GM-RAW "from:({doms}) newer_than:{days}d")')
     since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
-    queries.append(f'(OR (FROM "facebookmail.com") '
-                   f'(FROM "marketplace.facebook.com") SINCE {since})')
+    queries.append(f'({imap_or_from(MAIL_DOMAINS)} SINCE {since})')
     queries.append('(UNSEEN FROM "facebook")')
 
     for q in queries:
@@ -695,6 +716,29 @@ def record_event(conn, msg):
     return 0 if buyer_side else 1
 
 
+def record_purchase(conn, msg):
+    """Note a ShopGoodwill auction mail: what she bought, and what it cost.
+
+    The mirror of `record_event`. That one reconciles mail about things
+    she is selling; this one is the only automatic route cost basis has
+    into the database - `listings.paid` had a schema and a phone screen
+    for months and nothing that filled it, which is why every margin in
+    the analytics was null.
+
+    Returns 1 if an order was recorded, else 0."""
+    try:
+        result = goodwill_mod.import_mail(conn, msg)
+    except Exception:
+        log.exception("could not record ShopGoodwill mail")
+        return 0
+    if not result:
+        return 0
+    log.info("ShopGoodwill %s: %d item(s)%s",
+             result["kind"], len(result["listing_ids"]),
+             f", ${result['total']:.2f}" if result.get("total") else "")
+    return 1
+
+
 def poll_once(cfg, conn, do_print):
     host, port = cfg["imap_host"], int(cfg["imap_port"])
     user, pw = cfg["imap_user"], cfg["imap_password"]
@@ -709,7 +753,7 @@ def poll_once(cfg, conn, do_print):
         log.info("%d candidate(s) in the last %s day(s)",
                  len(ids), cfg.get("lookback_days") or 7)
 
-        handled = noted = skipped = 0
+        handled = noted = skipped = bought = 0
         for num in ids:
             # Triage on headers before pulling the body: most candidates
             # are mail we have already handled, and BODY.PEEK leaves the
@@ -735,6 +779,10 @@ def poll_once(cfg, conn, do_print):
                 except Exception:
                     log.exception("could not record event for %s",
                                   num.decode())
+                # A ShopGoodwill mail is not Facebook mail, so
+                # `record_event` refuses it on the sender check and it
+                # would otherwise fall out of the poll unrecorded.
+                bought += record_purchase(conn, msg)
                 imap.store(num, "-FLAGS", "\\Seen")
                 continue
             try:
@@ -759,8 +807,15 @@ def poll_once(cfg, conn, do_print):
         if noted:
             log.info("%d sale/listing event(s) noted from non-label mail",
                      noted)
+        if bought:
+            log.info("%d ShopGoodwill order(s) recorded", bought)
+        if noted or bought:
+            # Refresh after the purchases as well as the sales: an
+            # auction item she has already listed is reconciled by title
+            # in `link_sales`, so its cost only reaches the sale it
+            # belongs to once the rebuild has run.
             listings_mod.refresh(conn)
-        if (handled or noted) and truthy(cfg.get("sheets_after_poll")) \
+        if (handled or noted or bought) and truthy(cfg.get("sheets_after_poll")) \
                 and cfg.get("sheets_key"):
             try:
                 sync_sheets(cfg, conn)
@@ -1983,6 +2038,61 @@ def cmd_inventory(cfg, conn, args):
           "template, then batch print.")
 
 
+def cmd_goodwill(conn, args):
+    """Read one saved ShopGoodwill email and say what it found.
+
+    The `scan` of the auction half. Everything this parser knows was
+    reconstructed from two forwarded mails, and ShopGoodwill redesigns
+    that template like any other marketing department - so before a run
+    writes a cost basis into the database there has to be a way to point
+    it at a real message and *look*. Reads by default and writes only
+    when asked, for the same reason `scan` changes nothing.
+
+    Save the message as .eml from the mail client: 'Show original' in
+    Gmail, then save."""
+    raw = Path(args.path).read_bytes()
+    msg = email.message_from_bytes(raw)
+    if not goodwill_mod.is_from_goodwill(msg):
+        sender = mailparse._decode(msg.get("From")) or "(no From header)"
+        raise SystemExit(f"not a ShopGoodwill message - From: {sender}")
+
+    order = goodwill_mod.parse(msg)
+    if not order:
+        subject = mailparse._decode(msg.get("Subject"))
+        raise SystemExit(
+            f"no pattern matched that subject:\n  {subject}\n\n"
+            "If it is a win or a payment receipt, add it to "
+            "SUBJECT_PATTERNS in goodwill.py.")
+
+    print(f"kind    : {order['kind']}")
+    if order.get("seller"):
+        print(f"seller  : {order['seller']}")
+    if order.get("order_id"):
+        print(f"order   : {order['order_id']}   paid {order.get('paid_on')}")
+    costs = goodwill_mod.landed_cost(order) if order["kind"] == "goodwill_paid" else {}
+    for item in order.get("items") or []:
+        print(f"\n  item  : {item['item_id']}")
+        print(f"  title : {item.get('title')}")
+        print(f"  price : {item.get('price')}")
+        if item["item_id"] in costs:
+            print(f"  paid  : {costs[item['item_id']]}  (landed)")
+    if order["kind"] == "goodwill_paid":
+        print(f"\nsubtotal {order.get('subtotal')}  tax {order.get('tax')}  "
+              f"postage {order.get('shipping')}  total {order.get('total')}")
+        if len(order.get("items") or []) > 1:
+            print("More than one item, so the tax and the postage are not "
+                  "split - each item carries its own price and the rest "
+                  "stays as the trip's unassigned money.")
+
+    if not args.write:
+        print("\nNothing written. Re-run with --write to record it.")
+        return
+    result = goodwill_mod.import_order(conn, order)
+    listings_mod.refresh(conn)
+    print(f"\nrecorded {len(result['listing_ids'])} item(s)"
+          + (f", trip {result['trip_id']}" if result.get("trip_id") else ""))
+
+
 def cmd_verify(cfg, conn, args):
     """Check every archived label still matches the sale it belongs to.
 
@@ -2048,6 +2158,19 @@ def cmd_stats(cfg, conn, args):
           "SELECT * FROM v_aging LIMIT 10",
           lambda r: f"{(r['title'] or '?')[:34]:<36} ${r['price'] or 0:>7.2f}"
                     f"  {r['days_listed']}d  {r['inquiries']} inquiries")
+    # What has come home and is not yet for sale. A new question - until
+    # the ShopGoodwill importer there was no way for a row to exist
+    # before it was listed - and the one that decides what to photograph
+    # next. Cost is shown because it is the money standing still.
+    table("Bought, not yet listed",
+          "SELECT title, paid, inventory_code FROM listings "
+          "WHERE state = 'acquired' ORDER BY id DESC LIMIT 10",
+          # Not `or 0`: a win that has not been paid for yet has a null
+          # cost, and printing it as $0.00 says the thing was free. The
+          # same distinction `v_listing_perf.margin` is built on.
+          lambda r: f"{(r['title'] or '?')[:34]:<36} "
+                    + ("      -" if r["paid"] is None else f"${r['paid']:>6.2f}")
+                    + f"  {r['inventory_code'] or '----'}")
     table("Fastest sellers",
           "SELECT title, price, days_to_sell FROM v_listing_perf "
           "WHERE days_to_sell IS NOT NULL ORDER BY days_to_sell LIMIT 10",
@@ -2122,6 +2245,11 @@ def _main():
                    help="which listings (default: active)")
     p.add_argument("--all", action="store_true",
                    help="every listing, whatever its state")
+    p = sub.add_parser("goodwill",
+                       help="read one saved ShopGoodwill email")
+    p.add_argument("path", help="a .eml saved from the mail client")
+    p.add_argument("--write", action="store_true",
+                   help="record it; without this it only reports")
     p = sub.add_parser("ship", help="mark as shipped")
     p.add_argument("ref", help=ref_help)
     p = sub.add_parser("cancel", help="the buyer pulled out; not a sale")
@@ -2522,6 +2650,8 @@ def _main():
         cmd_verify(cfg, conn, args)
     elif args.cmd == "inventory":
         cmd_inventory(cfg, conn, args)
+    elif args.cmd == "goodwill":
+        cmd_goodwill(conn, args)
     elif args.cmd == "test-print":
         cmd_test_print(cfg, conn, args)
     elif args.cmd == "scan":

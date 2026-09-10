@@ -8418,3 +8418,378 @@ def test_the_jwt_signature_verifies_end_to_end(tmp_path):
         capture_output=True)
     assert done.returncode == 0, done.stdout + done.stderr
     assert b"Verified OK" in done.stdout
+
+
+# --------------------------------------------------------------------------
+# ShopGoodwill auction mail: what she bought, and what it really cost.
+#
+# The half of the mailbox nothing read until now. Every test here exists
+# because getting one of these wrong writes a wrong number into `paid`,
+# and a wrong cost basis is worse than none: a null margin reports itself
+# as unknown, a wrong one reports itself as profit.
+
+GOODWILL_WON = FIXTURES / "goodwill_won.eml"
+GOODWILL_PAID = FIXTURES / "goodwill_payment.eml"
+
+
+@pytest.fixture
+def won_mail():
+    return email.message_from_bytes(GOODWILL_WON.read_bytes())
+
+
+@pytest.fixture
+def paid_mail():
+    return email.message_from_bytes(GOODWILL_PAID.read_bytes())
+
+
+@pytest.mark.parametrize("from_header,ok", [
+    ("ShopGoodwill <no-reply@shopgoodwill.com>", True),
+    # The payment receipt comes from their transactional host, which is a
+    # different name entirely - matching only the bare domain would read
+    # every win and miss every payment, i.e. lose the money.
+    ("ShopGoodwill <no-reply@txemail.shopgoodwill.com>", True),
+    ("ShopGoodwill <No-Reply@ShopGoodwill.Com>", True),
+    ("ShopGoodwill <no-reply@shopgoodwill.com.example.net>", False),
+    ("\"ShopGoodwill.com\" <billing@notshopgoodwill.com>", False),
+    ("Facebook Marketplace <noreply@marketplace.facebook.com>", False),
+])
+def test_sender_domain_must_be_shopgoodwill(from_header, ok):
+    """What is downstream of this check is money against an object. An
+    IMAP FROM search matches the header as text, so a display name alone
+    gets a message fetched - the address domain is the real gate."""
+    from mplabel import goodwill
+
+    msg = email.message_from_string(
+        f"From: {from_header}\n"
+        "Subject: ShopGoodwill.com - Online Payment Received\n\n")
+    assert goodwill.is_from_goodwill(msg) is ok
+
+
+def test_a_goodwill_subject_is_never_classified_as_a_sale():
+    """Her purchases must not reach the seller-side classifier. A
+    ShopGoodwill subject answering 'sold' would put one of her own
+    purchases into the sell-through numerator - the same mistake
+    BUYER_KINDS exists to prevent for Facebook's buyer mail."""
+    from mplabel import goodwill
+
+    for subject in ("ShopGoodwill.com - You Were Awarded The Winning Bid!",
+                    "ShopGoodwill.com - Online Payment Received"):
+        assert listings.classify(subject) is None
+        assert goodwill.classify(subject) is not None
+
+
+def test_goodwill_kinds_are_buyer_side():
+    """`apply_events` replays mail_events into listings. A goodwill event
+    carries no Facebook listing id and its row is written with a cost by
+    the importer, so replaying it could only undo that."""
+    from mplabel import goodwill
+
+    for kind, _pattern in goodwill.SUBJECT_PATTERNS:
+        assert kind in listings.BUYER_KINDS
+
+
+def test_win_mail_gives_item_number_title_and_hammer_price(won_mail):
+    from mplabel import goodwill
+
+    order = goodwill.parse(won_mail)
+    assert order["kind"] == "goodwill_won"
+    item, = order["items"]
+    assert item["item_id"] == "911100022"
+    assert item["price"] == 24.50
+    assert order["seller"].startswith("Goodwill of the Example Valley")
+
+
+def test_win_title_stops_at_the_line_break(won_mail):
+    """The only thing marking the end of the title is the `<br>` after
+    it. Matched against the flattened body, `(.+)$` runs happily on
+    through the bidder agreement and the whole email becomes the title -
+    which is what shipped first and is invisible until you look at a
+    row."""
+    from mplabel import goodwill
+
+    item, = goodwill.parse(won_mail)["items"]
+    assert item["title"] == "Pair Of Painted Tin Toy Banks 1930s."
+    assert "PAYMENT MUST BE RECEIVED" not in item["title"]
+
+
+def test_win_title_keeps_its_own_full_stop(won_mail):
+    """Their template appends "!" to the title, so a title that ends in a
+    full stop arrives as "...Albums.!". Exactly one character is the
+    template's; stripping punctuation generally would eat the title's."""
+    from mplabel import goodwill
+
+    item, = goodwill.parse(won_mail)["items"]
+    assert item["title"].endswith("1930s.")
+
+
+def test_payment_mail_reads_every_figure(paid_mail):
+    from mplabel import goodwill
+
+    order = goodwill.parse(paid_mail)
+    assert order["kind"] == "goodwill_paid"
+    assert order["order_id"] == "65200001"
+    assert order["seller"] == "Goodwill Example County"
+    assert (order["subtotal"], order["tax"], order["shipping"],
+            order["total"]) == (8.99, 1.47, 9.41, 19.87)
+    assert order["paid_on"] == "2026-09-09"
+    item, = order["items"]
+    assert item["item_id"] == "911100037"
+    assert item["price"] == 8.99
+    assert item["quantity"] == 1
+
+
+def test_item_subtotal_is_not_read_as_an_item(paid_mail):
+    """`Item Subtotal: $8.99` sits four lines under `Item: 911100037`.
+    A loose `Item:` match makes the order total a second object on the
+    shelf, with a price and no title."""
+    from mplabel import goodwill
+
+    assert len(goodwill.parse(paid_mail)["items"]) == 1
+
+
+def test_paid_is_the_landed_cost_not_the_hammer_price(paid_mail):
+    """The teapot went for $8.99 and cost $19.87 to get here - $9.41 of
+    it postage. Recording the hammer price would report less than half of
+    what the object really cost, and every margin computed from it would
+    be wrong by more than 100%."""
+    from mplabel import goodwill
+
+    order = goodwill.parse(paid_mail)
+    assert goodwill.landed_cost(order) == {"911100037": 19.87}
+
+
+def _two_item_order(raw):
+    """The same payment mail with a second item in it."""
+    second = ('<td align="left"><font style="font-size:16px"><span>'
+              'BRASS CANDLESTICK PAIR<br><strong>Item:</strong> 911100099'
+              '<br><strong>Price:</strong> $21.00'
+              '<br><strong>Quantity:</strong> 1</span></font></td></tr><tr>')
+    anchor = '<tr><td align="left"><a href="https://click.shopgoodwill.com'
+    raw = raw.replace(anchor, second + anchor[4:], 1)
+    raw = raw.replace("<strong>Item Subtotal:</strong> $8.99",
+                      "<strong>Item Subtotal:</strong> $29.99")
+    return raw.replace("<strong>Order Total:</strong> $19.87",
+                       "<strong>Order Total:</strong> $45.00")
+
+
+def test_a_multi_item_order_is_never_apportioned():
+    """One shipping charge over three items cannot be split without
+    inventing the split - pro rata by price, by weight and evenly are
+    three different answers and none of them is on the receipt. Same rule
+    as `estimate_postage`: a derived figure that gets written down is
+    indistinguishable from a measured one a week later."""
+    from mplabel import goodwill
+
+    msg = email.message_from_string(
+        _two_item_order(GOODWILL_PAID.read_text(encoding="utf-8")))
+    order = goodwill.parse(msg)
+    assert order["total"] == 45.00
+    assert goodwill.landed_cost(order) == {"911100037": 8.99,
+                                           "911100099": 21.00}
+
+
+def test_the_unsplit_remainder_shows_up_as_unassigned(db):
+    """And it is not lost: tax and postage on a multi-item order become
+    the trip's unassigned money, which is the number the triage screen
+    exists to chase and the one question only she can answer."""
+    from mplabel import goodwill
+
+    msg = email.message_from_string(
+        _two_item_order(GOODWILL_PAID.read_text(encoding="utf-8")))
+    goodwill.import_mail(db, msg)
+    trip, = listings.trip_summary(db)
+    assert trip["receipt_total"] == 45.00
+    assert trip["assigned"] == 29.99
+    assert trip["unassigned"] == 15.01
+
+
+def test_a_single_item_order_leaves_nothing_unattributed(db, paid_mail):
+    """The other half of the same decision. A trip that can never reach
+    zero is a notification she cannot clear, and `notify.unattributed`
+    would say so about every auction she ever wins."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    trip, = listings.trip_summary(db)
+    assert trip["unassigned"] == 0.0
+
+
+def test_an_order_becomes_a_trip_with_the_selling_goodwill_on_it(db,
+                                                                paid_mail):
+    from mplabel import goodwill
+
+    result = goodwill.import_mail(db, paid_mail)
+    trip = listings.trip_summary(db, result["trip_id"])
+    assert trip["store"] == "ShopGoodwill - Goodwill Example County"
+    assert trip["occurred_at"] == "2026-09-09"
+    assert trip["receipt_total"] == 19.87
+
+
+def test_a_purchase_becomes_a_thing_on_a_shelf(db, paid_mail):
+    """The whole point: an auction win turns into inventory with a code
+    on it, without anybody typing. `paid` had a schema and a phone screen
+    for months and no automatic route in at all."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    row = db.execute("SELECT * FROM listings").fetchone()
+    assert row["listing_id"] == "goodwill:911100037"
+    assert row["title"] == "VINTAGE BLUE AND WHITE PORCELAIN MINI TEAPOT"
+    assert row["paid"] == 19.87
+    assert row["source"] == "goodwill"
+    assert row["state"] == goodwill.ACQUIRED
+    assert len(row["inventory_code"]) == 4
+
+
+def test_a_goodwill_key_cannot_collide_with_a_facebook_listing_id(db,
+                                                                 paid_mail):
+    """Both are nine-ish digit strings. Unprefixed, an item number that
+    happened to match a Facebook listing id would silently merge two
+    different objects and put a cost on the wrong one."""
+    from mplabel import goodwill
+
+    listings.upsert_listing(db, "911100037", "email", title="Something else")
+    goodwill.import_mail(db, paid_mail)
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 2
+    other = db.execute("SELECT paid FROM listings WHERE listing_id='911100037'"
+                       ).fetchone()
+    assert other["paid"] is None
+
+
+@pytest.mark.parametrize("order", [("won", "paid"), ("paid", "won")])
+def test_the_two_mails_land_on_one_row_either_way_round(db, order):
+    """A win and its payment are two mails about one object, and which
+    arrives first is not ours to decide - the backfill walks the mailbox
+    in whatever order the server returns."""
+    from mplabel import goodwill
+
+    won = GOODWILL_WON.read_text(encoding="utf-8").replace(
+        "911100022", "911100037")
+    raws = {"won": won, "paid": GOODWILL_PAID.read_text(encoding="utf-8")}
+    for which in order:
+        goodwill.import_mail(db, email.message_from_string(raws[which]))
+
+    rows = db.execute("SELECT listing_id, paid FROM listings").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["listing_id"] == "goodwill:911100037"
+    assert rows[0]["paid"] == 19.87
+
+
+def test_a_win_on_its_own_records_no_cost(db, won_mail):
+    """A win is a debt, not a cost: payment is due within seven days and
+    she has not made it. Writing the hammer price as `paid` would report
+    money that has not left the account, and would then block the
+    payment mail's better figure - which is the landed one."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, won_mail)
+    row = db.execute("SELECT paid, trip_id FROM listings").fetchone()
+    assert row["paid"] is None
+    assert row["trip_id"] is None
+    # The figure is not thrown away - it is on the event, where a debt
+    # belongs.
+    event = db.execute("SELECT kind, amount FROM mail_events").fetchone()
+    assert (event["kind"], event["amount"]) == ("goodwill_won", 24.50)
+
+
+def test_importing_the_same_mail_twice_changes_nothing(db, paid_mail):
+    """`backfill --restart` re-walks the whole mailbox. A second trip for
+    the same order would double the cost basis of the month."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    goodwill.import_mail(db, paid_mail)
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM mail_events").fetchone()[0] == 1
+
+
+def test_a_cost_she_corrected_survives_the_next_import(db, paid_mail):
+    """The mail arrives once and she is the later observation. A plain
+    overwrite on every import would undo a correction typed on the phone
+    the first time the backfill ran again."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    row = db.execute("SELECT id FROM listings").fetchone()
+    listings.set_cost(db, row["id"], 25.00)
+    goodwill.import_order(db, goodwill.parse(paid_mail))
+    assert db.execute("SELECT paid FROM listings").fetchone()["paid"] == 25.00
+
+
+def test_acquired_stays_out_of_the_sell_through_denominator(db, paid_mail):
+    """`v_price_band` measures sold over COUNT(*). Left in, a box of
+    things she has won and not yet photographed would push sell-through
+    down on the day it arrived - which is the opposite of what winning an
+    auction means."""
+    from mplabel import goodwill
+
+    listings.upsert_listing(db, "111", "email", title="Sold thing",
+                            price=20.0, state="sold")
+    listings.upsert_listing(db, "222", "email", title="Live thing",
+                            price=20.0, state="active")
+    goodwill.import_mail(db, paid_mail)
+    listings.build_views(db)
+    band = db.execute("SELECT listed, sold FROM v_price_band "
+                      "WHERE price_band='$10-25'").fetchone()
+    assert (band["listed"], band["sold"]) == (2, 1)
+
+
+def test_listing_something_moves_it_off_acquired(db, paid_mail):
+    """'acquired' ranks below 'active', so a late-arriving auction mail
+    cannot drag a listing that is already live back to the shelf - and
+    listing the thing does move it forward."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    key = "goodwill:911100037"
+    listings.upsert_listing(db, key, "email", state="active")
+    assert db.execute("SELECT state FROM listings").fetchone()["state"] == "active"
+    listings.upsert_listing(db, key, "goodwill", state=goodwill.ACQUIRED)
+    assert db.execute("SELECT state FROM listings").fetchone()["state"] == "active"
+
+
+def test_an_auction_cost_reaches_the_sale_it_belongs_to(db, paid_mail):
+    """The payoff, and the reason the module exists. `v_monthly.net` has
+    been correct and empty since the views were written, because nothing
+    could fill `paid`. Reconciliation is by title, exactly as it is for a
+    saved-page import."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    db.execute(
+        "INSERT INTO sales (message_id, item, price, received_at, status) "
+        "VALUES ('<m1>', 'Vintage blue and white porcelain mini teapot', "
+        "45.0, '2026-10-01T10:00:00', 'recorded')")
+    db.commit()
+    listings.refresh(db)
+
+    row = db.execute("SELECT state, price, paid, margin FROM v_listing_perf"
+                     ).fetchone()
+    assert (row["state"], row["price"], row["paid"]) == ("sold", 45.0, 19.87)
+    assert row["margin"] == 25.13
+    month = db.execute("SELECT net, costed FROM v_monthly").fetchone()
+    assert (month["net"], month["costed"]) == (25.13, 1)
+
+
+def test_the_poller_looks_for_goodwill_mail_too():
+    """A parser nothing calls is a parser that does not exist. The search
+    has to name the sender or the mail is never fetched."""
+    from mplabel import cli, goodwill
+
+    imap = _FakeIMAP([b"1"])
+    cli.candidate_ids(imap, {"lookback_days": "7"}, "imap.gmail.com")
+    assert "shopgoodwill.com" in imap.queries[0]
+    assert all(d in cli.MAIL_DOMAINS for d in goodwill.SENDER_DOMAINS)
+
+
+def test_the_plain_imap_fallback_nests_its_ors():
+    """IMAP's OR takes exactly two arguments. A flat `OR a b c` is
+    rejected outright, and `candidate_ids` then falls through to the
+    UNSEEN query - the one that hid eight labels behind a Gmail thread."""
+    from mplabel import cli
+
+    expr = cli.imap_or_from(("a.example", "b.example", "c.example"))
+    assert expr == ('(OR (OR (FROM "a.example") (FROM "b.example")) '
+                    '(FROM "c.example"))')
+    assert expr.count("OR") == expr.count("(OR")

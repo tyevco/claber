@@ -1,0 +1,58 @@
+From: ShopGoodwill <no-reply@txemail.shopgoodwill.com>
+To: Jane Tester <jane.tester@example.com>
+Subject: ShopGoodwill.com - Online Payment Received
+Date: Wed, 09 Sep 2026 22:04:11 -0400
+Message-ID: <fixture-goodwill-paid-0001@txemail.shopgoodwill.com>
+MIME-Version: 1.0
+Content-Type: text/html; charset="utf-8"
+
+<html><body>
+<table cellpadding="0" cellspacing="0" border="0" width="100%">
+<tbody><tr>
+<td align="center"><font style="font-size:18px"><span>Your online payment has been received.<br><br><strong>Payment was received on:</strong>&nbsp;&nbsp;9/9/2026</span></font></td>
+</tr>
+<tr>
+<td align="center"><font style="font-size:30px"><span><span style="font-size:30px">Order Details</span></span></font></td>
+</tr>
+<tr><td>
+<table cellpadding="0" cellspacing="0" border="0" width="100%">
+<tbody><tr>
+<th align="left" valign="top"><img src="https://images.shopgoodwill.com/item.jpg" width="240" border="0"></th>
+<th width="40" alt="Vintage Blue And White Porcelain Mini Teapot"><img src="https://images.shopgoodwill.com/spacer.gif" width="40" height="1"></th>
+<th align="left" valign="middle">
+<table cellpadding="0" cellspacing="0" border="0" width="260">
+<tbody><tr>
+<td align="left"><font style="font-size:16px"><span>VINTAGE BLUE AND WHITE PORCELAIN MINI TEAPOT<br><strong>Item:</strong> 911100037<br><strong>Price:</strong> $8.99<br><strong>Quantity:</strong> 1</span></font></td>
+</tr>
+<tr><td align="left"><a href="https://click.shopgoodwill.com/u/nrd.php?p=fixture"><font style="font-size:20px">VIEW ITEM</font></a></td></tr>
+<tr><td><hr></td></tr>
+</tbody></table>
+</th>
+</tr></tbody></table>
+</td></tr>
+<tr>
+<td align="center"><font style="font-size:18px"><span><strong>Seller's Information</strong><br><br><strong>Goodwill Name</strong>: Goodwill Example County<br><strong>City</strong>: Springfield</span></font></td>
+</tr>
+<tr><td>
+<table cellpadding="0" cellspacing="0" border="0" width="100%">
+<tbody><tr>
+<th align="left" valign="top">
+<table cellpadding="0" cellspacing="0" border="0" width="240">
+<tbody><tr>
+<td align="left"><font style="font-size:16px"><span><strong><span style="font-size:14px">Payment Information</span></strong><br><br><span style="font-size:14px"><strong>Order Number:</strong> 65200001</span><br><span style="font-size:14px"><strong>Item Subtotal:</strong> $8.99</span><br><span style="font-size:14px"><strong>Sales Tax (if applicable):</strong> $1.47</span><br><span style="font-size:14px"><strong>Shipping and Handling:</strong> $9.41<br> </span><br><span style="font-size:14px"><strong>Order Total:</strong> $19.87</span><br></span></font></td>
+</tr></tbody></table>
+</th>
+<th width="60"><img src="https://images.shopgoodwill.com/spacer.gif" width="60" height="1"></th>
+<th align="left" valign="top">
+<table cellpadding="0" cellspacing="0" border="0" width="240">
+<tbody><tr>
+<td align="left"><font style="font-size:16px"><span><strong><span style="font-size:14px">Shipping Information</span></strong><br><br><span style="font-size:14px"><strong>Name:</strong>&nbsp;Jane Tester</span><br><span style="font-size:14px"><strong>Address:</strong> 1 Example Way</span><br><span style="font-size:14px"><strong>City:</strong> Springfield</span><br><span style="font-size:14px"><strong>State:</strong> IL</span><br><span style="font-size:14px"><strong>Zip:</strong> 62701</span><br></span></font></td>
+</tr></tbody></table>
+</th>
+</tr></tbody></table>
+</td></tr>
+<tr>
+<td align="center"><font style="font-size:16px"><span>Once your order has been processed by the selling Goodwill, you may track your shipment here.<br>Congrats on winning the bid for your item(s)!<br>Thank you for using ShopGoodwill.com</span></font></td>
+</tr>
+</tbody></table>
+</body></html>
