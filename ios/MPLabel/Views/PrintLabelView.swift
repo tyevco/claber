@@ -96,10 +96,17 @@ struct PrintLabelView: View {
                 MPCard {
                     VStack(alignment: .leading, spacing: MP.S.x3) {
                         MPEyebrow("Turn")
+                        // `first(where:)` spelled out rather than as a
+                        // trailing closure: this is an argument to a call
+                        // that takes a trailing closure of its own, and
+                        // two of them nested is where the parser starts
+                        // guessing which is which.
                         MPPills(titles: turns.map(\.0),
-                                selected: turns.first { $0.1 == rotate }?.0
-                                          ?? "Auto") { title in
-                            rotate = turns.first { $0.0 == title }?.1 ?? nil
+                                selected: turns.first(where: {
+                                    $0.1 == rotate
+                                })?.0 ?? "Auto") { title in
+                            rotate = turns.first(where: { $0.0 == title })?.1
+                                     ?? nil
                             forget()
                         }
                         Stepper(value: $page, in: 1...50) {
@@ -163,7 +170,10 @@ struct PrintLabelView: View {
                                  + "one before printing.")
                                 .font(.system(size: 12))
                                 .foregroundStyle(MP.Palette.muted)
-                            MPPills(titles: (1...r.regionsFound).map(String.init),
+                            // `map { String($0) }`, not `map(String.init)`:
+                            // String has several inits that take an Int
+                            // and the bare reference is ambiguous.
+                            MPPills(titles: (1...r.regionsFound).map { String($0) },
                                     selected: String(region ?? r.region)) { pick in
                                 region = Int(pick)
                                 forget()
