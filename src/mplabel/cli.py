@@ -48,6 +48,10 @@ except ImportError:
     fcntl = None
 
 from . import backfill as backfill_mod
+# Safe at module level: ebay.py imports nothing from this package,
+# unlike `web`, which imports cli back and has to be imported inside
+# main() to avoid the cycle.
+from . import ebay as ebay_mod
 from . import goodwill as goodwill_mod
 from . import label
 from . import listings as listings_mod
@@ -2306,6 +2310,72 @@ def cmd_ebay(cfg, args):
     return 0
 
 
+def cmd_ebay_pull(cfg, conn, args):
+    """eBay orders as `sales` rows - printed, not written.
+
+    `--dry-run` is the only mode that exists yet, and that is the point
+    of this slice rather than a limitation of it: it proves the OAuth
+    path, the order JSON shape and the whole mapping against the real
+    API without one write to a database that holds real orders. Every
+    other survey in this project has the same shape - `scan` changes
+    nothing at all, and `notify`, `pending`, `reconcile` and `sheets`
+    each carry a `--dry-run` that was worth having.
+
+    Running it twice says the same thing, because it records nothing.
+    That honesty was got wrong once already: `notify --dry-run` ran the
+    whole decision and then called `rollback()`, which did nothing
+    because `remember` had already committed.
+    """
+    if not args.dry_run:
+        # Refused rather than defaulted to dry: a command that silently
+        # does less than its name says is worse than one that stops.
+        print("ebay pull: writing is not built yet - this slice only "
+              "surveys.\nRun it with --dry-run to see what it would "
+              "record.", file=sys.stderr)
+        return 2
+
+    try:
+        orders = ebay_mod.get_orders(cfg, since=args.since, limit=args.limit)
+    except ebay_mod.EbayConfigError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 78
+    except ebay_mod.EbayError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 1
+
+    if not orders:
+        print("no eBay orders in that window")
+        return 0
+
+    fresh, known = [], []
+    for order in orders:
+        rec = ebay_mod.order_to_sale(order)
+        # The same guard the mail path uses, and for the same reason: the
+        # unit of a sale is the order. A second `pull` over the same
+        # window must not be able to produce a second row.
+        seen = already_seen(conn, rec.get("message_id"), rec.get("order_id"))
+        (known if seen else fresh).append(rec)
+
+    for rec in fresh:
+        print(f"\n  {rec['message_id']}  {rec['item'] or '(no title)'}")
+        shown = "?" if rec["price"] is None else f"{rec['price']:.2f}"
+        print(f"    price     {shown}   "
+              f"(line items, not the order total)")
+        print(f"    sold      {rec['received_at']}")
+        print(f"    ship by   {rec['ship_by']}   (local date)")
+        print(f"    ship to   {rec['ship_to']}")
+        print(f"    service   {rec['service']}")
+        print(f"    sku       {rec['sku']}")
+
+    print(f"\nwould record {len(fresh)} sale(s); "
+          f"{len(known)} already in the database.")
+    # Said out loud because the columns do not exist yet, and a dry run
+    # that quietly implies otherwise is the thing this command is for.
+    print("nothing written - `sales.channel` and the write path are the "
+          "next slice.")
+    return 0
+
+
 def cmd_inventory(cfg, conn, args):
     """Write a CSV of inventory labels for the label maker.
 
@@ -2915,6 +2985,16 @@ def _main():
     esub.add_parser("check",
                     help="configuration, tokens and how long they have "
                          "left. Changes nothing and sends nothing")
+    e = esub.add_parser("pull",
+                        help="eBay orders as sales rows. --dry-run is "
+                             "currently the only mode: it prints what it "
+                             "would record and writes nothing")
+    e.add_argument("--since", metavar="YYYY-MM-DD",
+                   help="orders created on or after this date "
+                        f"(default: {ebay_mod.DEFAULT_SINCE_DAYS} days back)")
+    e.add_argument("--limit", type=int, help="stop after this many orders")
+    e.add_argument("--dry-run", action="store_true",
+                   help="print what would be recorded and write nothing")
 
     args = ap.parse_args()
     logging.basicConfig(
@@ -3064,5 +3144,9 @@ def _main():
         cmd_stats(cfg, conn, args)
     elif args.cmd == "reconcile":
         cmd_reconcile(cfg, conn, args)
+    elif args.cmd == "ebay":
+        # `auth` and `check` were handled above connect_db; `pull` needs
+        # the database, to say which orders are already recorded.
+        return cmd_ebay_pull(cfg, conn, args)
     elif args.cmd == "notify":
         return cmd_notify(cfg, conn, args)

@@ -10,17 +10,37 @@ this repo, which is why it is written down.
 
 ## What is built so far
 
-Phase 0 only: the plumbing. OAuth, the token store, and the two commands
-that prove them.
+The plumbing, and a survey of the orders.
 
 ```bash
 mplabel ebay auth            # prints the consent URL, then takes the code
 mplabel ebay check           # config and tokens; changes nothing
+mplabel ebay pull --dry-run  # the orders it would record; writes nothing
 ```
 
-Nothing reads or writes the database yet, and nothing has been sent to
-eBay in anger. Every row this adds to CLAUDE.md's verified/assumed table
-is **ASSUMED**.
+`pull` **refuses without `--dry-run`** and exits 2. Writing is the next
+slice; a command that silently does less than its name says is worse
+than one that stops.
+
+Nothing writes to the database yet, and nothing has been sent to eBay in
+anger. Every row this adds to CLAUDE.md's verified/assumed table is
+**ASSUMED** - the order fixture is built from eBay's documented schema
+and has never been compared with a real payload, so a green suite proves
+the mapping is self-consistent and nothing more.
+
+Three things in that mapping are worth knowing, because each is a trap
+this repo has fallen into before in another form:
+
+- **`price` is the line items, not `pricingSummary.total`,** which
+  carries delivery and sales tax. The wrong field would put tax into
+  `v_monthly.gross` and into the median `listings.worth` prices the next
+  object off.
+- **`ship_by` is converted to a local date.** eBay sends RFC 3339 UTC,
+  and `notify.due_parcels` compares this column as a *string* - so a raw
+  stamp is never `<= '2026-09-15'` and a parcel due today would be
+  reported the day after it was due.
+- **`message_id` is `ebay:<orderId>`, never NULL.** Six call sites on
+  the print path key on it and all six fail silently on a falsy one.
 
 ## What you have to do once
 
