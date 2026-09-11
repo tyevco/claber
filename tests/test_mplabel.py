@@ -8793,3 +8793,37 @@ def test_the_plain_imap_fallback_nests_its_ors():
     assert expr == ('(OR (OR (FROM "a.example") (FROM "b.example")) '
                     '(FROM "c.example"))')
     assert expr.count("OR") == expr.count("(OR")
+def test_an_inline_comment_does_not_choose_the_wrong_apple(tmp_path):
+    """The bug that produced `InternalServerError` and nothing else.
+
+    `configparser` does not strip inline comments, and this project's own
+    documentation showed the setting with one. So the value became
+    "sandbox   ; production once..." - which is not "sandbox" - and a
+    sandbox token went to the production host, where APNs refused it
+    without naming anything."""
+    from mplabel import notify
+
+    assert notify.environment({"apns_environment": "sandbox"}) == "sandbox"
+    assert notify.environment(
+        {"apns_environment": "sandbox   ; production once it is not a dev "
+                             "build"}) == "sandbox"
+    assert notify._host(
+        {"apns_environment": "sandbox ; later production"}) \
+        == notify.APNS_SANDBOX_HOST
+    # And the default is still production, including for an empty value.
+    assert notify.environment({}) == "production"
+    assert notify.environment({"apns_environment": ""}) == "production"
+
+
+def test_the_documented_config_has_no_inline_comments():
+    """The snippet in the docs is the thing people paste. It had one, and
+    it cost an afternoon of blaming Apple."""
+    for name in ("mplabel.conf.example", "docs/notifications.md"):
+        text = (Path(__file__).parent.parent / name).read_text()
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not re.match(r"^[a-z_]+\s*=", stripped):
+                continue
+            assert not re.search(r"\s[;#]", stripped), \
+                f"{name}: inline comment in {stripped!r} - configparser " \
+                "keeps it, so the value is not what it looks like"

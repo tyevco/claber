@@ -169,10 +169,29 @@ def provider_token(cfg, now=None):
 
 # ------------------------------------------------------------- sending
 
+def environment(cfg):
+    """Which Apple to talk to, from a value that may have picked up a
+    comment on the way in.
+
+    `configparser` does not strip inline comments, so a config written
+    from a documentation snippet that had one - as this project's own
+    did - holds `sandbox   ; production once...`. That is not "sandbox",
+    so the comparison failed and a **sandbox token was sent to the
+    production host**, which APNs answered with `InternalServerError`
+    and no explanation at all.
+
+    Taking the first word is not a licence to write comments inline; the
+    example and the docs put them on their own line, and `mplabel
+    config` flags any value that still has one. It is here because this
+    particular value decides which of two hosts is even asked, and being
+    wrong about it produces an error that names nothing.
+    """
+    raw = str(cfg.get("apns_environment") or "production").strip()
+    return raw.split()[0].strip(";#").lower() if raw else "production"
+
+
 def _host(cfg):
-    return (APNS_SANDBOX_HOST
-            if str(cfg.get("apns_environment", "production")).lower()
-               == "sandbox"
+    return (APNS_SANDBOX_HOST if environment(cfg) == "sandbox"
             else APNS_HOST)
 
 
