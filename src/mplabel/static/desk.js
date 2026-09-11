@@ -44,7 +44,7 @@ var S = {
   /* Print a label. The file never leaves the page until she asks: it is
      the one thing here that cannot be re-fetched, and a half-remembered
      one across a reload would print something she did not pick. */
-  send: null, sendUrl: null,
+  send: null, sendUrl: null, sendShot: null,
 
   /* Inventory */
   inv: null, invQ: '', invTotal: 0, sort: 'title', dir: 1, sel: [],
@@ -420,7 +420,11 @@ function renderNav() {
       '<button class="btn btn--quiet" onclick="toggleTheme()" ' +
         'style="padding:6px 10px;font-size:12px">' +
         (S.theme === 'dark' ? 'Light' : 'Dark') + '</button>' +
-      '<a href="/" style="font-size:12px">The phone app →</a>' +
+      /* `?ui=phone` and not `/`. On a laptop the bare link is a button
+         that bounces straight back here, because the auto-route would
+         send this browser to the desk again. The parameter is the
+         person overruling it, and it is remembered. */
+      '<a href="/?ui=phone" style="font-size:12px">The phone app →</a>' +
     '</div>';
 }
 
@@ -716,14 +720,19 @@ function viewQueue() {
         '" onclick="pickOrder(' + o.id + ')">' +
         '<span class="code code--row' + (bad ? ' code--bad' : '') + '">' +
           esc(o.code || '—') + '</span>' +
+        /* Two lines for the title and the price down on the second row.
+           Her titles run to a hundred characters - "Original 1944 WWII
+           Army Air Forces Officer Candidate School Panoramic Photograph
+           Miami Beach Florida" - so a single line next to a price is a
+           line with no room to say which parcel this is. */
         '<span class="qrow__text">' +
           '<span class="qrow__title">' + esc(o.item) + '</span>' +
           '<span class="qrow__sub">' +
             '<span class="qrow__buyer">' + esc(dash(o.buyer)) + '</span>' +
+            '<span class="qrow__price">' + money(o.price) + '</span>' +
             '<span class="qrow__due ' + u.cls + '">' + esc(u.label) + '</span>' +
           '</span>' +
         '</span>' +
-        '<span class="qrow__price">' + money(o.price) + '</span>' +
       '</button></div>';
   }).join('');
 
@@ -1257,15 +1266,34 @@ function viewSend() {
       sendAnswer(pick, r) +
     '</div>' +
     '<div class="send__right">' +
-      '<div class="label">The file you chose</div>' +
-      (S.sendUrl
-        ? '<embed src="' + esc(S.sendUrl) + '" type="application/pdf">'
-        : '<div class="send__blank"></div>') +
-      '<p class="prose muted" style="font-size:11.5px;margin:0">This is ' +
-        'the page going in, not the 4×6 coming out. What will print is ' +
-        'the measurement on the left.</p>' +
+      '<div class="label">' +
+        (S.sendShot ? 'What will print' : 'The file you chose') + '</div>' +
+      (S.sendShot
+        ? '<img class="send__page" src="' + esc(S.sendShot) + '" alt="">'
+        : (S.sendUrl
+            ? '<embed src="' + esc(S.sendUrl) + '" type="application/pdf">'
+            : '<div class="send__blank"></div>')) +
+      sendLegend(r) +
     '</div>' +
   '</div></div>';
+}
+
+/* The outline is drawn by the server, from the same call that does the
+   cropping - so it cannot show a rectangle the printer will not use.
+   This only has to say what the colours mean. */
+function sendLegend(r) {
+  if (!S.sendShot) {
+    return '<p class="prose muted" style="font-size:11.5px;margin:0">' +
+      'The page going in. Check the crop to see the 4×6 marked on it.</p>';
+  }
+  var extra = (r && r.regions_found > 1)
+    ? ' The red outlines are the other blocks on this page it could have ' +
+      'taken — a packing slip, usually. If it has boxed the wrong one, ' +
+      'say which under <b>Which block</b>.'
+    : '';
+  return '<p class="prose muted" style="font-size:11.5px;margin:0">' +
+    '<b style="color:var(--ac)">Green</b> is the 4×6 that will print, ' +
+    'drawn by the same code that does the cropping.' + extra + '</p>';
 }
 
 function sendHead() {
@@ -1343,6 +1371,10 @@ function takeSendFile(f) {
              region: '', result: null, error: '', busy: false };
   S.sendUrl = URL.createObjectURL(f);
   renderMain();
+  /* Draw it straight away. The outline is the whole reason this screen
+     is worth having on a laptop, and making her press a button to see
+     the page she just chose is a step with nothing behind it. */
+  refreshSendShot();
 }
 
 function clearSend() {
@@ -1353,18 +1385,65 @@ function clearSend() {
 
 function releaseSend() {
   if (S.sendUrl) { URL.revokeObjectURL(S.sendUrl); S.sendUrl = null; }
+  releaseShot();
 }
 
 function sendOpt(key, value) {
   if (!S.send) return;
   S.send[key] = value;
   /* Any option changes what the answer would be, so the old one stops
-     being about this. Showing a stale crop beside a changed rotation is
-     how somebody prints the thing they were just told not to. */
+     being about this - the picture included. A stale outline beside a
+     changed rotation is worse than no outline: it is a drawing of a
+     crop that is not going to happen, and it looks exactly like one
+     that is. */
   S.send.result = null;
   S.send.error = '';
+  releaseShot();
   renderMain();
+  /* Check-only is a toggle about *printing*, not about looking. Turning
+     it off should not stop the page being drawn, and must never make
+     this print. */
+  if (key !== 'dry') refreshSendShot();
 }
+
+function releaseShot() {
+  if (S.sendShot) { URL.revokeObjectURL(S.sendShot); S.sendShot = null; }
+}
+
+/* Always a dry run and never a print. This fires on its own - choosing a
+   file, changing the turn - so it has to be incapable of spending
+   stock whatever the toggle says. */
+function refreshSendShot() {
+  var pick = S.send;
+  if (!pick || !pick.file) return;
+  var q = [];
+  if (pick.rotate !== '') q.push('rotate=' + pick.rotate);
+  if (pick.page > 1) q.push('page=' + pick.page);
+  if (pick.region !== '') q.push('region=' + pick.region);
+  var query = q.length ? '?' + q.join('&') : '';
+
+  var mine = ++sendShotSeq;
+  (async function () {
+    try {
+      var body = await pick.file.arrayBuffer();
+      var res = await fetch('/api/label/preview' + query, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'X-Mplabel': '1', 'Content-Type': 'application/pdf' },
+        body: body
+      });
+      /* A slow answer to a question she has already changed must not
+         land. Without this the outline can flick back to the previous
+         rotation after the new one has drawn. */
+      if (mine !== sendShotSeq || S.send !== pick) return;
+      if (!res.ok) return;         /* the JSON call reports the reason */
+      releaseShot();
+      S.sendShot = URL.createObjectURL(await res.blob());
+      renderMain();
+    } catch (e) { /* the measurement below says what went wrong */ }
+  })();
+}
+
+var sendShotSeq = 0;
 
 function doSendLabel() {
   var pick = S.send;

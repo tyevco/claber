@@ -266,8 +266,11 @@ a:hover { text-decoration: underline; }
 /* ------------------------------------------------------------ to ship */
 
 .split { flex: 1; min-height: 0; display: flex; }
+/* Wider than the design's 380. That was drawn against invented titles of
+   about forty characters; hers run past a hundred, and the column has to
+   hold two lines of one without the parcel code losing its width. */
 .split__list {
-  width: 380px; flex: none; border-right: 1px solid var(--bd);
+  width: 430px; flex: none; border-right: 1px solid var(--bd);
   display: flex; flex-direction: column;
 }
 .split__head {
@@ -292,20 +295,27 @@ a:hover { text-decoration: underline; }
 .qrow__btn--on { background: var(--elev); border-color: var(--bds); }
 .qrow__btn--bad { background: var(--alt); }
 .qrow__text { flex: 1; min-width: 0; }
+/* `display` is load bearing, not decoration. As an inline span - which
+   is what a <span> is by default - `overflow` and `text-overflow` do
+   not apply at all, so the title simply painted over the price instead
+   of ending in an ellipsis. Two lines because these titles need them. */
 .qrow__title {
-  font-size: 13px; font-weight: 600; line-height: 1.3;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 13px; font-weight: 600; line-height: 1.35;
 }
 .qrow__sub {
-  display: flex; gap: 7px; align-items: baseline; margin-top: 2px;
+  display: flex; gap: 9px; align-items: baseline; margin-top: 4px;
 }
+/* The buyer yields first. A name is recoverable from the detail pane;
+   the price and the deadline are why the row is being scanned. */
 .qrow__buyer {
-  font-size: 11.5px; color: var(--mut);
+  flex: 1; min-width: 0; font-size: 11.5px; color: var(--mut);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .qrow__due {
   font-family: var(--mv-font-mono); font-size: 11px;
-  margin-left: auto; flex: none; color: var(--mut);
+  flex: none; color: var(--mut);
 }
 .qrow__due.due--now  { color: var(--al); }
 .qrow__due.due--soon { color: var(--wa); }
@@ -477,10 +487,13 @@ a:hover { text-decoration: underline; }
   flex: 1; min-width: 300px; position: sticky; top: 0;
   display: flex; flex-direction: column; gap: 9px;
 }
-.send__right embed, .send__blank {
+.send__right embed, .send__blank, .send__page {
   width: 100%; height: 520px; border: 1px solid var(--bd);
   border-radius: 12px; background: var(--rai); display: block;
 }
+/* `contain`, so the whole page is in frame. A crop outline you have to
+   scroll to see is not showing you where the crop is. */
+.send__page { object-fit: contain; padding: 8px; }
 .send__blank { background: var(--elev); }
 
 .send__opts { margin-top: 18px; padding: 6px 18px 14px; }

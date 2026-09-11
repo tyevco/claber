@@ -146,6 +146,12 @@ DEFAULTS = {
     # X-Forwarded-Proto. Forcing yes on a plain-HTTP LAN test makes the
     # browser drop the cookie and the login fails with no visible reason.
     "web_secure_cookie": "auto",
+    # Send a browser to the front end built for it when it asks for `/`:
+    # a phone gets the PWA, a laptop gets the desk portal. `?ui=phone` or
+    # `?ui=desk` overrides it and is remembered, which is what the link
+    # each one carries to the other actually does. Set to no to serve the
+    # phone app at `/` to everybody, as it was before.
+    "web_auto_route": "yes",
     # The print service. `printer_backend = pi-http` sends jobs here
     # instead of straight to a device; every other printer_* key stays
     # on the machine with the printer, which is the machine being tuned.

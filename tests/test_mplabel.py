@@ -11,12 +11,14 @@ import argparse
 import csv
 import email
 import importlib.util
+import io
 import json
 import re
 import sqlite3
 import threading
 import sys
 import time
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 
@@ -2046,6 +2048,37 @@ def test_print_label_still_prints_when_the_lock_cannot_be_made(
 
 # ------------------------------------------------------------ the web app
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Hand the 3xx back instead of chasing it.
+
+    `urlopen` follows a redirect by default, which is right for every
+    other test here and useless for the ones about routing: they are
+    asserting *which* way a browser is sent, and a followed redirect
+    reports 200 from wherever it landed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _http_once(url, headers=None, cookie=None):
+    """One request, no redirect following. Returns (status, headers)."""
+    import urllib.error
+
+    req = urllib.request.Request(url, method="GET")
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    if cookie:
+        req.add_header("Cookie", cookie)
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+        exc.close()
+        return exc.code, exc.headers, body
+
+
 def _http(url, method="GET", data=None, cookie=None, headers=None, raw=None):
     """One request through the real server. Returns (status, headers, body).
 
@@ -2092,6 +2125,28 @@ def app(tmp_path):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         yield f"http://127.0.0.1:{srv.server_address[1]}", conn
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.fixture
+def app_no_routing(tmp_path):
+    """The same server with `web_auto_route = no`, which is what someone
+    who does not want a redirect at `/` sets."""
+    import threading
+
+    from mplabel import cli, web
+
+    cli.connect_db(tmp_path)
+    cfg = {"home": str(tmp_path),
+           "web_password_hash": web.hash_password("hunter2"),
+           "web_session_days": "30", "web_secure_cookie": "no",
+           "web_auto_route": "no"}
+    srv = web.Server(("127.0.0.1", 0), cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
     finally:
         srv.shutdown()
         srv.server_close()
@@ -7275,6 +7330,153 @@ def test_the_desk_shell_is_served(app):
     assert _http(base + "/desk/")[0] == 200
 
 
+IPHONE = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+          "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+          "Mobile/15E148 Safari/604.1")
+# What that same iPhone sends after Request Desktop Site: a Mac, exactly.
+IPHONE_DESKTOP = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                  "Safari/605.1.15")
+ANDROID = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+ANDROID_DESKTOP = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+MAC = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+# What a browser sends when it is following a link or an address, and
+# what nothing scripted sends. Only a navigation gets routed.
+NAV = {"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+
+
+def _nav(agent, **extra):
+    head = dict(NAV)
+    head["User-Agent"] = agent
+    head.update(extra)
+    return head
+
+
+@pytest.mark.parametrize("agent,desk", [
+    (IPHONE, False),
+    (ANDROID, False),
+    (MAC, True),
+    # The whole point: Request Desktop Site works by rewriting the UA, so
+    # honouring it and reading the UA are the same act. If these two ever
+    # disagree with the two above, the button has stopped working.
+    (IPHONE_DESKTOP, True),
+    (ANDROID_DESKTOP, True),
+])
+def test_request_desktop_site_is_just_the_user_agent(agent, desk):
+    from mplabel import web
+    assert web.prefers_desk(agent) is desk
+
+
+def test_the_client_hint_beats_the_user_agent_string():
+    """`Sec-CH-UA-Mobile` is the designed replacement for reading the UA,
+    Chrome and Edge send it unasked, and it flips with Request Desktop
+    Site like everything else. Where it exists it is the better answer -
+    including on a UA string that has been rewritten to look like a Mac
+    while the browser still knows it is a phone."""
+    from mplabel import web
+    assert web.prefers_desk(MAC, "?1") is False
+    assert web.prefers_desk(IPHONE, "?0") is True
+    # Anything else and it falls back rather than guessing.
+    assert web.prefers_desk(IPHONE, "") is False
+    assert web.prefers_desk(MAC, "banana") is True
+
+
+def test_a_laptop_is_sent_to_the_desk_and_a_phone_is_not(app):
+    base, _ = app
+    status, headers, _ = _http_once(base + "/", headers=_nav(MAC))
+    assert status == 302
+    assert headers.get("Location") == "/desk"
+    # One URL answering two ways off a header, with Cloudflare in front.
+    assert "User-Agent" in (headers.get("Vary") or "")
+
+    status, _h, body = _http_once(base + "/", headers=_nav(IPHONE))
+    assert status == 200
+    assert b"<title>mplabel</title>" in body
+
+    # And the other way round: a phone that went looking for the desk on
+    # purpose is sent back, because it did not say `?ui=`.
+    status, headers, _ = _http_once(base + "/desk", headers=_nav(IPHONE))
+    assert status == 302 and headers.get("Location") == "/"
+
+
+def test_asking_for_one_pins_it_and_the_link_back_still_works(app):
+    """The failure this is really about: click "the phone app" on a
+    laptop, get auto-routed straight back to the desk, forever. The link
+    carries `?ui=`, which is remembered - so the second request, with no
+    parameter at all, has to come out the other way."""
+    base, _ = app
+    status, headers, _ = _http_once(base + "/?ui=phone",
+                               headers=_nav(MAC))
+    assert status == 302
+    assert headers.get("Location") == "/", "should land without the ?ui"
+    cookie = (headers.get("Set-Cookie") or "")
+    assert cookie.startswith("mplabel_ui=phone")
+    assert "HttpOnly" not in cookie, "a display preference is not a secret"
+
+    pinned = cookie.split(";")[0]
+    status, _h, body = _http_once(base + "/", cookie=pinned,
+                             headers=_nav(MAC))
+    assert status == 200, "the laptop bounced back to the desk"
+    assert b"<title>mplabel</title>" in body
+
+    # And back again, from the phone app's own Settings link.
+    status, headers, _ = _http_once(base + "/desk?ui=desk", cookie=pinned,
+                               headers=_nav(IPHONE))
+    assert status == 302 and headers.get("Location") == "/desk"
+    assert (headers.get("Set-Cookie") or "").startswith("mplabel_ui=desk")
+
+
+def test_auto_routing_leaves_everything_that_is_not_an_entry_point_alone(app):
+    """Assets, the API and deep links must fall straight through. A
+    redirect on `/app.js` would be a phone app that cannot load itself."""
+    base, _ = app
+    for path in ("/app.js", "/desk.js", "/manifest.json", "/healthz"):
+        status, _h, _b = _http(base + path, headers=_nav(MAC))
+        assert status == 200, path
+
+
+def test_only_a_navigation_is_routed(app):
+    """A 302 at `/` is for a browser following a link. Anything scripted
+    - curl, a health check, the deploy check in CLAUDE.md - asks for `/`
+    without saying it wants HTML, and has to keep getting what it always
+    got rather than a redirect it was never taught to follow."""
+    base, _ = app
+    status, _h, body = _http(base + "/", headers={"User-Agent": MAC})
+    assert status == 200
+    assert b"<title>mplabel</title>" in body
+
+
+def test_auto_routing_can_be_turned_off(app_no_routing):
+    """Off, `/` is the phone app for everybody, exactly as it was."""
+    base = app_no_routing
+    status, _h, body = _http(base + "/", headers=_nav(MAC))
+    assert status == 200
+    assert b"<title>mplabel</title>" in body
+
+
+def test_the_installed_app_pins_itself_to_the_phone():
+    """An installed PWA must never be redirected to the desk. On an iPad
+    it would be: from iPadOS 13 Safari reports itself as a Mac and
+    nothing in the request says otherwise. `start_url` carries the
+    override so the first launch settles it."""
+    manifest = json.loads(
+        (Path(__file__).parent.parent / "src" / "mplabel" / "static"
+         / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["start_url"] == "/?ui=phone"
+    assert manifest["scope"] == "/", "start_url must stay inside scope"
+
+
+def test_each_shell_links_to_the_other_with_the_override(app):
+    """A bare link between them is a button that bounces you back."""
+    static = Path(__file__).parent.parent / "src" / "mplabel" / "static"
+    assert '"/?ui=phone"' in (static / "desk.js").read_text(encoding="utf-8")
+    assert '"/desk?ui=desk"' in (static / "app.js").read_text(encoding="utf-8")
+
+
 def test_the_desk_and_the_phone_share_one_palette():
     """Both clients read the same tokens, so a colour changed for one
     cannot leave the other behind. Nobody has the two open side by side,
@@ -7289,6 +7491,84 @@ def test_the_desk_and_the_phone_share_one_palette():
         assert "--mv-font-sans:" not in text, f"{sheet} redefines the fonts"
     for shell in ("index.html", "desk.html"):
         assert "/tokens.css" in (static / shell).read_text(encoding="utf-8")
+
+
+def test_the_preview_outlines_the_crop_that_will_actually_print(tmp_path):
+    """Read off the picture, not off the arithmetic that made it.
+
+    The whole value of this preview is that the green box is where the
+    4x6 comes from. A box computed twice - once to crop, once to draw -
+    is a picture that agrees with nothing, which is the mistake
+    `_marker_band`/`marker_box` are paired to avoid. So this renders the
+    PNG, finds the green, and checks it lands on `crop_bbox`."""
+    from PIL import Image
+
+    from mplabel import label
+
+    src = FIXTURES / "label_sample.pdf"
+    png, _info = label.preview_png(src, width=800)
+    info = label.to_4x6(src, tmp_path / "out.pdf")
+
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    want = label.PREVIEW_TAKEN
+    xs, ys = [], []
+    for x in range(img.width):
+        for y in range(img.height):
+            r, g, b = img.getpixel((x, y))
+            if (abs(r - want[0]) < 40 and abs(g - want[1]) < 40
+                    and abs(b - want[2]) < 40):
+                xs.append(x)
+                ys.append(y)
+    assert xs, "no outline was drawn at all"
+
+    pw, ph = info["page_size"]
+    sx, sy = img.width / pw, img.height / ph
+    x0, y0, x1, y1 = info["crop_bbox"]
+    # PDF space is bottom-up; the image is top-down.
+    for got, expected in ((min(xs), x0 * sx), (max(xs), x1 * sx),
+                          (min(ys), (ph - y1) * sy),
+                          (max(ys), (ph - y0) * sy)):
+        assert abs(got - expected) <= 6, (got, expected)
+
+
+def test_the_preview_dims_what_is_not_going_to_print(tmp_path):
+    """An outline alone leaves "which side of this line survives" to be
+    worked out. On a letter sheet that is mostly not the label, that is
+    the question."""
+    from PIL import Image
+
+    from mplabel import label
+
+    png, _info = label.preview_png(FIXTURES / "label_sample.pdf", width=600)
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    info = label.to_4x6(FIXTURES / "label_sample.pdf", tmp_path / "o.pdf")
+    pw, ph = info["page_size"]
+    x0, y0, x1, y1 = info["crop_bbox"]
+    sx, sy = img.width / pw, img.height / ph
+
+    inside = img.getpixel((int((x0 + x1) / 2 * sx),
+                           int((ph - (y0 + y1) / 2) * sy)))
+    # A corner of the page, well outside any candidate block.
+    outside = img.getpixel((4, 4))
+    assert sum(inside) > sum(outside), \
+        "the part that prints is not brighter than the part that does not"
+
+
+def test_the_preview_route_is_a_png_and_needs_a_session(app):
+    base, _ = app
+    pdf = (FIXTURES / "label_sample.pdf").read_bytes()
+    head = {"Content-Type": "application/pdf", "X-Mplabel": "1"}
+
+    status, _h, _b = _http(base + "/api/label/preview", "POST",
+                           headers=head, raw=pdf)
+    assert status == 401, "anyone could render a label they uploaded"
+
+    _s, cookie = _login(base)
+    status, headers, body = _http(base + "/api/label/preview", "POST",
+                                  cookie=cookie, headers=head, raw=pdf)
+    assert status == 200
+    assert headers.get("Content-Type") == "image/png"
+    assert body.startswith(b"\x89PNG")
 
 
 def test_the_desk_checks_a_stray_label_before_it_spends_one():
