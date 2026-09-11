@@ -7291,6 +7291,28 @@ def test_the_desk_and_the_phone_share_one_palette():
         assert "/tokens.css" in (static / shell).read_text(encoding="utf-8")
 
 
+def test_the_desk_checks_a_stray_label_before_it_spends_one():
+    """This printer cannot report a failure, so a wrong crop costs a
+    label and says nothing - and a PDF from a seller nobody has printed
+    before is exactly where a wrong crop comes from.
+
+    Two things hold that up, and both are one character from being
+    wrong. Check-only starts **on**, so the first press of a new file
+    measures rather than prints. And the real print asks first, where
+    the dry run does not: the phone holds a button for 800ms and a mouse
+    makes that awkward, so the desk uses the confirm dialog instead."""
+    js = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
+          / "desk.js").read_text(encoding="utf-8")
+
+    take = js[js.index("function takeSendFile("):js.index("function clearSend(")]
+    assert "dry: true" in take, "a newly chosen PDF would print unchecked"
+
+    send = js[js.index("function doSendLabel("):js.index("function runSendLabel(")]
+    assert "if (pick.dry) return runSendLabel()" in send, \
+        "a dry run should not ask - it spends nothing"
+    assert "ask(" in send, "printing a stray label does not confirm"
+
+
 def test_the_desk_queue_shows_no_full_buyer_name():
     """`_order_row` sends a first name and `_order_detail` sends the whole
     one, deliberately - a list is what gets left open on a kitchen table
