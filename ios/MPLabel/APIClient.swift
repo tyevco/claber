@@ -166,14 +166,22 @@ actor APIClient {
 
     // MARK: - the shelf
 
-    func inventory(query: String = "") async throws -> [InventoryItem] {
-        var path = "/inventory"
+    /// The shelf. Returns the whole response rather than just the rows,
+    /// because the caller needs `states` too and a second request to
+    /// count one integer is a worse trade on house Wi-Fi.
+    func inventory(query: String = "",
+                   state: String = "") async throws -> InventoryResponse {
+        var parts: [String] = []
         if !query.isEmpty {
-            let q = query.addingPercentEncoding(
-                withAllowedCharacters: .urlQueryAllowed) ?? ""
-            path += "?q=" + q
+            parts.append("q=" + (query.addingPercentEncoding(
+                withAllowedCharacters: .urlQueryAllowed) ?? ""))
         }
-        return try await send(request(path), as: InventoryResponse.self).items
+        if !state.isEmpty {
+            parts.append("state=" + state)
+        }
+        let path = "/inventory"
+            + (parts.isEmpty ? "" : "?" + parts.joined(separator: "&"))
+        return try await send(request(path), as: InventoryResponse.self)
     }
 
     func item(_ id: Int) async throws -> InventoryItem {

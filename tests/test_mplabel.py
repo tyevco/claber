@@ -10752,3 +10752,98 @@ def test_ebay_order_refusal_names_the_field(ebay_cfg, monkeypatch):
     with pytest.raises(ebay.EbayError) as caught:
         ebay.get_orders(ebay_cfg)
     assert "filter=creationdate" in str(caught.value)
+
+
+# --------------------------------------------------------------------------
+# Bought and not yet listed, where she can see it.
+#
+# The auction importer put a kind of row in the database that nothing
+# before it could produce - a thing she owns that was never for sale -
+# and then no screen said so. They sort by title amongst everything
+# else, because they have neither a listed date nor a sold one, which
+# makes them present on the shelf and invisible as a group.
+
+def test_the_shelf_says_how_many_have_arrived_unlisted(app):
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (listing_id, title, state) "
+                 "VALUES ('goodwill:1', 'Teapot', 'acquired')")
+    conn.execute("INSERT INTO listings (listing_id, title, state) "
+                 "VALUES ('goodwill:2', 'Dove figurines', 'acquired')")
+    conn.execute("INSERT INTO listings (listing_id, title, state) "
+                 "VALUES ('L1', 'Brass lamp', 'active')")
+    conn.commit()
+
+    status, _h, body = _http(f"{base}/api/inventory", cookie=cookie)
+    assert status == 200
+    states = json.loads(body)["states"]
+    assert states["acquired"] == 2
+    assert states["active"] == 1
+
+
+def test_the_unlisted_count_does_not_move_while_she_searches(app):
+    """It rides on the search response, so the temptation is to scope it
+    to the search. The number exists to answer "what has arrived that I
+    have not listed", which is a fact about the shelf and not about what
+    is in the box - and a queue count that falls to nothing the moment
+    she types is one she cannot believe at any other moment either."""
+    base, conn = app
+    _status, cookie = _login(base)
+    for n in range(3):
+        conn.execute("INSERT INTO listings (listing_id, title, state) "
+                     "VALUES (?, ?, 'acquired')",
+                     (f"goodwill:{n}", f"Thing {n}"))
+    conn.commit()
+
+    for query in ("", "?q=nothingmatchesthis", "?state=active", "?limit=1"):
+        status, _h, body = _http(f"{base}/api/inventory{query}", cookie=cookie)
+        assert status == 200, body
+        assert json.loads(body)["states"]["acquired"] == 3, \
+            f"the queue count moved under {query!r}"
+
+
+def test_the_shelf_can_show_only_what_is_not_listed(app):
+    """The count is no use without a way to see what it counts."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (listing_id, title, state) "
+                 "VALUES ('goodwill:1', 'Teapot', 'acquired')")
+    conn.execute("INSERT INTO listings (listing_id, title, state) "
+                 "VALUES ('L1', 'Brass lamp', 'active')")
+    conn.commit()
+
+    status, _h, body = _http(f"{base}/api/inventory?state=acquired",
+                             cookie=cookie)
+    assert status == 200
+    items = json.loads(body)["items"]
+    assert [i["title"] for i in items] == ["Teapot"]
+
+
+def test_the_desk_counts_what_is_listed_rather_than_what_is_unsold():
+    """"Still listed" used to mean "not sold", which was the same thing
+    while `active` and `sold` were the only states anything could be in.
+    `draft` and `acquired` are both things she owns that nobody can buy,
+    so counting them reported stock as shopfront - and the number is on
+    the desk's header where it reads as the size of the shop."""
+    desk = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
+            / "desk.js").read_text(encoding="utf-8")
+    # The *last* one. There are two figures reading "still listed" and
+    # only this one counts rows by hand - the other is `listed - sold`
+    # off `v_price_band`, which excludes both non-listed states already
+    # because the view does. Anchoring on the first occurrence tests the
+    # one that was never wrong.
+    summary = desk[desk.rindex("still listed") - 600:
+                   desk.rindex("still listed")]
+    assert "t.state === 'active'" in summary
+    assert "t.state !== 'sold'" not in summary
+
+
+def test_the_phone_and_the_desk_agree_on_the_word_for_acquired():
+    """`acquired` names a thing that happened; what she needs to know is
+    that it is not listed, which is a thing to do. Both front ends say
+    the second, and a test says so because the database word is right
+    there and easy to echo."""
+    static = Path(__file__).parent.parent / "src" / "mplabel" / "static"
+    for name in ("app.js", "desk.js"):
+        js = (static / name).read_text(encoding="utf-8")
+        assert "not listed" in js.lower(), f"{name} has no word for acquired"

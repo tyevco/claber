@@ -27,6 +27,11 @@ var S = {
      rerender into innerHTML, which drops focus and the caret with it,
      and a search box that loses focus every keystroke is unusable. */
   inv: [], invQ: '', bins: [], item: null, bin: null, focusId: null,
+  /* `invState` filters the shelf to one state and is only ever
+     'acquired' today - the not-listed queue. `invStates` is the count
+     per state over the whole table, which is what decides whether that
+     banner is worth showing. */
+  invState: '', invStates: {},
   /* The chosen PDF and what the server said about it, while the
      Print-a-label screen is up. Never persisted: the file is the
      one thing here that cannot be re-fetched, and a half-remembered
@@ -535,11 +540,33 @@ function onSearch(value) {
 
 async function loadInventory() {
   try {
-    var q = S.invQ ? '?q=' + encodeURIComponent(S.invQ) : '';
-    var d = await api('/api/inventory' + q);
+    // Not `p`: the XSS guard in the suite watches a short list of
+    // single-letter names for `+ x.field` interpolation, and `p` is one
+    // of them. A URL built here is not the bug it is looking for, but a
+    // guard loosened to fit a variable name stops being a guard.
+    var query = [];
+    if (S.invQ) query.push('q=' + encodeURIComponent(S.invQ));
+    if (S.invState) query.push('state=' + encodeURIComponent(S.invState));
+    var d = await api('/api/inventory'
+                      + (query.length ? '?' + query.join('&') : ''));
     S.inv = d.items || [];
+    /* Counted server-side over the whole table, so it does not fall to
+       nothing the moment she types in the search box. */
+    S.invStates = d.states || {};
     render();
   } catch (e) { toast(e.message, { bad: true }); }
+}
+
+/* Things that have arrived and are not for sale yet.
+ *
+ * Before the auction importer nothing could be in this state: a row was
+ * born when Facebook first mentioned it, by which time it was already
+ * listed. Now a ShopGoodwill win puts a thing on the shelf weeks before
+ * she photographs it, and those rows sort by title amongst everything
+ * else - present, and invisible as a group. */
+function toggleNotListed() {
+  S.invState = S.invState === 'acquired' ? '' : 'acquired';
+  loadInventory();
 }
 
 async function loadBins() {
@@ -565,6 +592,8 @@ function shelfView() {
           (it.inventory_code
             ? ' <span class="mono">' + esc(it.inventory_code) + '</span>' : '') +
           (it.state === 'sold' ? ' <span class="tag">sold</span>' : '') +
+          (it.state === 'acquired'
+            ? ' <span class="tag tag--none">not listed</span>' : '') +
         '</div>' +
       '</div></button>';
   }).join('');
@@ -589,11 +618,30 @@ function shelfView() {
         'value="' + esc(S.invQ || '') + '" ' +
         'oninput="onSearch(this.value)" ' +
         'onfocus="S.focusId=\'inv-q\'" onblur="S.focusId=null">' +
+      notListedBanner() +
       (binStrip ? '<div class="chips">' + binStrip + '</div>' : '') +
       (rows || '<div class="empty"><h2>Nothing here</h2>' +
         '<p>' + (S.invQ ? 'No item matches that.'
                         : 'No listings imported yet.') + '</p></div>') +
     '</div>' + tabs('shelf') + '</div>';
+}
+
+/* Shown only when there is something in it. A banner that permanently
+ * reads "0 waiting" is furniture, and the whole point of this one is
+ * that it is a queue - the same reason `pending` moved to a chip rather
+ * than keeping a tab it could not fill. */
+function notListedBanner() {
+  var n = (S.invStates || {}).acquired || 0;
+  var on = S.invState === 'acquired';
+  if (!n && !on) return '';
+  return '<button class="card" onclick="toggleNotListed()">' +
+    '<div class="meta"><div class="distinct">' +
+      (on ? 'Showing what is not listed'
+          : n + ' arrived, not listed yet') +
+    '</div><div class="lead">' +
+      (on ? 'Tap to show the whole shelf again'
+          : 'Bought and on a shelf, but not for sale') +
+    '</div></div></button>';
 }
 
 async function openItem(id) {
