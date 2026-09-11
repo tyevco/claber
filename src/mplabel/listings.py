@@ -93,8 +93,14 @@ CREATE TABLE IF NOT EXISTS listings (
     removed_at    TEXT,
     renewed_count INTEGER DEFAULT 0,
     inquiries     INTEGER DEFAULT 0,
-    state         TEXT DEFAULT 'active',   -- active | sold | expired | removed
-    source        TEXT,                    -- email | dyi | csv | manual
+    -- acquired | active | sold | expired | removed. 'acquired' is bought
+    -- and not yet listed, which nothing could say before the ShopGoodwill
+    -- importer: a row used to be born when Facebook first mentioned it,
+    -- by which time it was already for sale. It is kept out of the
+    -- sell-through denominator in `v_price_band` - a box of things she
+    -- has won and not yet photographed has not failed to sell.
+    state         TEXT DEFAULT 'active',
+    source        TEXT,          -- email | dyi | csv | manual | goodwill
     first_seen    TEXT,
     last_seen     TEXT,
     inventory_code TEXT,
@@ -209,7 +215,12 @@ EVENT_PATTERNS = [
 # table. A purchase email carries the *seller's* listing id, so treating
 # one as a listing would invent a row for an item that was never for sale,
 # inflating the listing count and dragging sell-through down with it.
-BUYER_KINDS = {"purchase"}
+# ShopGoodwill's two kinds are here for the same reason and a stronger
+# one: they are not Facebook mail at all, so they carry no Facebook
+# listing id and `apply_events` has nothing to reconcile them against.
+# `goodwill.import_order` writes the listing row itself, with a cost -
+# replaying the event on top could only undo that.
+BUYER_KINDS = {"purchase", "goodwill_won", "goodwill_paid"}
 
 
 # The sale subjects carry the item name, and for a local-pickup sale that
@@ -275,7 +286,11 @@ def upsert_listing(conn, listing_id, source, **fields):
     updates, vals = {"last_seen": now}, []
     existing = dict(row)
     # 'sold' is terminal and beats anything else we might later infer.
-    rank = {"active": 0, "expired": 1, "removed": 2, "sold": 3}
+    # 'acquired' sits below 'active' rather than beside it: a thing she
+    # has bought and not yet listed is earlier in its life than a live
+    # listing, so a late auction mail must not drag a listed item back.
+    rank = {"acquired": -1, "active": 0, "expired": 1, "removed": 2,
+            "sold": 3}
     for k, v in fields.items():
         if v is None:
             continue
@@ -738,6 +753,10 @@ SELECT price_band,
        ROUND(AVG(CASE WHEN state='sold' THEN days_to_sell END), 1) AS avg_days_to_sell,
        ROUND(AVG(price), 2)                            AS avg_price
 FROM v_listing_perf
+-- Bought and not yet listed is not a listing that failed to sell. Left
+-- in, every auction win would push sell-through down on the day it
+-- arrived, which is the opposite of what winning one means.
+WHERE state <> 'acquired'
 GROUP BY price_band;
 
 DROP VIEW IF EXISTS v_monthly;
