@@ -1,13 +1,13 @@
 {
   "bin": {
-    "code": "Z5N",
-    "created_at": "2026-09-10T20:01:59",
+    "code": "HW5",
+    "created_at": "2026-09-11T11:28:16",
     "name": "ATTIC",
     "notes": null
   },
   "items": [
     {
-      "bin_code": "Z5N",
+      "bin_code": "HW5",
       "id": 1,
       "inventory_code": "7K2M",
       "listing_id": null,

@@ -547,6 +547,7 @@ hardware or a real Facebook account.
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | **No email carries the postage charge** | **Verified from the real label email.** It is a *prepaid* label - Facebook pays the carrier and takes it out of the payout - so the one document this system reliably receives says what the parcel weighs and what service it went by, and not what it cost. A test pins that the fixture has no charge in it, because the temptation is to write a parser for a number that is not there. The payout email is the only plausible carrier and **none has ever been seen**, so whether one exists is still open: `mplabel scan` against the real mailbox is what settles it. Until then every figure is typed by a person, and `listings.estimate_postage` derives one only from parcels whose charge she actually confirmed - returning nothing at all when there is no basis, rather than a number that would be indistinguishable from a measured one a week later. |
 | Printing a label that is not a Marketplace one | **Verified on the hardware, on four real labels, over the tunnel.** Three FedEx Ground return labels and one eBay FedEx/USPS e-VS label went from a Windows workstation through `mplabel send` to the G4 and came out correctly. So the whole chain is real: login, the cached token, the upload, the crop, the orientation, and the print. Two things that had been reasoned about are now measured. **Three of the four carry no extractable text at all** - they are flattened images, exactly the case `rotation_source: aspect` exists for - and the shape-based orientation was **right on all three**. And the crop was right first time on both carriers' layouts, with every barcode complete. What is still **ASSUMED** is any *other* seller's layout, and in particular a page where the label shares the sheet with a packing slip: that path is unit-tested against a synthetic page and has never met a real one. `--dry-run` costs nothing and is still the thing to run first on a PDF from a new source. |
+| The desk portal, on her real data | **Verified: it is running against the real database.** Which immediately found what seeded data could not - the queue titles overlapped their prices, because her titles run past a hundred characters where the design was drawn against forty, and because a `<span>` ignores `text-overflow` however carefully it is set. The seed carries titles that long now. Still not checked on real data: the CSV import wizard, and Month-end against a full year. |
 | The desk portal | **Runs, and every screen has been looked at against seeded data in both themes.** Six screens at `/desk`, driven in headless Edge over CDP: the queue's confirm-and-print dialog, a bulk edit of three rows through `POST /api/inventory/bulk`, the search box keeping its caret, the CSV wizard through mapping and preview. That walk found five things the assertions did not - a figure that was really a `LIMIT`, a focus restore undone by a later render, a theme button that never changed its own label, an `era` column the endpoint had never sent, and a photo placeholder that lied about drafts with photographs. **Not** run against real data, and not on a real laptop over the tunnel - `tools/desk-preview.py` seeds a throwaway database and nothing here has met a real order. |
 | ShopGoodwill mail shapes | **Reconstructed from real mail, parser never run against a live mailbox.** Two real threads were read and the fixtures rebuilt by hand from them with invented names, so the field labels, the `<strong>Label:</strong> value` shape, the two sender hosts (`shopgoodwill.com` for a win, `txemail.shopgoodwill.com` for a payment) and every figure in the payment receipt are **verified against real mail**. What is **ASSUMED**: that a multi-item order lays its items out the way a single-item one does - every real order seen so far holds exactly one. `mplabel goodwill <eml> --write`-less is how to settle that against a real message before it writes anything. |
 | No auction mail carries a shipped/delivered notice | **ASSUMED.** Only the win and the payment receipt have been seen. If a dispatch mail exists it would give a real arrival date, which is the one thing the current pair cannot say - `scan` against the real mailbox is what settles it. |
@@ -904,6 +905,52 @@ anything new on the wire. `inventory.normalise_location_code` refuses a
 scan as an item and bin itself. `cli.CODE_LENGTH` is 3 as well, but a
 parcel code is stamped as plain text on a 4x6 shipping label and never
 goes into a marker, so the two never meet a scanner together.
+
+**"Request Desktop Site" is not a thing to respect separately.** That
+button works by rewriting the User-Agent - iOS Safari starts sending a
+macOS one, Android Chrome drops its `Mobi` token - so a sniff that reads
+those tokens honours it for free, and a sniff that reads anything else
+fights it. `MOBILE_TOKENS` is short for exactly that reason: it is the
+set of tokens the button manipulates and nothing else.
+`Sec-CH-UA-Mobile` is preferred where it exists, because it is the
+designed replacement and it flips the same way.
+
+Three traps came with it:
+
+- **The link between the two shells has to carry `?ui=`.** A bare link
+  to `/` from the desk is a button that redirects you straight back to
+  the desk, forever. The parameter is a person overruling the sniff, and
+  it is remembered in a cookie for a year.
+- **Only a navigation gets routed.** Every browser asks for `text/html`
+  and nothing scripted does, so `curl /`, a health check and the deploy
+  check in this file keep getting what they always got instead of a 302
+  nobody taught them to follow.
+- **An iPad reports itself as a Mac** and has since iPadOS 13; nothing
+  in the request says otherwise, so it gets the desk. That is why
+  `manifest.json`'s `start_url` is `/?ui=phone` - an installed copy pins
+  itself on first launch and can never be redirected away from the app
+  she added to her home screen.
+
+**A crop and the drawing that made it must come from one function.**
+`label.crop_box` exists because the desk's preview draws the rectangle
+the printer is about to use, and a box computed twice - once to crop,
+once to draw - is a picture that agrees with nothing. The preview
+renders server-side and hands back a PNG rather than coordinates for a
+browser to plot, for the same reason: numbers invite a second
+implementation of where the crop is, and the wrong one would be the one
+she is looking at. `test_the_preview_outlines_the_crop_that_will_
+actually_print` reads the green off the rendered image and compares it
+with `crop_bbox`, rather than trusting either calculation.
+
+**A `<span>` is inline, so `overflow` and `text-overflow` do nothing to
+it.** The desk's queue title had `white-space: nowrap; overflow: hidden;
+text-overflow: ellipsis` and painted straight over the price anyway,
+because none of those apply to an inline box. It showed up the first
+time the screen met her real titles - which run past a hundred
+characters where the design was drawn against forty - and not once
+against the seeded data. Flex items are blockified and so were fine;
+that one span was not a flex item. The title is a two-line clamp now and
+the price moved to the second row.
 
 **A crop and the drawing that made it must come from one function.** The
 decoder is handed a box; a box computed from different arithmetic than

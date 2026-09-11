@@ -201,6 +201,11 @@ web_session_days = 30
 # auto = Secure only when X-Forwarded-Proto says https, which is right
 # behind a Cloudflare tunnel and wrong on plain loopback.
 web_secure_cookie = auto
+# A phone asking for `/` gets the PWA and a laptop gets the desk portal.
+# "Request Desktop Site" is honoured for free: that button rewrites the
+# User-Agent, which is the thing being read. `?ui=phone` / `?ui=desk`
+# overrides it for a year, and is what the link between the two sets.
+web_auto_route  = yes
 # Where `mplabel send` posts a label from another machine - the same
 # address the phone app uses. This one belongs in the *workstation's*
 # config, not the Pi's: the Pi has no reason to send a label to itself.

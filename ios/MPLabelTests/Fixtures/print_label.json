@@ -16,6 +16,10 @@
     ],
     "job": "adhoc-4e8d7ac3fc1d4de8",
     "page": 1,
+    "page_size": [
+      612,
+      792
+    ],
     "printed": false,
     "recorded": "nowhere - this backend writes straight to the device and keeps no journal",
     "region": 1,
