@@ -358,7 +358,17 @@ struct BatchFailure: Codable, Identifiable {
 
 struct OrdersResponse: Codable { let orders: [Order] }
 struct PendingResponse: Codable { let pending: [Order] }
-struct InventoryResponse: Codable { let items: [InventoryItem]; let count: Int }
+/// `count` is the length of this page; `states` is how many rows are in
+/// each state across the whole table, which the server deliberately does
+/// not scope to the search - the not-listed queue is a fact about the
+/// shelf, not about what is currently typed in the box. Optional so a
+/// build of this app keeps working against a Pi that has not been
+/// updated yet.
+struct InventoryResponse: Codable {
+    let items: [InventoryItem]
+    let count: Int
+    let states: [String: Int]?
+}
 struct ItemResponse: Codable { let item: InventoryItem }
 struct BinsResponse: Codable { let bins: [Bin] }
 struct BinResponse: Codable { let bin: Bin }

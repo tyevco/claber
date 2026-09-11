@@ -791,7 +791,24 @@ class Handler(BaseHTTPRequestHandler):
         args.append(limit)
 
         rows = [dict(r) for r in self.db().execute(sql, args).fetchall()]
-        return self.json({"items": rows, "count": len(rows)})
+
+        # How many are in each state, over the whole table - deliberately
+        # ignoring `q`, `state` and `limit`.
+        #
+        # It rides on this response rather than being its own endpoint
+        # because the shelf is the screen that needs it and it already
+        # makes this request; a fourth call from a phone on house Wi-Fi
+        # to answer one integer is a worse trade.
+        #
+        # Unfiltered because the number it exists for is "what has
+        # arrived that I have not listed", which is a fact about the
+        # shelf and not about the search box. Scoped to the query it
+        # would fall to nothing the moment she typed, which is exactly
+        # when a queue count is least believable.
+        states = {r["state"] or "unknown": r["n"] for r in self.db().execute(
+            "SELECT state, COUNT(*) AS n FROM listings GROUP BY state")}
+        return self.json({"items": rows, "count": len(rows),
+                          "states": states})
 
     def h_item(self, lid):
         """One thing, plus what else is in its bin.

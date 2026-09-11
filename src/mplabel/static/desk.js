@@ -997,16 +997,26 @@ function invHead(shown) {
       ? shown + ' of ' + S.invTotal + ' matching'
       : plural(shown, 'match', 'matches');
   }
+  /* "Still listed" means listed. It used to mean "not sold", which was
+     the same thing while `active` and `sold` were the only states that
+     could hold anything - and stopped being when `draft` and `acquired`
+     arrived, both of which are things she owns that nobody can buy.
+     Counting them here reported stock as shopfront. */
   var live = (S.inv || []).filter(function (t) {
-    return t.state !== 'sold';
+    return t.state === 'active';
   }).length;
   return plural(all, 'item') + ' · ' + live + ' still listed';
 }
 
 function stateTag(state) {
   var cls = state === 'sold' ? 'tag--ok'
-          : state === 'draft' ? 'tag--warn' : '';
+          : (state === 'draft' || state === 'acquired') ? 'tag--warn' : '';
+  /* `acquired` is spelled out rather than title-cased, because the word
+     the database uses is not the one a person would reach for: what she
+     wants to know about one of these rows is that it is *not listed*,
+     which is a thing to do, and "Acquired" is a thing that happened. */
   var word = state === 'active' ? 'Listed'
+           : state === 'acquired' ? 'Not listed'
            : state ? state.charAt(0).toUpperCase() + state.slice(1) : '—';
   return '<span class="tag ' + cls + '">' + esc(word) + '</span>';
 }

@@ -1560,6 +1560,37 @@ all: every UI test passes with the session in any state. This came from
 the phone, twice - "the viewfinder is black" and then "the camera
 stopped responding".
 
+**A word computed from the states can stop meaning what it says.** The
+desk's header read `N still listed`, counted as everything not `sold` -
+which was exactly right while `active` and `sold` were the only states a
+row could be in. `draft` and `acquired` are both things she owns that
+nobody can buy, so the moment they existed that figure reported stock as
+shopfront, on the header where the number reads as the size of the shop.
+It counts `state === 'active'` now. Same family as the caveat that goes
+on being said: nothing broke, the sentence simply stopped being true, and
+no test saw it because a test would have asserted the same arithmetic.
+Note the *other* `still listed` on that screen - `listed - sold` off
+`v_price_band` - was always right, because the view excludes both
+non-listed states; a test anchored on the first match in the file tests
+the one that was never wrong.
+
+**The not-listed count is deliberately not scoped to the search.** It
+rides on `/api/inventory`, which is the request the shelf already makes -
+a fourth call from a phone on house Wi-Fi to answer one integer is a
+worse trade - but `states` is counted over the whole table and ignores
+`q`, `state` and `limit`. The number answers "what has arrived that I
+have not listed", which is a fact about the shelf and not about what is
+in the box; scoped to the query it would fall to nothing the moment she
+typed, which is exactly when a queue count is least believable.
+
+**Both front ends say "not listed", not "acquired".** The column names a
+thing that happened; what she needs off a row is that it is *not listed*,
+which is a thing to do. The database word is right there and easy to
+echo, so a test says both clients spell it out. The banner shows only
+when the queue has something in it - a card permanently reading "0
+waiting" is furniture, and this one exists to be a queue, the same reason
+`pending` moved to a chip rather than keeping a tab it could not fill.
+
 **A served asset missing from `STAMPED_ASSETS` never reaches the client.**
 It lists the files whose mtime busts the cache. It used to be written out
 **twice** - once in `asset_stamp` and again in `shell_html` - which was

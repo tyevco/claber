@@ -1,6 +1,6 @@
 {
   "label": {
-    "bytes": 2389,
+    "bytes": 2315,
     "crop_bbox": [
       90.0,
       450.0,
@@ -14,7 +14,7 @@
       522.0,
       738.0
     ],
-    "job": "adhoc-4e8d7ac3fc1d4de8",
+    "job": "adhoc-205f1857e7d9dcea",
     "page": 1,
     "page_size": [
       612,
@@ -26,7 +26,7 @@
     "regions_found": 1,
     "rotation": 90,
     "rotation_source": "text",
-    "sha256": "4e8d7ac3fc1d4de8302df85cedf533bf8b6c2f45ba000135003af2a9d3559766",
+    "sha256": "205f1857e7d9dceadb73126e3a418cbc4909e8ed30c229ff1e06c08d5a9facf2",
     "size_in": [
       4.0,
       6.0
