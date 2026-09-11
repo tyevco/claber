@@ -231,3 +231,54 @@ apns_topic      = com.marchvector.Sellomatic
 # BadDeviceToken, which reads like a malformed token rather than one
 # addressed to the wrong Apple.
 apns_environment = sandbox
+
+# ------------------------------------------------------------------ ebay
+# The other selling channel, and the first one with an API. Everything
+# here is empty by default and `mplabel ebay` exits 78 rather than
+# half-trying. See docs/ebay.md for the eBay-side setup, none of which
+# can be done from this repo.
+
+# sandbox or production. It picks the host AND which credentials are
+# meant: the two keysets are different strings that look alike, and a
+# sandbox key sent to production is a 401 that says nothing about
+# environments. Build against sandbox - but note its category and aspect
+# data is stale, so it proves the plumbing and not the listing.
+ebay_environment = sandbox
+
+# From the developer portal's Application Keys page, per environment.
+# eBay calls these "Client ID" and "Client Secret" on some pages and
+# App ID / Cert ID on others; they are the same two values. The cert id
+# is a secret - `mplabel config` redacts it - so it is the better one to
+# pass as MPLABEL_EBAY_CERT_ID rather than leave on disk.
+ebay_app_id     =
+ebay_cert_id    =
+
+# The RuName, not a URL, however much it looks like one should go here.
+# eBay resolves it to the redirect configured against the keyset, and
+# sending the URL itself is rejected as a mismatch - which reads as the
+# redirect being misconfigured rather than the wrong kind of value.
+ebay_ru_name    =
+
+ebay_marketplace = EBAY_US
+
+# Needed to PUBLISH an offer, not to draft one - but eBay validates them
+# when the offer is created, not when it goes live, so they have to exist
+# before the first push. The seller account must be opted in to Business
+# Policies first; all four are set up in My eBay and read back by
+# `mplabel ebay check`.
+ebay_merchant_location  =
+ebay_fulfillment_policy =
+ebay_payment_policy     =
+ebay_return_policy      =
+
+# Ours, not eBay's: 32-80 characters that we invent, tell eBay once, and
+# eBay hashes back to us in the account-deletion challenge.
+#   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# Redacted by `mplabel config` - it is the only thing proving a deletion
+# notice came from eBay rather than from anyone who found the URL.
+ebay_verification_token =
+
+# The public HTTPS URL eBay sends those notices to. It must be the exact
+# string eBay is configured with: the challenge hash covers it, so a
+# trailing slash difference fails the handshake with no explanation.
+ebay_notification_endpoint =

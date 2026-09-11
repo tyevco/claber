@@ -10,6 +10,13 @@ emails, records each sale in SQLite, converts the letter-size label PDF
 to exactly 4x6in, prints it on a USB thermal printer, and mirrors
 everything into a Google Sheet with sell-through analytics.
 
+The same mailbox is read for the other direction. ShopGoodwill auction
+mail - "You Were Awarded The Winning Bid", "Online Payment Received" -
+is where a lot of her stock comes from, and it is the only sourcing
+event that arrives as a document rather than as a receipt in a bag. It
+turns into inventory with a cost on it, which is the half `listings.paid`
+had a schema for and no automatic route into.
+
 The user is technically capable and running this on real orders. Broken
 output means a parcel does not ship on time, so correctness beats
 cleverness.
@@ -90,8 +97,9 @@ run against a real database.
 |---|---|
 | `check` | poll once, record, do **not** print |
 | `run [--loop]` | poll and print; `--loop` is what systemd runs |
-| `scan [--limit N]` | survey Facebook subjects, change nothing. Feeds open work #2 |
-| `backfill [--limit N] [--restart]` | classify old mail into `mail_events` |
+| `scan [--limit N]` | survey Facebook and ShopGoodwill subjects, change nothing. Feeds open work #2 |
+| `backfill [--limit N] [--restart]` | classify old mail into `mail_events`, and import old auction orders |
+| `goodwill <eml> [--write]` | read one saved ShopGoodwill email and say what it found. Reports by default; `--write` records it |
 
 | Prints | |
 |---|---|
@@ -104,6 +112,8 @@ run against a real database.
 | `supvan-test-print --style edges` | the edge test: eight bars per side, 8 dots apart, each a different length so it names itself without a number beside it. Reads where each edge starts printing and nothing else. Moves paper |
 | `shelf-tag --code XXX [--name N] [--marker\|--qr] [--size WxH[in]] [--preview PNG] [--print]` | a tag for a shelf, bin or area. Code big, name under it, marker beside it. **Three** characters, where an item code is four. No DB |
 | `config [--all]` | the resolved config, each key marked `default`/`file`/`env`, secrets redacted, and **which** file was read. No DB |
+| `ebay auth [--code C]` | consent for the eBay account. No `--code` prints the URL; the Pi is headless, so consent happens in a browser elsewhere and the code is pasted back. No DB |
+| `ebay check` | config, tokens, and how long the refresh token has left. Changes nothing, sends nothing, exits **78** if anything needs attention. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -128,8 +138,8 @@ run against a real database.
 | `reconcile [--since JOB] [--dry-run]` | reconcile the local DB against printd's journal. The recovery path for an ambiguous print |
 | `notify [--dry-run]` | say the three things that earn a notification. `--dry-run` prints the whole decision and records nothing, so it says the same thing twice. Exit **78** if push is not configured |
 
-`probe`, `selftest`, `supvan-probe` and `file` run above `connect_db` in
-`main()` - see the note below on why.
+`probe`, `selftest`, `supvan-probe`, `file` and `ebay auth|check` run
+above `connect_db` in `main()` - see the note below on why.
 
 ## Deploying to the Pi
 
@@ -218,6 +228,7 @@ src/mplabel/
   marker.py      the shelf marker: a 6x24 band for our own 3-4 char codes
   inventory.py   draws the 48mm inventory label; QR or shelf marker
   static/marker.js  the marker decoder in the browser, a port of marker.py
+  goodwill.py    ShopGoodwill auction mail -> inventory with a cost on it
   savedpage.py   parse a saved Marketplace selling page
   sheets.py      Google Sheets sync via service account
   supvan.py      T50M Pro label maker: HID transport, frames, status
@@ -238,7 +249,9 @@ src/mplabel/
                              a table dense enough to bulk-edit
 
 tests/test_mplabel.py     the whole Python suite, one file
-tests/fixtures/           synthetic stand-ins; make_label.py regenerates the PDF
+tests/fixtures/           synthetic stand-ins; make_label.py regenerates the PDF.
+                          goodwill_won.eml / goodwill_payment.eml are
+                          rebuilt by hand from real mail, invented names
 tests/make_ios_fixtures.py  captures real server payloads for the Swift tests
 tools/desk-preview.py     a seeded throwaway server, so the desk can be
                           looked at. Same argument as ios/screenshots.sh
@@ -249,6 +262,9 @@ ios/                      the native client; see ios/README.md and
                  and openssl rather than two large packages
   shopping.py    the aisle: candidates, the receipt read as lines, and a
                  proposal that never writes a cost by itself
+  ebay.py        the other selling channel: urllib client, OAuth and the
+                 token store. One seam out - `_transport` - and the
+                 tests replace it
 
 docs/                     ios-handoff, ios-release, notifications,
                           split-architecture, supvan-t50m-protocol,
@@ -362,12 +378,84 @@ not touch a database that already holds real sales, so `connect_db` carries
 a small `PRAGMA table_info` / `ALTER TABLE` loop. Add to that list, not
 just to `SCHEMA`, or the column exists only on fresh installs.
 
+**An auction cost is the landed cost, not the hammer price.** The
+ShopGoodwill payment receipt itemises four numbers - item subtotal, sales
+tax, shipping and handling, order total - and what left her account is
+the last one. On the $8.99 teapot the postage was $9.41, so recording
+the price the auction closed at would report less than half of what the
+object cost and every margin computed from it would be wrong by over
+100%. `goodwill.landed_cost` is that decision in one function.
+
+It only holds where there is nothing to divide. An order with three
+items has one shipping charge and one tax line covering all three, and
+splitting them - pro rata by price, by weight, evenly - is three
+different answers, none of them on the receipt. So a multi-item order
+gives each item its own price and the remainder stays as the trip's
+`unassigned`, which is already the number the triage screen exists to
+chase. Same rule as `estimate_postage`: a derived figure that gets
+written down is indistinguishable from a measured one a week later.
+
+The other half of that decision is why a single-item order takes the
+whole total: a trip whose unassigned can never reach zero is a
+notification she can never clear, and `notify.unattributed` would fire
+on every auction she ever wins.
+
+**A win is a debt; only the payment is a cost.** Payment is due within
+seven days and the win mail arrives before any money moves, so the win
+creates the thing on the shelf with `paid` null and the payment receipt
+is what fills it. Writing the hammer price on the win would report money
+that has not left the account *and* then block the better figure, because
+`upsert_listing` fills blanks rather than overwriting. The hammer price
+is kept on the `mail_events` row, where a debt belongs. Either mail can
+arrive first and either can be missing; both key on
+`goodwill:<item number>`, so they land on one row whichever way round
+they turn up.
+
+**A ShopGoodwill item number looks exactly like a Facebook listing id.**
+Both are nine-ish digit strings, so an unprefixed key would silently
+merge two different objects and hang a cost on the wrong one.
+`goodwill.KEY_PREFIX` namespaces them, the same way `title_key` uses
+`saved:` and `import_csv` uses `csv:`. A test inserts a Facebook listing
+whose id equals the item number and asserts they stay apart.
+
+**`acquired` is bought and not yet listed, and it is kept out of the
+sell-through denominator.** Nothing could say that before the auction
+importer: a row used to be born when Facebook first mentioned it, by
+which time it was already for sale. `v_price_band` measures sold over
+`COUNT(*)`, so a box of things she has won and not yet photographed would
+go straight into the denominator and make sell-through *fall* on the day
+it arrived - the opposite of what winning an auction means. The state
+ranks **below** `active` in `upsert_listing`, so a late auction mail
+cannot drag a live listing back onto the shelf.
+
+**Her purchases have their own classifier, deliberately.**
+`listings.classify` is asked about Facebook mail and `goodwill.classify`
+about auction mail, and they are not merged: one classifier answering
+"sold" to a ShopGoodwill subject would put one of her own purchases into
+the sell-through numerator. The auction kinds are in `BUYER_KINDS` for
+the same reason Facebook's `purchase` is - and a stronger one: a goodwill
+event carries no Facebook listing id at all, and its listing row is
+written with a cost by the importer, so replaying it in `apply_events`
+could only undo that.
+
+**IMAP's `OR` takes exactly two arguments.** Adding a third sender meant
+the plain-search fallback needed nesting - `OR (OR a b) c` - and getting
+that wrong is not a soft failure: the server rejects the whole SEARCH,
+`candidate_ids` falls through to its last query, and that one is
+`(UNSEEN FROM "facebook")`, which is the search that hid eight labels
+behind a Gmail thread. `cli.imap_or_from` builds it and a test pins the
+shape.
+
 **Cost basis enters through the sourcing half, and nowhere else.**
 `trips`, `photos` and `listings.paid` had a schema and no API for a
 while, which is why `v_listing_perf.margin` and `v_monthly.net` have
 always been null: the columns compute correctly and nothing could fill
 them. `/api/trips`, `/api/photos` and `POST /api/inventory` are that
-route now. Two things in it are load bearing. A hand-added item is keyed
+route now - and `goodwill.py` is the second one, the only route that
+needs no person at all, because an auction sends a receipt. Note it
+reuses `trips` rather than adding an orders table: an order is "a shop, a
+day, and what the receipt came to" with the shop online, and giving cost
+basis a second place to live is how the two disagree. Two things in it are load bearing. A hand-added item is keyed
 with `listings.title_key(title)`, the same derivation the saved-page
 import uses - a local pickup produces no label email, so the sale
 arrives later knowing only the title, and a manual item under any other
@@ -458,7 +546,13 @@ hardware or a real Facebook account.
 | **No email carries the postage charge** | **Verified from the real label email.** It is a *prepaid* label - Facebook pays the carrier and takes it out of the payout - so the one document this system reliably receives says what the parcel weighs and what service it went by, and not what it cost. A test pins that the fixture has no charge in it, because the temptation is to write a parser for a number that is not there. The payout email is the only plausible carrier and **none has ever been seen**, so whether one exists is still open: `mplabel scan` against the real mailbox is what settles it. Until then every figure is typed by a person, and `listings.estimate_postage` derives one only from parcels whose charge she actually confirmed - returning nothing at all when there is no basis, rather than a number that would be indistinguishable from a measured one a week later. |
 | Printing a label that is not a Marketplace one | **Verified on the hardware, on four real labels, over the tunnel.** Three FedEx Ground return labels and one eBay FedEx/USPS e-VS label went from a Windows workstation through `mplabel send` to the G4 and came out correctly. So the whole chain is real: login, the cached token, the upload, the crop, the orientation, and the print. Two things that had been reasoned about are now measured. **Three of the four carry no extractable text at all** - they are flattened images, exactly the case `rotation_source: aspect` exists for - and the shape-based orientation was **right on all three**. And the crop was right first time on both carriers' layouts, with every barcode complete. What is still **ASSUMED** is any *other* seller's layout, and in particular a page where the label shares the sheet with a packing slip: that path is unit-tested against a synthetic page and has never met a real one. `--dry-run` costs nothing and is still the thing to run first on a PDF from a new source. |
 | The desk portal | **Runs, and every screen has been looked at against seeded data in both themes.** Six screens at `/desk`, driven in headless Edge over CDP: the queue's confirm-and-print dialog, a bulk edit of three rows through `POST /api/inventory/bulk`, the search box keeping its caret, the CSV wizard through mapping and preview. That walk found five things the assertions did not - a figure that was really a `LIMIT`, a focus restore undone by a later render, a theme button that never changed its own label, an `era` column the endpoint had never sent, and a photo placeholder that lied about drafts with photographs. **Not** run against real data, and not on a real laptop over the tunnel - `tools/desk-preview.py` seeds a throwaway database and nothing here has met a real order. |
+| ShopGoodwill mail shapes | **Reconstructed from real mail, parser never run against a live mailbox.** Two real threads were read and the fixtures rebuilt by hand from them with invented names, so the field labels, the `<strong>Label:</strong> value` shape, the two sender hosts (`shopgoodwill.com` for a win, `txemail.shopgoodwill.com` for a payment) and every figure in the payment receipt are **verified against real mail**. What is **ASSUMED**: that a multi-item order lays its items out the way a single-item one does - every real order seen so far holds exactly one. `mplabel goodwill <eml> --write`-less is how to settle that against a real message before it writes anything. |
+| No auction mail carries a shipped/delivered notice | **ASSUMED.** Only the win and the payment receipt have been seen. If a dispatch mail exists it would give a real arrival date, which is the one thing the current pair cannot say - `scan` against the real mailbox is what settles it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
+| eBay OAuth on a headless Pi | **ASSUMED.** The consent URL, the code exchange and the refresh are written and unit-tested against a replaced `_transport`; none has been sent to eBay. The refresh token's ~18-month lifetime is reported *only* on the initial exchange, so `exchange_code` records the absolute expiry there or it cannot be recovered - `ebay check` counts it down. |
+| eBay business-policy prerequisites | **ASSUMED, and they bite earlier than they read.** Opt-in plus fulfillment/payment/return policies and an inventory location look like publish-time requirements; eBay validates them when the **offer is created**. So they gate the first push even though nothing here ever publishes. |
+| eBay account-deletion compliance | **ASSUMED and not built.** Subscribing or opting out is required before the first *production* call, and opting out needs storing no eBay data - which we will. Sandbox needs none of it, which is why sandbox is first. |
+| eBay order JSON, label geometry, SKU rules | **ASSUMED.** Nothing has been pulled, attached or pushed. In particular an eBay 4x6 is a different page from Facebook's and `extract_label_fields` is verified against exactly one real label. |
 | The release workflow | **UNRUN.** Every piece of it is a command that works on a Mac, and none of it has been executed once - not the runner label, not cloud signing, not the upload. The first tag is the experiment. What is checked in software: `version.sh` against good and bad tags, both workflows' shell blocks parse, and `check-archive.sh` refuses XcodeGen's placeholder version numbers. What cannot be: whether the API key's role is sufficient, whether `macos-26` has an iOS 26 SDK today, and whether App Store Connect accepts a three-part build number of this shape. |
 
 When the user reports real-world results, move rows up this table and
@@ -622,6 +716,26 @@ would rather queue behind the poller than be refused. And a *stale* lock
 is not a thing that can happen - flock is held by an open file
 description, so the kernel drops it when a killed process's descriptors
 close. What survives a kill is an empty file that locks nobody out.
+
+**An exit code nothing propagates is a contract with one end.**
+`cli.main` wrapped `_main()` and threw its return value away, and
+`__main__.py` called `main()` and threw that away too - so `notify`'s
+carefully documented **78** arrived at the shell as **0**, through the
+installed script and `python -m mplabel` alike. The unit's
+`RestartPreventExitStatus=78` had a test; the exit code it depends on
+had none, because every test called `cmd_notify` directly and got the
+right answer. Both halves are needed and only one was being checked -
+which is the same shape as the exit-78 note below, one layer further
+out. `test_the_module_entrypoint_passes_the_exit_code_on` is the guard.
+
+**An environment check on the refresh path is two hours late.**
+`ebay.access_token` returned a cached token without looking at which
+eBay it was minted for, and only `refresh_access` compared. An access
+token is good for 7200 seconds, so pointing a sandbox install at
+production sent sandbox credentials to the live account for up to two
+hours before anything noticed - and what it answers is a 401 that says
+nothing about environments. The check guards *use*, not just renewal.
+Caught by the test, not by reading it.
 
 **A configuration refusal must not be retried.** `printd` will not start
 without `printd_secret` - a print request is a physical action and it
@@ -1715,6 +1829,16 @@ poller cannot detect its own absence.
 
 ### The sourcing half
 
+**The auction route is built** - `goodwill.py`, wired into the poller and
+into `backfill`, so a ShopGoodwill win and its payment receipt become a
+thing on a shelf with an inventory code and a landed cost without anybody
+typing. `mplabel inventory --state acquired` is then a batch of labels
+for what has come home, and `mplabel stats` shows what is bought and not
+yet listed. What is **not** answered is whether the parser survives a
+real message: the fixtures are reconstructions of two real threads, every
+real order seen so far holds exactly one item, and `mplabel goodwill
+<eml>` without `--write` is how to check one before it writes anything.
+
 The API is done - trips, photos, attach, create-item and an allow-listed
 item `fields` that takes `paid` - and **Capture and Triage are built**
 against it in `ios/`. That is the flow the whole phase was for: she
@@ -1803,6 +1927,46 @@ Three things about it are worth keeping here rather than rediscovering:
 
 What is left is a laptop, a real database and the tunnel. Everything so
 far is a seeded server on the machine the code was written on.
+### The other selling channel
+
+eBay, and the reasoning that shaped it is in `docs/ebay.md`. **Phase 0 -
+the plumbing - is built**: `ebay.py` with a urllib client, the OAuth
+auth-code and refresh flows, a 0600 token store under `<data>/ebay/`,
+and `ebay auth` / `ebay check`. Nothing touches the database and nothing
+has reached eBay; sandbox is first precisely so a bug cannot list
+anything real.
+
+Four things settled the shape of the rest, and they are worth keeping
+here because each was expensive to find:
+
+- **Draft-only, and there is no `ebay publish` method.** Going live is a
+  decision made in eBay's own UI where the whole listing is visible. It
+  also happens to dodge the image problem: `imageUrls` must be public
+  HTTPS, her photos sit behind bearer auth, and the Sell REST APIs have
+  no upload at all - but images are required to *publish* an offer, not
+  to create an unpublished one. What draft-only does **not** dodge is
+  the business policies, which eBay validates at offer-creation time.
+- **`message_id` cannot be NULL for an eBay sale.** Six call sites on
+  the *print* path key on it - `ensure_code` returns early on a falsy
+  one and mints no parcel code, `mark_printed`'s `WHERE message_id=?`
+  matches nothing and leaves a printed parcel in Pending for ever, and
+  `notify.failed_prints` then cries wolf daily. A synthetic
+  `ebay:<orderId>` keeps all six working, and it is the scheme-prefixed
+  key `title_key`'s `saved:` and `import_dyi`'s `dyi:` already
+  established.
+- **The channel goes on `sales`, not `listings`.** All four analytics
+  views are `FROM listings`, so leaving that table alone keeps every
+  existing analytic working - and a row in `listings` is a thing on a
+  shelf, not a posting. Cross-posting one object to both channels is
+  the normal case.
+- **Pulling her eBay orders in *is* the sold-comps feature.** Those are
+  her own realised prices, and they reach `comparables()` through
+  `link_sales` for free. eBay's Marketplace Insights is partner-only,
+  and Browse returns *asking* prices, which this repo already refuses to
+  treat as evidence. So there is nothing to build and roughly twice the
+  evidence to gain - provided a pulled order resolves back through
+  `ebay_offers` to the listing it came from, or `link_sales` mints a
+  phantom beside it and sell-through moves **down** on a sale.
 
 ### Older, still true
 

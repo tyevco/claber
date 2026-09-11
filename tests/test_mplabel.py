@@ -9366,3 +9366,738 @@ def test_the_jwt_signature_verifies_end_to_end(tmp_path):
         capture_output=True)
     assert done.returncode == 0, done.stdout + done.stderr
     assert b"Verified OK" in done.stdout
+
+
+# ------------------------------------------------------------------ ebay
+#
+# Every test here replaces `ebay._transport`, which is the module's only
+# way out. Nothing in this file may touch the network: a suite that can
+# fail because eBay is having an afternoon is a suite nobody trusts.
+
+
+@pytest.fixture
+def ebay_cfg(tmp_path):
+    """A configured-enough sandbox install, with its own home."""
+    from mplabel import cli
+    cfg = dict(cli.DEFAULTS)
+    cfg.update(home=str(tmp_path),
+               ebay_app_id="app-id", ebay_cert_id="cert-id",
+               ebay_ru_name="Her-Name-abcde-xyz")
+    return cfg
+
+
+def _fake_transport(replies):
+    """Answer each call from `replies`, recording what was asked.
+
+    `replies` is a list of (status, payload); the recorded calls come
+    back on the function itself so a test can assert on the request as
+    well as on what was made of the answer.
+    """
+    calls = []
+
+    def transport(method, url, headers, body=None, timeout=None):
+        calls.append({"method": method, "url": url, "headers": headers,
+                      "body": body})
+        status, payload = replies[len(calls) - 1]
+        return status, {}, json.dumps(payload).encode()
+
+    transport.calls = calls
+    return transport
+
+
+def test_ebay_consent_url_sends_the_runame_not_a_url(ebay_cfg):
+    """redirect_uri is the RuName.
+
+    eBay resolves it to the redirect configured against the keyset. It
+    looks like it wants a URL and sending one is rejected as a mismatch,
+    which reads like the redirect is misconfigured rather than that the
+    wrong kind of value was sent.
+    """
+    from mplabel import ebay
+    from urllib.parse import parse_qs, urlparse
+
+    query = parse_qs(urlparse(ebay.consent_url(ebay_cfg)).query)
+    assert query["redirect_uri"] == ["Her-Name-abcde-xyz"]
+    assert query["client_id"] == ["app-id"]
+    assert query["response_type"] == ["code"]
+
+
+def test_ebay_consent_scopes_stay_on_the_production_host(ebay_cfg):
+    """The scope strings are identifiers, not endpoints.
+
+    They are always api.ebay.com even in sandbox. Rewriting them to the
+    sandbox host produces a rejection that reads as a permissions problem
+    with the account.
+    """
+    from mplabel import ebay
+
+    assert ebay.environment(ebay_cfg) == "sandbox"
+    assert "sandbox" in ebay.auth_host(ebay_cfg)
+    assert all(s.startswith("https://api.ebay.com/oauth/") for s in ebay.SCOPES)
+
+
+def test_ebay_auth_records_when_the_refresh_token_dies(ebay_cfg, monkeypatch):
+    """The eighteen-month fuse is only mentioned once.
+
+    `refresh_token_expires_in` comes back on the authorization-code
+    exchange and a refresh never repeats it, so if it is not written down
+    here the expiry cannot be recovered - and the failure eighteen months
+    from now is every call returning invalid_grant with no warning.
+    """
+    from mplabel import ebay
+
+    transport = _fake_transport([(200, {
+        "access_token": "access-1", "expires_in": 7200,
+        "refresh_token": "refresh-1",
+        "refresh_token_expires_in": 47304000,
+    })])
+    monkeypatch.setattr(ebay, "_transport", transport)
+
+    tokens = ebay.exchange_code(ebay_cfg, "code-from-the-redirect")
+    assert tokens["refresh_token"] == "refresh-1"
+    assert ebay.refresh_days_left(tokens) > 500
+
+    # And it survives the round trip to disk, which is the only place it
+    # will be read from eighteen months later.
+    assert ebay.refresh_days_left(ebay.load_tokens(ebay_cfg)) > 500
+
+
+def test_ebay_token_file_is_not_world_readable(ebay_cfg, monkeypatch):
+    """A refresh token is a credential and this Pi also serves a web app."""
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
+        "access_token": "a", "expires_in": 7200, "refresh_token": "r"})]))
+    ebay.exchange_code(ebay_cfg, "code")
+    mode = ebay.token_path(ebay_cfg).stat().st_mode & 0o777
+    assert mode == 0o600, oct(mode)
+
+
+def test_ebay_refresh_asks_for_the_scopes_again(ebay_cfg, monkeypatch):
+    """`scope` is required on a refresh and is easy to leave off.
+
+    Without it eBay mints a token carrying no scopes at all, and every
+    call then fails 403 - which reads as the seller account lacking a
+    permission rather than as this request lacking a parameter.
+    """
+    from mplabel import ebay
+    from urllib.parse import parse_qs
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1", "refresh_token_expires_in": 47304000}),
+        (200, {"access_token": "a2", "expires_in": 7200}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+
+    ebay.exchange_code(ebay_cfg, "code")
+    ebay.refresh_access(ebay_cfg)
+
+    form = parse_qs(transport.calls[1]["body"].decode())
+    assert form["grant_type"] == ["refresh_token"]
+    assert form["refresh_token"] == ["r1"]
+    assert set(form["scope"][0].split()) == set(ebay.SCOPES)
+
+
+def test_ebay_reuses_an_access_token_that_is_still_good(ebay_cfg, monkeypatch):
+    """Two hours is two hours; refreshing per call is a rate limit waiting."""
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1"}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    assert ebay.access_token(ebay_cfg) == "a1"
+    assert ebay.access_token(ebay_cfg) == "a1"
+    assert len(transport.calls) == 1
+
+
+def test_ebay_refreshes_an_access_token_about_to_expire(ebay_cfg, monkeypatch):
+    """A token that dies between the check and the call is a needless 401."""
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        # expires_in inside EXPIRY_SLACK, so it is already too old to use.
+        (200, {"access_token": "a1", "expires_in": 60,
+               "refresh_token": "r1"}),
+        (200, {"access_token": "a2", "expires_in": 7200}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    assert ebay.access_token(ebay_cfg) == "a2"
+    assert len(transport.calls) == 2
+
+
+def test_ebay_will_not_send_a_sandbox_token_to_production(ebay_cfg,
+                                                          monkeypatch):
+    """The 401 for this says nothing about environments.
+
+    The two keysets are different strings that look alike, so the
+    mistake is one edited config line - and the answer is a refusal that
+    reads as the credentials being wrong rather than as being pointed at
+    the wrong eBay.
+    """
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
+        "access_token": "a", "expires_in": 7200, "refresh_token": "r"})]))
+    ebay.exchange_code(ebay_cfg, "code")
+
+    ebay_cfg["ebay_environment"] = "production"
+    with pytest.raises(ebay.EbayConfigError) as caught:
+        ebay.access_token(ebay_cfg)
+    assert "sandbox" in str(caught.value)
+
+
+def test_ebay_keeps_the_body_of_a_refusal(ebay_cfg, monkeypatch):
+    """eBay puts the reason in the body, so a non-2xx must not raise away.
+
+    `urlopen` raises on a 400 and the handle closes with it; reading the
+    body first is the difference between "eBay said no" and knowing
+    which field it objected to.
+    """
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(400, {
+        "error": "invalid_grant",
+        "error_description": "the provided authorization code is expired"})]))
+    with pytest.raises(ebay.EbayError) as caught:
+        ebay.exchange_code(ebay_cfg, "stale-code")
+    assert "invalid_grant" in str(caught.value)
+    assert "expired" in str(caught.value)
+
+
+def test_ebay_names_the_field_a_refusal_objected_to():
+    """The useful half of an eBay error is two levels down in `parameters`."""
+    from mplabel import ebay
+
+    line = ebay.describe_errors({"errors": [{
+        "errorId": 25002, "message": "A user error has occurred.",
+        "parameters": [{"name": "sku", "value": "7QK9"}]}]})
+    assert "25002" in line and "sku=7QK9" in line
+
+
+def test_ebay_call_carries_the_marketplace_and_the_bearer(ebay_cfg,
+                                                           monkeypatch):
+    """Both headers are required and neither fails loudly when missing."""
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1"}),
+        (200, {"total": 0}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    status, _ = ebay.call(ebay_cfg, "GET", "/sell/inventory/v1/inventory_item")
+    assert status == 200
+    sent = transport.calls[1]
+    assert sent["headers"]["Authorization"] == "Bearer a1"
+    assert sent["headers"]["X-EBAY-C-MARKETPLACE-ID"] == "EBAY_US"
+    # And it went to the sandbox host, not the production one.
+    assert sent["url"].startswith("https://api.sandbox.ebay.com/")
+
+
+def test_ebay_check_says_what_is_missing_and_changes_nothing(ebay_cfg):
+    """`notify --check` exists because a refusal cannot say whose fault it
+    is. eBay is worse: an unscoped token, a sandbox token sent to
+    production and a genuinely unauthorised account are three variations
+    on the same 401."""
+    from mplabel import ebay
+
+    rows = ebay.check(ebay_cfg)
+    problems = [(label_, problem) for label_, _, problem in rows if problem]
+    # No tokens yet, so that is the thing to say - and it is the only
+    # blocking one, because the policies are needed to publish and this
+    # design deliberately never publishes.
+    assert any("auth" in problem for _, problem in problems)
+    assert not ebay.token_path(ebay_cfg).exists()
+
+
+def test_ebay_check_warns_before_the_refresh_token_dies(ebay_cfg,
+                                                         monkeypatch):
+    """Thirty days is enough notice to redo the consent calmly."""
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
+        "access_token": "a", "expires_in": 7200, "refresh_token": "r",
+        # Ten days. Nothing is broken yet, and that is the point.
+        "refresh_token_expires_in": 10 * 86400})]))
+    ebay.exchange_code(ebay_cfg, "code")
+
+    warnings = [problem for label_, _, problem in ebay.check(ebay_cfg)
+                if problem and "ebay auth" in problem]
+    assert warnings, "a token with ten days left should be warned about"
+
+
+def test_ebay_unconfigured_exits_78_rather_than_half_trying(tmp_path,
+                                                             capsys):
+    """78 is EX_CONFIG, the refusal printd and notify already make.
+
+    A permanent error retried by a timer for ever is a permanent error in
+    the journal for ever, with the one line that says what is wrong
+    buried under it.
+    """
+    from mplabel import cli
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path))
+    assert cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="check")) == 78
+
+
+def test_the_module_entrypoint_passes_the_exit_code_on():
+    """`python -m mplabel` discarded it, so every 78 read as success.
+
+    The exit code and the unit's RestartPreventExitStatus=78 are both
+    needed and only one of them had a test. This is the other half.
+    """
+    source = (Path(__file__).parent.parent / "src" / "mplabel"
+              / "__main__.py").read_text()
+    assert "sys.exit(main())" in source
+
+    from mplabel import cli
+    import inspect
+    # And the wrapper has to return what it wraps, or the entrypoint
+    # above faithfully exits on None.
+    assert "return _main()" in inspect.getsource(cli.main)
+
+
+def test_ebay_secrets_are_not_echoed_by_the_config_command():
+    """`mplabel config` is the command you run *and paste* when stuck.
+
+    `ebay_cert_id` is the OAuth client secret under the other of the two
+    names eBay gives it, and `ebay_verification_token` is the only thing
+    proving an account-deletion notice came from eBay rather than from
+    anyone who found the URL. The app id and the RuName are public
+    halves and stay visible - seeing them is how you check the right
+    keyset is loaded.
+    """
+    from mplabel import cli
+
+    assert "ebay_cert_id" in cli.SECRET_KEYS
+    assert "ebay_verification_token" in cli.SECRET_KEYS
+    assert "ebay_app_id" not in cli.SECRET_KEYS
+    assert "ebay_ru_name" not in cli.SECRET_KEYS
+
+
+def test_the_installer_makes_the_token_directory():
+    """A pull and a pip install do not run install_pi.sh.
+
+    `photos/` went wrong exactly this way: the route the docs give for
+    updating leaves the directory missing and the first write failing on
+    something it cannot create. Tokens are worse than photographs, so the
+    directory is 0700.
+    """
+    script = (Path(__file__).parent.parent / "install_pi.sh").read_text()
+    assert 'install -d -m 700' in script and '$DATA_DIR/ebay' in script
+# --------------------------------------------------------------------------
+# ShopGoodwill auction mail: what she bought, and what it really cost.
+#
+# The half of the mailbox nothing read until now. Every test here exists
+# because getting one of these wrong writes a wrong number into `paid`,
+# and a wrong cost basis is worse than none: a null margin reports itself
+# as unknown, a wrong one reports itself as profit.
+
+GOODWILL_WON = FIXTURES / "goodwill_won.eml"
+GOODWILL_PAID = FIXTURES / "goodwill_payment.eml"
+
+
+@pytest.fixture
+def won_mail():
+    return email.message_from_bytes(GOODWILL_WON.read_bytes())
+
+
+@pytest.fixture
+def paid_mail():
+    return email.message_from_bytes(GOODWILL_PAID.read_bytes())
+
+
+@pytest.mark.parametrize("from_header,ok", [
+    ("ShopGoodwill <no-reply@shopgoodwill.com>", True),
+    # The payment receipt comes from their transactional host, which is a
+    # different name entirely - matching only the bare domain would read
+    # every win and miss every payment, i.e. lose the money.
+    ("ShopGoodwill <no-reply@txemail.shopgoodwill.com>", True),
+    ("ShopGoodwill <No-Reply@ShopGoodwill.Com>", True),
+    ("ShopGoodwill <no-reply@shopgoodwill.com.example.net>", False),
+    ("\"ShopGoodwill.com\" <billing@notshopgoodwill.com>", False),
+    ("Facebook Marketplace <noreply@marketplace.facebook.com>", False),
+])
+def test_sender_domain_must_be_shopgoodwill(from_header, ok):
+    """What is downstream of this check is money against an object. An
+    IMAP FROM search matches the header as text, so a display name alone
+    gets a message fetched - the address domain is the real gate."""
+    from mplabel import goodwill
+
+    msg = email.message_from_string(
+        f"From: {from_header}\n"
+        "Subject: ShopGoodwill.com - Online Payment Received\n\n")
+    assert goodwill.is_from_goodwill(msg) is ok
+
+
+def test_a_goodwill_subject_is_never_classified_as_a_sale():
+    """Her purchases must not reach the seller-side classifier. A
+    ShopGoodwill subject answering 'sold' would put one of her own
+    purchases into the sell-through numerator - the same mistake
+    BUYER_KINDS exists to prevent for Facebook's buyer mail."""
+    from mplabel import goodwill
+
+    for subject in ("ShopGoodwill.com - You Were Awarded The Winning Bid!",
+                    "ShopGoodwill.com - Online Payment Received"):
+        assert listings.classify(subject) is None
+        assert goodwill.classify(subject) is not None
+
+
+def test_goodwill_kinds_are_buyer_side():
+    """`apply_events` replays mail_events into listings. A goodwill event
+    carries no Facebook listing id and its row is written with a cost by
+    the importer, so replaying it could only undo that."""
+    from mplabel import goodwill
+
+    for kind, _pattern in goodwill.SUBJECT_PATTERNS:
+        assert kind in listings.BUYER_KINDS
+
+
+def test_win_mail_gives_item_number_title_and_hammer_price(won_mail):
+    from mplabel import goodwill
+
+    order = goodwill.parse(won_mail)
+    assert order["kind"] == "goodwill_won"
+    item, = order["items"]
+    assert item["item_id"] == "911100022"
+    assert item["price"] == 24.50
+    assert order["seller"].startswith("Goodwill of the Example Valley")
+
+
+def test_win_title_stops_at_the_line_break(won_mail):
+    """The only thing marking the end of the title is the `<br>` after
+    it. Matched against the flattened body, `(.+)$` runs happily on
+    through the bidder agreement and the whole email becomes the title -
+    which is what shipped first and is invisible until you look at a
+    row."""
+    from mplabel import goodwill
+
+    item, = goodwill.parse(won_mail)["items"]
+    assert item["title"] == "Pair Of Painted Tin Toy Banks 1930s."
+    assert "PAYMENT MUST BE RECEIVED" not in item["title"]
+
+
+def test_win_title_keeps_its_own_full_stop(won_mail):
+    """Their template appends "!" to the title, so a title that ends in a
+    full stop arrives as "...Albums.!". Exactly one character is the
+    template's; stripping punctuation generally would eat the title's."""
+    from mplabel import goodwill
+
+    item, = goodwill.parse(won_mail)["items"]
+    assert item["title"].endswith("1930s.")
+
+
+def test_payment_mail_reads_every_figure(paid_mail):
+    from mplabel import goodwill
+
+    order = goodwill.parse(paid_mail)
+    assert order["kind"] == "goodwill_paid"
+    assert order["order_id"] == "65200001"
+    assert order["seller"] == "Goodwill Example County"
+    assert (order["subtotal"], order["tax"], order["shipping"],
+            order["total"]) == (8.99, 1.47, 9.41, 19.87)
+    assert order["paid_on"] == "2026-09-09"
+    item, = order["items"]
+    assert item["item_id"] == "911100037"
+    assert item["price"] == 8.99
+    assert item["quantity"] == 1
+
+
+def test_item_subtotal_is_not_read_as_an_item(paid_mail):
+    """`Item Subtotal: $8.99` sits four lines under `Item: 911100037`.
+    A loose `Item:` match makes the order total a second object on the
+    shelf, with a price and no title."""
+    from mplabel import goodwill
+
+    assert len(goodwill.parse(paid_mail)["items"]) == 1
+
+
+def test_paid_is_the_landed_cost_not_the_hammer_price(paid_mail):
+    """The teapot went for $8.99 and cost $19.87 to get here - $9.41 of
+    it postage. Recording the hammer price would report less than half of
+    what the object really cost, and every margin computed from it would
+    be wrong by more than 100%."""
+    from mplabel import goodwill
+
+    order = goodwill.parse(paid_mail)
+    assert goodwill.landed_cost(order) == {"911100037": 19.87}
+
+
+def _two_item_order(raw):
+    """The same payment mail with a second item in it."""
+    second = ('<td align="left"><font style="font-size:16px"><span>'
+              'BRASS CANDLESTICK PAIR<br><strong>Item:</strong> 911100099'
+              '<br><strong>Price:</strong> $21.00'
+              '<br><strong>Quantity:</strong> 1</span></font></td></tr><tr>')
+    anchor = '<tr><td align="left"><a href="https://click.shopgoodwill.com'
+    raw = raw.replace(anchor, second + anchor[4:], 1)
+    raw = raw.replace("<strong>Item Subtotal:</strong> $8.99",
+                      "<strong>Item Subtotal:</strong> $29.99")
+    return raw.replace("<strong>Order Total:</strong> $19.87",
+                       "<strong>Order Total:</strong> $45.00")
+
+
+def test_a_multi_item_order_is_never_apportioned():
+    """One shipping charge over three items cannot be split without
+    inventing the split - pro rata by price, by weight and evenly are
+    three different answers and none of them is on the receipt. Same rule
+    as `estimate_postage`: a derived figure that gets written down is
+    indistinguishable from a measured one a week later."""
+    from mplabel import goodwill
+
+    msg = email.message_from_string(
+        _two_item_order(GOODWILL_PAID.read_text(encoding="utf-8")))
+    order = goodwill.parse(msg)
+    assert order["total"] == 45.00
+    assert goodwill.landed_cost(order) == {"911100037": 8.99,
+                                           "911100099": 21.00}
+
+
+def test_the_unsplit_remainder_shows_up_as_unassigned(db):
+    """And it is not lost: tax and postage on a multi-item order become
+    the trip's unassigned money, which is the number the triage screen
+    exists to chase and the one question only she can answer."""
+    from mplabel import goodwill
+
+    msg = email.message_from_string(
+        _two_item_order(GOODWILL_PAID.read_text(encoding="utf-8")))
+    goodwill.import_mail(db, msg)
+    trip, = listings.trip_summary(db)
+    assert trip["receipt_total"] == 45.00
+    assert trip["assigned"] == 29.99
+    assert trip["unassigned"] == 15.01
+
+
+def test_a_single_item_order_leaves_nothing_unattributed(db, paid_mail):
+    """The other half of the same decision. A trip that can never reach
+    zero is a notification she cannot clear, and `notify.unattributed`
+    would say so about every auction she ever wins."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    trip, = listings.trip_summary(db)
+    assert trip["unassigned"] == 0.0
+
+
+def test_an_order_becomes_a_trip_with_the_selling_goodwill_on_it(db,
+                                                                paid_mail):
+    from mplabel import goodwill
+
+    result = goodwill.import_mail(db, paid_mail)
+    trip = listings.trip_summary(db, result["trip_id"])
+    assert trip["store"] == "ShopGoodwill - Goodwill Example County"
+    assert trip["occurred_at"] == "2026-09-09"
+    assert trip["receipt_total"] == 19.87
+
+
+def test_a_purchase_becomes_a_thing_on_a_shelf(db, paid_mail):
+    """The whole point: an auction win turns into inventory with a code
+    on it, without anybody typing. `paid` had a schema and a phone screen
+    for months and no automatic route in at all."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    row = db.execute("SELECT * FROM listings").fetchone()
+    assert row["listing_id"] == "goodwill:911100037"
+    assert row["title"] == "VINTAGE BLUE AND WHITE PORCELAIN MINI TEAPOT"
+    assert row["paid"] == 19.87
+    assert row["source"] == "goodwill"
+    assert row["state"] == goodwill.ACQUIRED
+    assert len(row["inventory_code"]) == 4
+
+
+def test_a_goodwill_key_cannot_collide_with_a_facebook_listing_id(db,
+                                                                 paid_mail):
+    """Both are nine-ish digit strings. Unprefixed, an item number that
+    happened to match a Facebook listing id would silently merge two
+    different objects and put a cost on the wrong one."""
+    from mplabel import goodwill
+
+    listings.upsert_listing(db, "911100037", "email", title="Something else")
+    goodwill.import_mail(db, paid_mail)
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 2
+    other = db.execute("SELECT paid FROM listings WHERE listing_id='911100037'"
+                       ).fetchone()
+    assert other["paid"] is None
+
+
+@pytest.mark.parametrize("order", [("won", "paid"), ("paid", "won")])
+def test_the_two_mails_land_on_one_row_either_way_round(db, order):
+    """A win and its payment are two mails about one object, and which
+    arrives first is not ours to decide - the backfill walks the mailbox
+    in whatever order the server returns."""
+    from mplabel import goodwill
+
+    won = GOODWILL_WON.read_text(encoding="utf-8").replace(
+        "911100022", "911100037")
+    raws = {"won": won, "paid": GOODWILL_PAID.read_text(encoding="utf-8")}
+    for which in order:
+        goodwill.import_mail(db, email.message_from_string(raws[which]))
+
+    rows = db.execute("SELECT listing_id, paid FROM listings").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["listing_id"] == "goodwill:911100037"
+    assert rows[0]["paid"] == 19.87
+
+
+def test_a_win_on_its_own_records_no_cost(db, won_mail):
+    """A win is a debt, not a cost: payment is due within seven days and
+    she has not made it. Writing the hammer price as `paid` would report
+    money that has not left the account, and would then block the
+    payment mail's better figure - which is the landed one."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, won_mail)
+    row = db.execute("SELECT paid, trip_id FROM listings").fetchone()
+    assert row["paid"] is None
+    assert row["trip_id"] is None
+    # The figure is not thrown away - it is on the event, where a debt
+    # belongs.
+    event = db.execute("SELECT kind, amount FROM mail_events").fetchone()
+    assert (event["kind"], event["amount"]) == ("goodwill_won", 24.50)
+
+
+def test_importing_the_same_mail_twice_changes_nothing(db, paid_mail):
+    """`backfill --restart` re-walks the whole mailbox. A second trip for
+    the same order would double the cost basis of the month."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    goodwill.import_mail(db, paid_mail)
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM mail_events").fetchone()[0] == 1
+
+
+def test_a_cost_she_corrected_survives_the_next_import(db, paid_mail):
+    """The mail arrives once and she is the later observation. A plain
+    overwrite on every import would undo a correction typed on the phone
+    the first time the backfill ran again."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    row = db.execute("SELECT id FROM listings").fetchone()
+    listings.set_cost(db, row["id"], 25.00)
+    goodwill.import_order(db, goodwill.parse(paid_mail))
+    assert db.execute("SELECT paid FROM listings").fetchone()["paid"] == 25.00
+
+
+def test_acquired_stays_out_of_the_sell_through_denominator(db, paid_mail):
+    """`v_price_band` measures sold over COUNT(*). Left in, a box of
+    things she has won and not yet photographed would push sell-through
+    down on the day it arrived - which is the opposite of what winning an
+    auction means."""
+    from mplabel import goodwill
+
+    listings.upsert_listing(db, "111", "email", title="Sold thing",
+                            price=20.0, state="sold")
+    listings.upsert_listing(db, "222", "email", title="Live thing",
+                            price=20.0, state="active")
+    goodwill.import_mail(db, paid_mail)
+    listings.build_views(db)
+    band = db.execute("SELECT listed, sold FROM v_price_band "
+                      "WHERE price_band='$10-25'").fetchone()
+    assert (band["listed"], band["sold"]) == (2, 1)
+
+
+def test_listing_something_moves_it_off_acquired(db, paid_mail):
+    """'acquired' ranks below 'active', so a late-arriving auction mail
+    cannot drag a listing that is already live back to the shelf - and
+    listing the thing does move it forward."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    key = "goodwill:911100037"
+    listings.upsert_listing(db, key, "email", state="active")
+    assert db.execute("SELECT state FROM listings").fetchone()["state"] == "active"
+    listings.upsert_listing(db, key, "goodwill", state=goodwill.ACQUIRED)
+    assert db.execute("SELECT state FROM listings").fetchone()["state"] == "active"
+
+
+def test_an_auction_cost_reaches_the_sale_it_belongs_to(db, paid_mail):
+    """The payoff, and the reason the module exists. `v_monthly.net` has
+    been correct and empty since the views were written, because nothing
+    could fill `paid`. Reconciliation is by title, exactly as it is for a
+    saved-page import."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    db.execute(
+        "INSERT INTO sales (message_id, item, price, received_at, status) "
+        "VALUES ('<m1>', 'Vintage blue and white porcelain mini teapot', "
+        "45.0, '2026-10-01T10:00:00', 'recorded')")
+    db.commit()
+    listings.refresh(db)
+
+    row = db.execute("SELECT state, price, paid, margin FROM v_listing_perf"
+                     ).fetchone()
+    assert (row["state"], row["price"], row["paid"]) == ("sold", 45.0, 19.87)
+    assert row["margin"] == 25.13
+    month = db.execute("SELECT net, costed FROM v_monthly").fetchone()
+    assert (month["net"], month["costed"]) == (25.13, 1)
+
+
+def test_the_poller_looks_for_goodwill_mail_too():
+    """A parser nothing calls is a parser that does not exist. The search
+    has to name the sender or the mail is never fetched."""
+    from mplabel import cli, goodwill
+
+    imap = _FakeIMAP([b"1"])
+    cli.candidate_ids(imap, {"lookback_days": "7"}, "imap.gmail.com")
+    assert "shopgoodwill.com" in imap.queries[0]
+    assert all(d in cli.MAIL_DOMAINS for d in goodwill.SENDER_DOMAINS)
+
+
+def test_the_plain_imap_fallback_nests_its_ors():
+    """IMAP's OR takes exactly two arguments. A flat `OR a b c` is
+    rejected outright, and `candidate_ids` then falls through to the
+    UNSEEN query - the one that hid eight labels behind a Gmail thread."""
+    from mplabel import cli
+
+    expr = cli.imap_or_from(("a.example", "b.example", "c.example"))
+    assert expr == ('(OR (OR (FROM "a.example") (FROM "b.example")) '
+                    '(FROM "c.example"))')
+    assert expr.count("OR") == expr.count("(OR")
+def test_an_inline_comment_does_not_choose_the_wrong_apple(tmp_path):
+    """The bug that produced `InternalServerError` and nothing else.
+
+    `configparser` does not strip inline comments, and this project's own
+    documentation showed the setting with one. So the value became
+    "sandbox   ; production once..." - which is not "sandbox" - and a
+    sandbox token went to the production host, where APNs refused it
+    without naming anything."""
+    from mplabel import notify
+
+    assert notify.environment({"apns_environment": "sandbox"}) == "sandbox"
+    assert notify.environment(
+        {"apns_environment": "sandbox   ; production once it is not a dev "
+                             "build"}) == "sandbox"
+    assert notify._host(
+        {"apns_environment": "sandbox ; later production"}) \
+        == notify.APNS_SANDBOX_HOST
+    # And the default is still production, including for an empty value.
+    assert notify.environment({}) == "production"
+    assert notify.environment({"apns_environment": ""}) == "production"
+
+
+def test_the_documented_config_has_no_inline_comments():
+    """The snippet in the docs is the thing people paste. It had one, and
+    it cost an afternoon of blaming Apple."""
+    for name in ("mplabel.conf.example", "docs/notifications.md"):
+        text = (Path(__file__).parent.parent / name).read_text()
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not re.match(r"^[a-z_]+\s*=", stripped):
+                continue
+            assert not re.search(r"\s[;#]", stripped), \
+                f"{name}: inline comment in {stripped!r} - configparser " \
+                "keeps it, so the value is not what it looks like"

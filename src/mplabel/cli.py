@@ -26,11 +26,13 @@ import json
 import logging
 import os
 import random
+import re
 import socket
 import sqlite3
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -46,6 +48,7 @@ except ImportError:
     fcntl = None
 
 from . import backfill as backfill_mod
+from . import goodwill as goodwill_mod
 from . import label
 from . import listings as listings_mod
 from . import mailparse
@@ -155,6 +158,37 @@ DEFAULTS = {
     "printd_secret": "",
     "printd_timeout": "45",
     "printd_state_dir": "",
+    # eBay, the other selling channel. Every value is empty by default
+    # and `mplabel ebay` exits 78 rather than half-trying, like notify.
+    #
+    # sandbox or production. It picks the host *and* which credentials
+    # are meant, because the two keysets are different strings that look
+    # alike, and sending a sandbox key to production is a 401 that says
+    # nothing about environments.
+    "ebay_environment": "sandbox",
+    # From the developer portal's Application Keys page, per environment.
+    # eBay calls the first two "Client ID" and "Client Secret" on some
+    # pages and App ID / Cert ID on others; they are the same values.
+    "ebay_app_id": "",
+    "ebay_cert_id": "",
+    # The RuName, not a URL - eBay resolves it to the redirect configured
+    # against the keyset, and sending the URL itself is rejected.
+    "ebay_ru_name": "",
+    "ebay_marketplace": "EBAY_US",
+    # Needed to *publish* an offer, not to draft one. Set up in My eBay
+    # and the Account API; see docs/ebay.md.
+    "ebay_merchant_location": "",
+    "ebay_fulfillment_policy": "",
+    "ebay_payment_policy": "",
+    "ebay_return_policy": "",
+    # Ours, not eBay's: 32-80 characters that we invent and eBay echoes
+    # back in the account-deletion challenge. See web.py.
+    "ebay_verification_token": "",
+    # The public HTTPS URL eBay sends account-deletion notices to. It has
+    # to be the exact string eBay is configured with - the challenge hash
+    # covers it, so a trailing slash difference fails the handshake with
+    # no explanation.
+    "ebay_notification_endpoint": "",
 }
 
 SCHEMA = """
@@ -371,6 +405,27 @@ def upsert(conn, rec):
     conn.commit()
 
 
+# Every sender the poller cares about. Facebook mail is what she sold;
+# ShopGoodwill mail is what she bought, and it is the only sourcing
+# event that arrives as a document rather than as a receipt in a bag.
+MAIL_DOMAINS = tuple(mailparse.SENDER_DOMAINS) + tuple(goodwill_mod.SENDER_DOMAINS)
+
+
+def imap_or_from(domains):
+    """`OR` over a FROM per domain, as plain IMAP wants it.
+
+    IMAP's OR is binary and prefix, so three terms is `OR (OR a b) c`
+    rather than a list - and getting that wrong is not a soft failure:
+    the server rejects the whole SEARCH and `candidate_ids` falls
+    through to the UNSEEN query, which is the one that hid eight
+    labels."""
+    terms = [f'(FROM "{d}")' for d in domains]
+    expr = terms[0]
+    for term in terms[1:]:
+        expr = f"(OR {expr} {term})"
+    return expr
+
+
 def candidate_ids(imap, cfg, host):
     """Which messages to consider this poll.
 
@@ -385,13 +440,12 @@ def candidate_ids(imap, cfg, host):
     places, and labelling one message must not be able to hide its eight
     siblings."""
     days = int(cfg.get("lookback_days") or 7)
-    doms = " OR ".join(mailparse.SENDER_DOMAINS)
+    doms = " OR ".join(MAIL_DOMAINS)
     queries = []
     if "gmail" in host:
         queries.append(f'(X-GM-RAW "from:({doms}) newer_than:{days}d")')
     since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
-    queries.append(f'(OR (FROM "facebookmail.com") '
-                   f'(FROM "marketplace.facebook.com") SINCE {since})')
+    queries.append(f'({imap_or_from(MAIL_DOMAINS)} SINCE {since})')
     queries.append('(UNSEEN FROM "facebook")')
 
     for q in queries:
@@ -721,6 +775,29 @@ def record_event(conn, msg):
     return 0 if buyer_side else 1
 
 
+def record_purchase(conn, msg):
+    """Note a ShopGoodwill auction mail: what she bought, and what it cost.
+
+    The mirror of `record_event`. That one reconciles mail about things
+    she is selling; this one is the only automatic route cost basis has
+    into the database - `listings.paid` had a schema and a phone screen
+    for months and nothing that filled it, which is why every margin in
+    the analytics was null.
+
+    Returns 1 if an order was recorded, else 0."""
+    try:
+        result = goodwill_mod.import_mail(conn, msg)
+    except Exception:
+        log.exception("could not record ShopGoodwill mail")
+        return 0
+    if not result:
+        return 0
+    log.info("ShopGoodwill %s: %d item(s)%s",
+             result["kind"], len(result["listing_ids"]),
+             f", ${result['total']:.2f}" if result.get("total") else "")
+    return 1
+
+
 def poll_once(cfg, conn, do_print):
     host, port = cfg["imap_host"], int(cfg["imap_port"])
     user, pw = cfg["imap_user"], cfg["imap_password"]
@@ -735,7 +812,7 @@ def poll_once(cfg, conn, do_print):
         log.info("%d candidate(s) in the last %s day(s)",
                  len(ids), cfg.get("lookback_days") or 7)
 
-        handled = noted = skipped = 0
+        handled = noted = skipped = bought = 0
         for num in ids:
             # Triage on headers before pulling the body: most candidates
             # are mail we have already handled, and BODY.PEEK leaves the
@@ -761,6 +838,10 @@ def poll_once(cfg, conn, do_print):
                 except Exception:
                     log.exception("could not record event for %s",
                                   num.decode())
+                # A ShopGoodwill mail is not Facebook mail, so
+                # `record_event` refuses it on the sender check and it
+                # would otherwise fall out of the poll unrecorded.
+                bought += record_purchase(conn, msg)
                 imap.store(num, "-FLAGS", "\\Seen")
                 continue
             try:
@@ -785,8 +866,15 @@ def poll_once(cfg, conn, do_print):
         if noted:
             log.info("%d sale/listing event(s) noted from non-label mail",
                      noted)
+        if bought:
+            log.info("%d ShopGoodwill order(s) recorded", bought)
+        if noted or bought:
+            # Refresh after the purchases as well as the sales: an
+            # auction item she has already listed is reconciled by title
+            # in `link_sales`, so its cost only reaches the sale it
+            # belongs to once the rebuild has run.
             listings_mod.refresh(conn)
-        if (handled or noted) and truthy(cfg.get("sheets_after_poll")) \
+        if (handled or noted or bought) and truthy(cfg.get("sheets_after_poll")) \
                 and cfg.get("sheets_key"):
             try:
                 sync_sheets(cfg, conn)
@@ -1647,8 +1735,18 @@ def cmd_status(cfg):
 
 
 # Anything whose value must not be echoed to a terminal or a paste.
+# `mplabel config` is the command you run *and paste* when something is
+# broken, which is exactly when a credential leaks.
+#
+# `ebay_cert_id` is the OAuth client secret under one of the two names
+# eBay gives it, and `ebay_verification_token` is what proves an
+# account-deletion notice came from eBay rather than from anyone who
+# found the URL. The app id and the RuName are deliberately not here:
+# both are public halves and seeing them is how you check the right
+# keyset is loaded.
 SECRET_KEYS = ("imap_password", "printd_secret", "web_password_hash",
-               "sheets_key", "sheets_key_json")
+               "sheets_key", "sheets_key_json",
+               "ebay_cert_id", "ebay_verification_token")
 
 
 def config_sources(path=None):
@@ -1718,6 +1816,23 @@ def cmd_config(args):
             continue
         shown = "<set>" if (value and key in SECRET_KEYS) else value
         print(f"  {key:<{width}}  {shown or '':<28}  {origin}")
+
+    # An inline comment is not a comment. `configparser` keeps it, so
+    # `apns_environment = sandbox ; production later` is a value that is
+    # not "sandbox" - and that one chose the wrong APNs host and produced
+    # a refusal that named nothing. Flagged for every key, because the
+    # next one will be somewhere else.
+    suspect = [(key, value) for key, value, origin in rows
+               if origin == "file" and value
+               and re.search(r"\s[;#]", str(value))]
+    if suspect:
+        print("\nThese values contain what looks like an inline comment,"
+              " and configparser keeps it:", file=sys.stderr)
+        for key, value in suspect:
+            head = str(value).split(None, 1)[0]
+            print(f"  {key} = {value!r}\n    -> put the comment on its own"
+                  f" line, or this stays {head!r} plus the rest",
+                  file=sys.stderr)
 
     if not args.all:
         n = sum(1 for _k, _v, o in rows if o == "default")
@@ -1953,7 +2068,13 @@ def cmd_notify(cfg, conn, args):
         conn.commit()
         print(f"host        : {notify_mod._host(cfg)}")
         print(f"topic       : {cfg.get('apns_topic') or '(unset)'}")
-        print(f"environment : {cfg.get('apns_environment') or 'production'}")
+        # As the sender resolves it, not as it was typed: the two
+        # differed, and the difference chose the wrong host.
+        resolved = notify_mod.environment(cfg)
+        typed = str(cfg.get("apns_environment") or "production")
+        print(f"environment : {resolved}"
+              + (f"   (config says {typed!r})" if typed.strip() != resolved
+                 else ""))
 
         key_path = cfg.get("apns_key_path") or ""
         key_id = cfg.get("apns_key_id") or ""
@@ -2022,8 +2143,7 @@ def cmd_notify(cfg, conn, args):
             if len(device["token"]) != 64:
                 print("              ^ an APNs token is 64 hex characters",
                       file=sys.stderr)
-            if device["environment"] != (cfg.get("apns_environment")
-                                         or "production"):
+            if device["environment"] != notify_mod.environment(cfg):
                 print("              ^ registered against a different "
                       "environment than apns_environment", file=sys.stderr)
         return 0
@@ -2116,6 +2236,70 @@ def cmd_notify(cfg, conn, args):
     return 0
 
 
+def cmd_ebay(cfg, args):
+    """`ebay auth` and `ebay check`. Neither touches the database.
+
+    Above `connect_db` for the same reason `probe` and `selftest` are: a
+    credential test must not need a writable home directory. It is the
+    one thing you want working when nothing else is.
+    """
+    from . import ebay as ebay_mod
+
+    if args.ebaycmd == "check":
+        problems = 0
+        for label, value, problem in ebay_mod.check(cfg):
+            print(f"{label:20}: {value}")
+            if problem:
+                problems += 1
+                print(f"{'':20}  ^ {problem}", file=sys.stderr)
+        if problems:
+            # 78, not 1: an unconfigured install is a permanent error and
+            # a timer must not retry it for ever. Same refusal printd
+            # makes for a missing secret.
+            noun = "thing needs" if problems == 1 else "things need"
+            print(f"\n{problems} {noun} attention - see docs/ebay.md",
+                  file=sys.stderr)
+            return 78
+        print("\nnothing to fix")
+        return 0
+
+    # auth
+    try:
+        if not args.code:
+            url = ebay_mod.consent_url(cfg)
+            print("Open this on a machine with a browser, sign in as the "
+                  "seller, and agree:\n")
+            print(f"  {url}\n")
+            print("eBay then redirects to the URL configured against the "
+                  "RuName with ?code=... on the end. That code is "
+                  "url-encoded and expires in a few minutes, so paste it "
+                  "back promptly:\n")
+            print("  mplabel ebay auth --code '<the code>'")
+            return 0
+        # The code arrives url-encoded in a browser's address bar and is
+        # routinely pasted that way. Unquoting an already-clean code is a
+        # no-op, so this is safe in both directions.
+        tokens = ebay_mod.exchange_code(
+            cfg, urllib.parse.unquote(args.code))
+    except ebay_mod.EbayConfigError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 78
+    except ebay_mod.EbayError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"stored {ebay_mod.token_path(cfg)} (0600)")
+    days = ebay_mod.refresh_days_left(tokens)
+    if days is None:
+        print("eBay did not say how long the refresh token lasts, which "
+              "means the expiry cannot be recorded - `ebay check` will "
+              "not be able to warn you before it dies.")
+    else:
+        print(f"the refresh token lasts {days} days. `ebay check` counts "
+              f"it down; there is no second warning from eBay.")
+    return 0
+
+
 def cmd_inventory(cfg, conn, args):
     """Write a CSV of inventory labels for the label maker.
 
@@ -2159,6 +2343,61 @@ def cmd_inventory(cfg, conn, args):
           + (f"  ({fresh} new code(s) assigned)" if fresh else ""))
     print("Import it in SUPVAN's editor, bind the fields once as a "
           "template, then batch print.")
+
+
+def cmd_goodwill(conn, args):
+    """Read one saved ShopGoodwill email and say what it found.
+
+    The `scan` of the auction half. Everything this parser knows was
+    reconstructed from two forwarded mails, and ShopGoodwill redesigns
+    that template like any other marketing department - so before a run
+    writes a cost basis into the database there has to be a way to point
+    it at a real message and *look*. Reads by default and writes only
+    when asked, for the same reason `scan` changes nothing.
+
+    Save the message as .eml from the mail client: 'Show original' in
+    Gmail, then save."""
+    raw = Path(args.path).read_bytes()
+    msg = email.message_from_bytes(raw)
+    if not goodwill_mod.is_from_goodwill(msg):
+        sender = mailparse._decode(msg.get("From")) or "(no From header)"
+        raise SystemExit(f"not a ShopGoodwill message - From: {sender}")
+
+    order = goodwill_mod.parse(msg)
+    if not order:
+        subject = mailparse._decode(msg.get("Subject"))
+        raise SystemExit(
+            f"no pattern matched that subject:\n  {subject}\n\n"
+            "If it is a win or a payment receipt, add it to "
+            "SUBJECT_PATTERNS in goodwill.py.")
+
+    print(f"kind    : {order['kind']}")
+    if order.get("seller"):
+        print(f"seller  : {order['seller']}")
+    if order.get("order_id"):
+        print(f"order   : {order['order_id']}   paid {order.get('paid_on')}")
+    costs = goodwill_mod.landed_cost(order) if order["kind"] == "goodwill_paid" else {}
+    for item in order.get("items") or []:
+        print(f"\n  item  : {item['item_id']}")
+        print(f"  title : {item.get('title')}")
+        print(f"  price : {item.get('price')}")
+        if item["item_id"] in costs:
+            print(f"  paid  : {costs[item['item_id']]}  (landed)")
+    if order["kind"] == "goodwill_paid":
+        print(f"\nsubtotal {order.get('subtotal')}  tax {order.get('tax')}  "
+              f"postage {order.get('shipping')}  total {order.get('total')}")
+        if len(order.get("items") or []) > 1:
+            print("More than one item, so the tax and the postage are not "
+                  "split - each item carries its own price and the rest "
+                  "stays as the trip's unassigned money.")
+
+    if not args.write:
+        print("\nNothing written. Re-run with --write to record it.")
+        return
+    result = goodwill_mod.import_order(conn, order)
+    listings_mod.refresh(conn)
+    print(f"\nrecorded {len(result['listing_ids'])} item(s)"
+          + (f", trip {result['trip_id']}" if result.get("trip_id") else ""))
 
 
 def cmd_verify(cfg, conn, args):
@@ -2226,6 +2465,19 @@ def cmd_stats(cfg, conn, args):
           "SELECT * FROM v_aging LIMIT 10",
           lambda r: f"{(r['title'] or '?')[:34]:<36} ${r['price'] or 0:>7.2f}"
                     f"  {r['days_listed']}d  {r['inquiries']} inquiries")
+    # What has come home and is not yet for sale. A new question - until
+    # the ShopGoodwill importer there was no way for a row to exist
+    # before it was listed - and the one that decides what to photograph
+    # next. Cost is shown because it is the money standing still.
+    table("Bought, not yet listed",
+          "SELECT title, paid, inventory_code FROM listings "
+          "WHERE state = 'acquired' ORDER BY id DESC LIMIT 10",
+          # Not `or 0`: a win that has not been paid for yet has a null
+          # cost, and printing it as $0.00 says the thing was free. The
+          # same distinction `v_listing_perf.margin` is built on.
+          lambda r: f"{(r['title'] or '?')[:34]:<36} "
+                    + ("      -" if r["paid"] is None else f"${r['paid']:>6.2f}")
+                    + f"  {r['inventory_code'] or '----'}")
     table("Fastest sellers",
           "SELECT title, price, days_to_sell FROM v_listing_perf "
           "WHERE days_to_sell IS NOT NULL ORDER BY days_to_sell LIMIT 10",
@@ -2260,7 +2512,13 @@ def _close_sale(conn, ref, status):
 
 def main():
     try:
-        _main()
+        # `return`, not a bare call. `notify` and `ebay check` answer a
+        # configuration error with 78 (EX_CONFIG) so that systemd's
+        # RestartPreventExitStatus=78 can keep a permanent error dead
+        # where it can be seen - and dropping the value here turned every
+        # one of those refusals into a success, which is the half of that
+        # pair that has no unit test to notice.
+        return _main()
     except printers.PrinterUnavailable as exc:
         # An Exception everywhere else, so the poll loop and the web app
         # can catch it - but at a terminal it should still just print the
@@ -2328,6 +2586,11 @@ def _main():
                    help="which listings (default: active)")
     p.add_argument("--all", action="store_true",
                    help="every listing, whatever its state")
+    p = sub.add_parser("goodwill",
+                       help="read one saved ShopGoodwill email")
+    p.add_argument("path", help="a .eml saved from the mail client")
+    p.add_argument("--write", action="store_true",
+                   help="record it; without this it only reports")
     p = sub.add_parser("ship", help="mark as shipped")
     p.add_argument("ref", help=ref_help)
     p = sub.add_parser("cancel", help="the buyer pulled out; not a sale")
@@ -2634,6 +2897,19 @@ def _main():
     p.add_argument("--bind")
     p.add_argument("--port", type=int)
 
+    p = sub.add_parser("ebay", help="the other selling channel")
+    esub = p.add_subparsers(dest="ebaycmd", required=True)
+    e = esub.add_parser("auth",
+                        help="grant this application access to the eBay "
+                             "account; the Pi is headless, so consent "
+                             "happens in a browser elsewhere")
+    e.add_argument("--code",
+                   help="the authorization code from the redirect URL. "
+                        "Without it this prints the consent URL and stops")
+    esub.add_parser("check",
+                    help="configuration, tokens and how long they have "
+                         "left. Changes nothing and sends nothing")
+
     args = ap.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -2712,6 +2988,11 @@ def _main():
         from . import printd as printd_mod
         printd_mod.serve(cfg, bind=args.bind, port=args.port)
         return
+    if args.cmd == "ebay" and args.ebaycmd in ("auth", "check"):
+        # Same reasoning as probe and selftest: checking a credential
+        # must not need the database. The subcommands that read or write
+        # listings fall through to the block below.
+        return cmd_ebay(cfg, args)
 
     conn = connect_db(cfg["home"])
 
@@ -2735,6 +3016,8 @@ def _main():
         cmd_verify(cfg, conn, args)
     elif args.cmd == "inventory":
         cmd_inventory(cfg, conn, args)
+    elif args.cmd == "goodwill":
+        cmd_goodwill(conn, args)
     elif args.cmd == "test-print":
         cmd_test_print(cfg, conn, args)
     elif args.cmd == "scan":
