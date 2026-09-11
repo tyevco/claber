@@ -58,6 +58,11 @@ def db():
     # fixture is a database the code would never meet - which is the
     # exact mistake the comment above records.
     conn.executescript(shopping.SCHEMA)
+    # And where a listing is posted on eBay. Same reason again: a
+    # fixture missing a table the code creates is a database the code
+    # would never meet.
+    from mplabel import ebay as ebay_schema
+    conn.executescript(ebay_schema.SCHEMA)
     return conn
 
 
@@ -5561,7 +5566,7 @@ def test_a_migrated_database_has_the_same_foreign_keys_as_a_fresh_one(tmp_path):
 
     def foreign_keys(conn):
         out = set()
-        for table in ("listings", "photos"):
+        for table in ("listings", "photos", "ebay_offers"):
             for row in conn.execute(f"PRAGMA foreign_key_list({table})"):
                 # (id, seq, table, from, to, on_update, on_delete, match)
                 out.add((table, row[3], row[2], row[4], row[6]))
@@ -9923,7 +9928,8 @@ def test_ebay_check_says_what_is_missing_and_changes_nothing(ebay_cfg):
     from mplabel import ebay
 
     rows = ebay.check(ebay_cfg)
-    problems = [(label_, problem) for label_, _, problem in rows if problem]
+    problems = [(label_, problem)
+                for label_, _, problem, _blocking in rows if problem]
     # No tokens yet, so that is the thing to say - and it is the only
     # blocking one, because the policies are needed to publish and this
     # design deliberately never publishes.
@@ -9942,7 +9948,7 @@ def test_ebay_check_warns_before_the_refresh_token_dies(ebay_cfg,
         "refresh_token_expires_in": 10 * 86400})]))
     ebay.exchange_code(ebay_cfg, "code")
 
-    warnings = [problem for label_, _, problem in ebay.check(ebay_cfg)
+    warnings = [problem for label_, _, problem, _b in ebay.check(ebay_cfg)
                 if problem and "ebay auth" in problem]
     assert warnings, "a token with ten days left should be warned about"
 
@@ -10754,6 +10760,214 @@ def test_ebay_order_refusal_names_the_field(ebay_cfg, monkeypatch):
     assert "filter=creationdate" in str(caught.value)
 
 
+# --- ebay: the one unauthenticated route that serves data
+#
+# What it refuses is the whole design, so most of these test refusals.
+
+
+def _seed_ebay_photo(conn, home, listed=True, name="vase.jpg",
+                     digest="a" * 64):
+    """A photograph on disk, attached to a listing, optionally pushed."""
+    photos = Path(home) / "photos"
+    photos.mkdir(parents=True, exist_ok=True)
+    # A real JPEG header, so the Content-Type assertion means something.
+    (photos / name).write_bytes(b"\xff\xd8\xff\xe0" + b"not really a jpeg")
+    conn.execute("INSERT INTO listings (title, state) VALUES ('Vase', 'active')")
+    lid = conn.execute("SELECT id FROM listings ORDER BY id DESC").fetchone()[0]
+    # Absolute, because that is what `h_add_photo` stores: it builds the
+    # path from `photo_dir(home)`, and `safe_home_path` resolves what it
+    # is given - so a relative path resolves against the process CWD and
+    # is correctly refused. Getting this wrong in the fixture looked
+    # exactly like the route being broken.
+    conn.execute("INSERT INTO photos (path, sha256, listing_id) "
+                 "VALUES (?, ?, ?)", (str(photos / name), digest, lid))
+    if listed:
+        conn.execute("INSERT INTO ebay_offers (listing_id, sku, state) "
+                     "VALUES (?, 'MP-7QK3', 'draft')", (lid,))
+    conn.commit()
+    return lid, digest
+
+
+def test_ebay_photo_is_served_without_a_token(app, tmp_path):
+    """eBay fetches `imageUrls` itself and carries no bearer token.
+
+    The Sell REST APIs have no image upload at all, so a public URL is
+    the only route - which is why this hole exists and why it is the
+    narrowest one that works.
+    """
+    base, conn = app
+    _lid, digest = _seed_ebay_photo(conn, tmp_path)
+
+    status, headers, body = _http(f"{base}/ebay/photo/{digest}")
+    assert status == 200
+    assert body.startswith(b"\xff\xd8\xff")
+    assert headers.get("Content-Type") == "image/jpeg"
+
+
+def test_an_unlisted_photo_is_not_served(app, tmp_path):
+    """The join through `ebay_offers` is the allowlist.
+
+    A photograph of something that was never pushed to eBay is not
+    public, even though its digest is in the same table and its bytes
+    are in the same directory.
+    """
+    base, conn = app
+    _lid, digest = _seed_ebay_photo(conn, tmp_path, listed=False)
+
+    status, _h, _b = _http(f"{base}/ebay/photo/{digest}")
+    assert status == 404
+
+
+def test_a_receipt_can_never_be_served_here(app, tmp_path):
+    """The reason the allowlist is a join and not a flag.
+
+    A receipt carries what she paid and where she was. It is attached to
+    a *trip*, never to a listing, so no `ebay_offers` row can ever reach
+    it - not even for someone who learns its sha256.
+    """
+    base, conn = app
+    (tmp_path / "photos").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "photos" / "receipt.jpg").write_bytes(b"\xff\xd8\xff\xe0till")
+    conn.execute("INSERT INTO trips (store) VALUES ('Goodwill')")
+    tid = conn.execute("SELECT id FROM trips").fetchone()[0]
+    conn.execute("INSERT INTO photos (path, sha256, trip_id) "
+                 "VALUES (?, ?, ?)",
+                 (str(tmp_path / "photos" / "receipt.jpg"), "b" * 64, tid))
+    conn.commit()
+
+    status, _h, _b = _http(f"{base}/ebay/photo/{'b' * 64}")
+    assert status == 404
+
+
+def test_the_two_photo_refusals_are_indistinguishable(app, tmp_path):
+    """Otherwise an anonymous caller has an oracle.
+
+    "No such photo" and "that photo exists but is not listed" must read
+    identically, or the route answers a question about the contents of
+    the database to someone with no token.
+    """
+    base, conn = app
+    _lid, digest = _seed_ebay_photo(conn, tmp_path, listed=False)
+
+    known = _http(f"{base}/ebay/photo/{digest}")
+    unknown = _http(f"{base}/ebay/photo/{'c' * 64}")
+    assert known[0] == unknown[0] == 404
+    assert known[2] == unknown[2]
+
+
+def test_the_ebay_photo_path_takes_only_a_digest(app, tmp_path):
+    """64 lowercase hex is matched in the pattern, so nothing else even
+    reaches the handler - no traversal, no filename, no id."""
+    base, conn = app
+    _seed_ebay_photo(conn, tmp_path)
+
+    for bad in ("../../etc/passwd", "vase.jpg", "A" * 64, "a" * 63,
+                "a" * 65, ""):
+        status, _h, _b = _http(f"{base}/ebay/photo/{bad}")
+        assert status == 404, bad
+
+
+def test_the_ebay_photo_route_is_outside_the_api_prefix():
+    """`_dispatch` rewrites `/api/v1/...` onto `/api/...`.
+
+    eBay stores this URL against a live listing, so it has to sit where
+    that aliasing cannot reach it and where a future `v2` does not move
+    it - a URL a third party holds cannot be renamed.
+    """
+    from mplabel import web
+
+    route = [r for r in web.Handler.ROUTES if "ebay/photo" in r[1]]
+    assert len(route) == 1
+    method, pattern, _handler, needs_auth = route[0]
+    assert method == "GET"
+    assert not pattern.startswith("^/api")
+    # Unauthenticated on purpose - and the only one of those that hands
+    # back stored data. The others are the health check and the three
+    # steps of logging in, none of which says anything about an order.
+    assert needs_auth is False
+    assert {p for _m, p, _h, a in web.Handler.ROUTES if a is False} == {
+        r"^/healthz$",
+        r"^/api/login$",
+        r"^/api/logout$",
+        r"^/api/session$",
+        r"^/ebay/photo/(?P<digest>[0-9a-f]{64})$",
+    }, "the set of unauthenticated routes changed - was that deliberate?"
+
+
+def test_ebay_photo_url_refuses_plain_http(ebay_cfg):
+    """eBay refuses a non-https `imageUrls`, and says so about the field
+    rather than the scheme - so the useful place to catch it is here."""
+    from mplabel import ebay
+
+    with pytest.raises(ebay.EbayConfigError):
+        ebay.photo_url(ebay_cfg, "a" * 64)          # unset
+
+    ebay_cfg["ebay_photo_base"] = "http://pi.example.com"
+    with pytest.raises(ebay.EbayConfigError) as caught:
+        ebay.photo_url(ebay_cfg, "a" * 64)
+    assert "https" in str(caught.value)
+
+    ebay_cfg["ebay_photo_base"] = "https://pi.example.com/"
+    # The trailing slash is absorbed rather than doubled - a `//` in the
+    # path is a 404 that reads as the route being wrong.
+    assert ebay.photo_url(ebay_cfg, "a" * 64) == (
+        "https://pi.example.com/ebay/photo/" + "a" * 64)
+
+
+def test_ebay_skus_reads_every_page(ebay_cfg, monkeypatch):
+    """One read-only call before the first push ever happens.
+
+    eBay's SKU uniqueness is per-account and permanent, and reusing one
+    does not error - it silently re-points that inventory item at a new
+    object, so a listing already live starts describing something else.
+    """
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1"}),
+        (200, {"inventoryItems": [{"sku": "OLD-1"}, {"sku": "OLD-2"}],
+               "next": "/sell/inventory/v1/inventory_item?offset=2"}),
+        (200, {"inventoryItems": [{"sku": "OLD-3"}]}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    assert ebay.existing_skus(ebay_cfg) == ["OLD-1", "OLD-2", "OLD-3"]
+
+
+def test_ebay_check_passes_on_an_install_that_cannot_publish_yet(tmp_path,
+                                                                  monkeypatch):
+    """Exit 78 means *permanently misconfigured*, and must stay that.
+
+    The four publish-time policy ids are unset on every install until
+    someone sets up Business Policies, and nothing in this system
+    publishes - so counting them as faults reported a healthy sandbox
+    install that authenticates and pulls orders as broken, and exit 78 is
+    the code `RestartPreventExitStatus=78` is built on. A note is not a
+    fault.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path),
+               ebay_app_id="app", ebay_cert_id="cert",
+               ebay_ru_name="Ru-Name")
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
+        "access_token": "a", "expires_in": 7200, "refresh_token": "r",
+        "refresh_token_expires_in": 47304000})]))
+    ebay.exchange_code(cfg, "code")
+
+    rows = ebay.check(cfg)
+    unset = [r for r in rows if r[2] and not r[3]]
+    assert len(unset) == 4, "the policies should be notes, not faults"
+    assert not [r for r in rows if r[2] and r[3]], \
+        "nothing about this install is actually broken"
+    assert cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="check")) == 0
+
+    # And a genuinely unconfigured one still refuses, or the exit code
+    # has stopped meaning anything.
+    bare = dict(cli.DEFAULTS, home=str(tmp_path))
+    assert cli.cmd_ebay(bare, argparse.Namespace(ebaycmd="check")) == 78
 # --------------------------------------------------------------------------
 # Bought and not yet listed, where she can see it.
 #

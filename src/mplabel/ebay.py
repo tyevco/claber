@@ -97,6 +97,50 @@ EXPIRY_SLACK = 300
 TIMEOUT = 30
 
 
+# Where a listing is posted on eBay. Declared here rather than in
+# `listings.SCHEMA` for the same reason `shopping.py` owns its own: the
+# module that writes a table owns it. `connect_db` runs this after
+# listings', because the reference below needs that table to exist.
+#
+# A real relation, unlike `sales -> listings`, and it earns one: eBay
+# *mints* the sku and the offer id, so there is an actual key to point
+# at rather than a title to match on. It also has to be a new table
+# rather than columns on `listings` - a column added by `ALTER TABLE`
+# gets no foreign key at all on a database that already migrated, which
+# is the `bin_code` incident, while `CREATE TABLE IF NOT EXISTS` gives a
+# fresh Pi and hers the identical constrained table.
+#
+# ON DELETE CASCADE, not SET NULL: unlike a bin, this row has no meaning
+# without the listing it describes.
+#
+# One row per listing, keyed on it, because the question being asked is
+# "where is this listed" - the same question `listings.bin_code`
+# answers about a shelf. A relist overwrites. If "what has this been
+# listed as before?" turns out to be real, that is a new table beside
+# this one rather than a different shape of it.
+#
+# `ebay_item` is eBay's *listingId* and is null until she publishes,
+# which this system deliberately never does. It is not called
+# `listing_id`: that name already means two different things in this
+# database - a Facebook id on `sales` and a possibly-synthetic key on
+# `listings` - and a third meaning is how `build_job`'s "buffers" went
+# wrong.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS ebay_offers (
+    listing_id INTEGER PRIMARY KEY
+               REFERENCES listings(id) ON DELETE CASCADE,
+    sku        TEXT UNIQUE,
+    offer_id   TEXT,
+    ebay_item  TEXT,
+    state      TEXT,          -- draft | published | ended
+    pushed_at  TEXT,
+    -- Of what was last sent, so a push that would change nothing makes
+    -- no call at all.
+    digest     TEXT
+);
+"""
+
+
 class EbayError(RuntimeError):
     """Something about the configuration, the tokens, or eBay's answer."""
 
@@ -441,13 +485,21 @@ def check(cfg):
     production, and a genuinely unauthorised account with three
     variations on the same 401.
 
-    Returns a list of (label, value, problem_or_None) so the caller does
-    the printing and this stays testable.
+    Returns a list of (label, value, problem_or_None, blocking) so the
+    caller does the printing and this stays testable.
+
+    `blocking` is the difference between "this install is broken" and
+    "you have not got to that part yet", and it decides the exit code.
+    Exit 78 means a *permanent* misconfiguration - the unit carries
+    `RestartPreventExitStatus=78` on the strength of that - so it must
+    not fire for the publish-time policies, which nothing here needs
+    because nothing here publishes. Reporting a healthy sandbox install
+    as a failure is how an exit code stops being believed.
     """
     rows = []
 
-    def add(label, value, problem=None):
-        rows.append((label, value, problem))
+    def add(label, value, problem=None, blocking=True):
+        rows.append((label, value, problem, blocking))
 
     try:
         env = environment(cfg)
@@ -501,9 +553,12 @@ def check(cfg):
         value = (cfg.get(key) or "").strip()
         # Not required to create a draft - required to publish one. Said
         # plainly here because the failure otherwise arrives weeks later
-        # inside eBay's own UI, where it looks like eBay's problem.
+        # inside eBay's own UI, where it looks like eBay's problem - but
+        # *not* blocking, or a sandbox install that authenticates and
+        # pulls orders perfectly well reports itself broken.
         add(label, value or "(unset)",
-            None if value else "needed to publish, not to draft")
+            None if value else "needed to publish, not to draft",
+            blocking=False)
     return rows
 
 
@@ -738,3 +793,68 @@ def get_orders(cfg, since=None, limit=None):
         # offset ourselves keeps the filter intact.
         path = payload.get("next")
     return orders
+
+
+INVENTORY_ITEM_PATH = "/sell/inventory/v1/inventory_item"
+
+
+def existing_skus(cfg, limit=200):
+    """Every SKU already on the account, read-only.
+
+    Worth one call before the first push ever happens. eBay's SKU
+    uniqueness is per-account and **permanent** - reusing one does not
+    error, it silently re-points the old inventory item at a new object,
+    so a listing already live would start describing something else.
+    Deriving ours from `listings.inventory_code` only avoids that if
+    nothing is already using the same shape, and this is how to know
+    rather than assume.
+    """
+    skus, offset = [], 0
+    while True:
+        page = min(limit - len(skus), 100)
+        if page <= 0:
+            break
+        status, payload = call(
+            cfg, "GET",
+            f"{INVENTORY_ITEM_PATH}?limit={page}&offset={offset}")
+        if status != 200:
+            raise EbayError(
+                f"eBay refused the inventory list ({status}): "
+                + describe_errors(payload))
+        items = payload.get("inventoryItems") or []
+        skus.extend(item.get("sku") for item in items if item.get("sku"))
+        if not payload.get("next") or not items:
+            break
+        offset += len(items)
+    return skus
+
+
+PHOTO_PATH = "/ebay/photo/"
+
+
+def photo_url(cfg, digest):
+    """The public URL eBay fetches one photograph at.
+
+    `ebay_photo_base` is the outside of the tunnel - the same host the
+    phone reaches, without a path. It has to be **https**: eBay refuses
+    a plain-http `imageUrls` outright, and the refusal names the field
+    rather than the scheme.
+
+    Deliberately a separate key from `ebay_notification_endpoint` even
+    though both are the same host today. That one is a whole URL eBay
+    stores and hashes into the deletion challenge, so a trailing slash
+    changes its meaning; this one is a base that gets a path appended.
+    Making one serve both jobs is how a shared string acquires two
+    meanings.
+    """
+    base = (cfg.get("ebay_photo_base") or "").strip().rstrip("/")
+    if not base:
+        raise EbayConfigError(
+            "ebay_photo_base is not set, so there is no public URL to "
+            "give eBay for a photograph. See docs/ebay.md.")
+    if not base.startswith("https://"):
+        raise EbayConfigError(
+            f"ebay_photo_base is {base!r}; eBay refuses a non-https "
+            f"imageUrls, and the refusal names the field rather than "
+            f"the scheme.")
+    return f"{base}{PHOTO_PATH}{digest}"

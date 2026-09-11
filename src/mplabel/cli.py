@@ -199,6 +199,12 @@ DEFAULTS = {
     # covers it, so a trailing slash difference fails the handshake with
     # no explanation.
     "ebay_notification_endpoint": "",
+    # The outside of the tunnel, without a path: eBay fetches listing
+    # photographs from here, because the Sell REST APIs have no image
+    # upload and `imageUrls` must be a public https URL. Only photos
+    # attached to a listing already pushed to eBay are served; see
+    # `web.h_ebay_photo`.
+    "ebay_photo_base": "",
 }
 
 SCHEMA = """
@@ -356,6 +362,10 @@ def connect_db(home):
         from . import shopping as shopping_mod
 
         conn.executescript(shopping_mod.SCHEMA)
+        # Where a listing is posted on eBay. After listings', because it
+        # references that table - and declared with the rest so a fresh
+        # database and a migrated one agree about the constraint.
+        conn.executescript(ebay_mod.SCHEMA)
         # ...which is exactly why a new column needs saying separately: the
         # database already holds real sales and CREATE TABLE IF NOT EXISTS
         # will not touch them. See MIGRATIONS.
@@ -2256,21 +2266,52 @@ def cmd_ebay(cfg, args):
     from . import ebay as ebay_mod
 
     if args.ebaycmd == "check":
-        problems = 0
-        for label, value, problem in ebay_mod.check(cfg):
+        blocking, notes = 0, 0
+        for label, value, problem, is_blocking in ebay_mod.check(cfg):
             print(f"{label:20}: {value}")
-            if problem:
-                problems += 1
+            if not problem:
+                continue
+            if is_blocking:
+                blocking += 1
                 print(f"{'':20}  ^ {problem}", file=sys.stderr)
-        if problems:
+            else:
+                # A note, not a fault. Printed on stdout beside the row
+                # it belongs to, and it does not reach the exit code.
+                notes += 1
+                print(f"{'':20}    {problem}")
+        if blocking:
             # 78, not 1: an unconfigured install is a permanent error and
             # a timer must not retry it for ever. Same refusal printd
-            # makes for a missing secret.
-            noun = "thing needs" if problems == 1 else "things need"
-            print(f"\n{problems} {noun} attention - see docs/ebay.md",
+            # makes for a missing secret - which is why only a *blocking*
+            # problem earns it. The publish-time policies are notes.
+            noun = "thing needs" if blocking == 1 else "things need"
+            print(f"\n{blocking} {noun} attention - see docs/ebay.md",
                   file=sys.stderr)
             return 78
-        print("\nnothing to fix")
+        if notes:
+            print(f"\nnothing broken. {notes} thing(s) are only needed to "
+                  f"publish, which nothing here does yet.")
+        else:
+            print("\nnothing to fix")
+        return 0
+
+    if args.ebaycmd == "skus":
+        try:
+            skus = ebay_mod.existing_skus(cfg)
+        except ebay_mod.EbayConfigError as exc:
+            print(f"ebay: {exc}", file=sys.stderr)
+            return 78
+        except ebay_mod.EbayError as exc:
+            print(f"ebay: {exc}", file=sys.stderr)
+            return 1
+        if not skus:
+            print("no SKUs on the account yet - nothing to collide with")
+            return 0
+        for sku in sorted(skus):
+            print(f"  {sku}")
+        print(f"\n{len(skus)} SKU(s) already in use. Reusing one does not "
+              f"error:\nit re-points that inventory item at a new object, "
+              f"so a live listing\nwould start describing something else.")
         return 0
 
     # auth
@@ -2985,6 +3026,10 @@ def _main():
     esub.add_parser("check",
                     help="configuration, tokens and how long they have "
                          "left. Changes nothing and sends nothing")
+    esub.add_parser("skus",
+                    help="every SKU already on the eBay account. Read-only, "
+                         "and worth one call before the first push: eBay's "
+                         "SKU uniqueness is permanent")
     e = esub.add_parser("pull",
                         help="eBay orders as sales rows. --dry-run is "
                              "currently the only mode: it prints what it "
@@ -3074,7 +3119,7 @@ def _main():
         from . import printd as printd_mod
         printd_mod.serve(cfg, bind=args.bind, port=args.port)
         return
-    if args.cmd == "ebay" and args.ebaycmd in ("auth", "check"):
+    if args.cmd == "ebay" and args.ebaycmd in ("auth", "check", "skus"):
         # Same reasoning as probe and selftest: checking a credential
         # must not need the database. The subcommands that read or write
         # listings fall through to the block below.

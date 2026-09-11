@@ -15,6 +15,7 @@ The plumbing, and a survey of the orders.
 ```bash
 mplabel ebay auth            # prints the consent URL, then takes the code
 mplabel ebay check           # config and tokens; changes nothing
+mplabel ebay skus            # SKUs already on the account; read-only
 mplabel ebay pull --dry-run  # the orders it would record; writes nothing
 ```
 
@@ -41,6 +42,43 @@ this repo has fallen into before in another form:
   reported the day after it was due.
 - **`message_id` is `ebay:<orderId>`, never NULL.** Six call sites on
   the print path key on it and all six fail silently on a falsy one.
+
+## The one public route, and what it will not serve
+
+eBay fetches listing photographs itself: the Sell REST APIs have no image
+upload, and `imageUrls` must be a public **https** URL. Her photographs
+sit behind bearer auth, so there is one unauthenticated route:
+
+```
+GET https://<tunnel>/ebay/photo/<sha256>
+```
+
+`ebay_photo_base` is the outside of the tunnel, without a path. It is a
+separate key from `ebay_notification_endpoint` on purpose - that one is a
+whole URL eBay hashes into the deletion challenge, where a trailing slash
+changes the meaning, and this one is a base that gets a path appended.
+
+**What it refuses is the design.** A photograph is served only when its
+digest is attached to a listing that has a row in `ebay_offers` - the
+join *is* the allowlist. Everything else is 404: every receipt, every
+untriaged capture, every photograph of something that was never listed. A
+receipt carries what she paid and where she was, and it can never be
+served here even by someone who learns its sha256.
+
+Three properties worth not breaking:
+
+- **The digest is matched in the route pattern** - 64 lowercase hex and
+  nothing else - so no path can be traversed and no other shape reaches
+  the handler at all.
+- **Both refusals are byte-identical.** "No such photo" and "that photo
+  exists but is not listed" must be indistinguishable, or the route is an
+  oracle telling an anonymous caller which digests are in the database.
+- **It takes no query parameters, and must not grow any.** The moment it
+  does, it has stopped being a way to hand eBay some bytes and become a
+  way to ask this server questions without a token.
+
+The bytes themselves are already public - eBay shows them on the listing.
+What is not public is everything else in `photos/`.
 
 ## What you have to do once
 
