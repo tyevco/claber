@@ -466,6 +466,44 @@ a:hover { text-decoration: underline; }
 }
 .bulk__form .field { width: 150px; flex: none; }
 
+/* ------------------------------------------------------ print a label */
+
+.send { display: flex; gap: 26px; align-items: flex-start; }
+.send__left { flex: 1; min-width: 0; max-width: 520px; }
+/* The page going in, at a size where a wrong crop is obvious. This is
+   the whole reason the screen is worth having on a laptop rather than
+   only on the phone. */
+.send__right {
+  flex: 1; min-width: 300px; position: sticky; top: 0;
+  display: flex; flex-direction: column; gap: 9px;
+}
+.send__right embed, .send__blank {
+  width: 100%; height: 520px; border: 1px solid var(--bd);
+  border-radius: 12px; background: var(--rai); display: block;
+}
+.send__blank { background: var(--elev); }
+
+.send__opts { margin-top: 18px; padding: 6px 18px 14px; }
+.sendrow {
+  display: flex; align-items: center; gap: 14px;
+  padding: 11px 0; border-bottom: 1px solid var(--bd);
+}
+.sendrow:last-child { border-bottom: none; }
+.sendrow .label { flex: none; width: 96px; }
+.sendrow__opts {
+  flex: 1; display: flex; align-items: center;
+  gap: 6px; flex-wrap: wrap; justify-content: flex-end;
+}
+.sendrow__opts .pill { padding: 6px 11px; font-size: 12px; }
+
+/* The chooser doubles as the chosen-file card, so it loses the dashed
+   "nothing here yet" edge once there is something in it. */
+.drop--has {
+  border-style: solid; border-color: var(--bd); padding: 22px 24px;
+  text-align: left;
+}
+.drop--has p { margin-left: 0; margin-right: 0; }
+
 /* ----------------------------------------------------- listing writer */
 
 .writer__head {

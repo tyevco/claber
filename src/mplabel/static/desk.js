@@ -41,6 +41,11 @@ var S = {
   /* To ship */
   pick: null, detail: null, labelUrl: null,
 
+  /* Print a label. The file never leaves the page until she asks: it is
+     the one thing here that cannot be re-fetched, and a half-remembered
+     one across a reload would print something she did not pick. */
+  send: null, sendUrl: null,
+
   /* Inventory */
   inv: null, invQ: '', invTotal: 0, sort: 'title', dir: 1, sel: [],
   bulk: null, bulkVal: '', bins: null,
@@ -71,6 +76,7 @@ MP.onUnauthorized = function () {
 var SCREENS = [
   { key: 'home',      slug: 'today',     label: 'Today',          view: viewToday },
   { key: 'queue',     slug: 'queue',     label: 'To ship',        view: viewQueue },
+  { key: 'send',      slug: 'print',     label: 'Print a label',  view: viewSend },
   { key: 'inventory', slug: 'inventory', label: 'Inventory',      view: viewInventory },
   { key: 'writer',    slug: 'writer',    label: 'Listing writer', view: viewWriter },
   { key: 'review',    slug: 'review',    label: 'Month-end',      view: viewReview },
@@ -1140,6 +1146,266 @@ function exportSelection() {
   a.click();
   URL.revokeObjectURL(a.href);
   toast(rows.length + ' rows exported.');
+}
+
+/* -------------------------------------------------- print a stray label
+ *
+ * A 4x6 that did not come from a Marketplace email: eBay, PirateShip, a
+ * carrier's own site, a return. `POST /api/print/label` takes the PDF
+ * and records nothing - there is no order for it to belong to, and
+ * inventing one would put a parcel that is not a sale into revenue and
+ * into the Sheet.
+ *
+ * The laptop is where these actually arrive - emailed by a buyer,
+ * downloaded from a seller's site - so this screen gets the affordances
+ * the phone cannot have: drag a file onto it, and see the page you are
+ * cropping from at a size where a wrong crop is obvious.
+ *
+ * Check-only is on by default, and that is not a nicety. This printer
+ * cannot report a failure, so a wrong crop costs a label and says
+ * nothing; a PDF from a seller nobody has printed before is exactly
+ * where a wrong crop comes from, and checking first is free.
+ */
+
+function viewSend() {
+  var pick = S.send;
+  var r = pick && pick.result;
+
+  var chooser =
+    '<div class="drop' + (pick ? ' drop--has' : '') + '" id="senddrop" ' +
+        'ondragover="sendOver(event, true)" ' +
+        'ondragleave="sendOver(event, false)" ondrop="sendDrop(event)">' +
+      '<h3>' + (pick ? esc(pick.name) : 'Drop a label PDF here') + '</h3>' +
+      '<p>' + (pick
+        ? 'Drop another to replace it.'
+        : 'Whatever the seller emailed, or a carrier’s own download. ' +
+          'Nothing about it is recorded — there is no order for it to ' +
+          'belong to.') + '</p>' +
+      '<input type="file" id="sendfile" accept="application/pdf,.pdf" ' +
+        'style="display:none" onchange="pickSendFile(this)">' +
+      '<button class="btn" style="margin-top:18px" ' +
+        'onclick="document.getElementById(\'sendfile\').click()">' +
+        (pick ? 'Choose another' : 'Choose a file') + '</button>' +
+    '</div>';
+
+  if (!pick) {
+    return '<div class="pane"><div class="wiz">' + sendHead() + chooser +
+      '</div></div>';
+  }
+
+  var turns = [['', 'Work it out'], ['0', '0°'], ['90', '90°'],
+               ['180', '180°'], ['270', '270°']];
+  var turnBtns = turns.map(function (t) {
+    return '<button class="pill' + (pick.rotate === t[0] ? ' pill--on' : '') +
+      '" onclick="sendOpt(\'rotate\', \'' + t[0] + '\')">' +
+      esc(t[1]) + '</button>';
+  }).join('');
+
+  var regions = '';
+  if (r && r.regions_found > 1) {
+    var buttons = '';
+    for (var i = 1; i <= r.regions_found; i++) {
+      var on = String(pick.region) === String(i) ||
+               (pick.region === '' && r.region === i);
+      buttons += '<button class="pill' + (on ? ' pill--on' : '') +
+        '" onclick="sendOpt(\'region\', \'' + i + '\')">' + i + '</button>';
+    }
+    regions = '<div class="sendrow"><span class="label">Which block</span>' +
+      '<span class="sendrow__opts">' + buttons + '</span></div>' +
+      '<p class="prose muted" style="font-size:12px;margin:0">This page has ' +
+      esc(r.regions_found) + ' things on it that could be the label. Check ' +
+      'each one before printing.</p>';
+  }
+
+  return '<div class="pane"><div class="send">' +
+    '<div class="send__left">' + sendHead() + chooser +
+      '<div class="card send__opts">' +
+        '<div class="sendrow"><span class="label">Check only</span>' +
+          '<span class="sendrow__opts">' +
+            '<button class="pill' + (pick.dry ? ' pill--on' : '') +
+              '" onclick="sendOpt(\'dry\', true)">On</button>' +
+            '<button class="pill' + (pick.dry ? '' : ' pill--on') +
+              '" onclick="sendOpt(\'dry\', false)">Off</button>' +
+          '</span></div>' +
+        '<div class="sendrow"><span class="label">Turn</span>' +
+          '<span class="sendrow__opts">' + turnBtns + '</span></div>' +
+        '<div class="sendrow"><span class="label">Page</span>' +
+          '<span class="sendrow__opts">' +
+            '<button class="pill" onclick="sendOpt(\'page\', ' +
+              Math.max(1, (pick.page || 1) - 1) + ')">−</button>' +
+            '<b class="mono" style="padding:0 10px">' +
+              esc(pick.page || 1) + '</b>' +
+            '<button class="pill" onclick="sendOpt(\'page\', ' +
+              ((pick.page || 1) + 1) + ')">+</button>' +
+          '</span></div>' +
+        regions +
+      '</div>' +
+      /* Actions above the measurement, not below it. The thing this
+         screen exists to do is print; the size and the rotation are
+         reference, and reference under the button is how the add-item
+         and order screens both ended up with their primary action below
+         a fold. */
+      '<div style="display:flex;gap:11px;margin-top:18px">' +
+        '<button class="btn ' + (pick.dry ? 'btn--primary' : 'btn--alarm') +
+          '" style="flex:1" onclick="doSendLabel()"' +
+          (pick.busy ? ' disabled' : '') + '>' +
+          (pick.busy ? 'Working…'
+                     : (pick.dry ? 'Check the crop' : 'Print it')) +
+          '</button>' +
+        '<button class="btn btn--quiet" onclick="clearSend()">Clear</button>' +
+      '</div>' +
+      sendAnswer(pick, r) +
+    '</div>' +
+    '<div class="send__right">' +
+      '<div class="label">The file you chose</div>' +
+      (S.sendUrl
+        ? '<embed src="' + esc(S.sendUrl) + '" type="application/pdf">'
+        : '<div class="send__blank"></div>') +
+      '<p class="prose muted" style="font-size:11.5px;margin:0">This is ' +
+        'the page going in, not the 4×6 coming out. What will print is ' +
+        'the measurement on the left.</p>' +
+    '</div>' +
+  '</div></div>';
+}
+
+function sendHead() {
+  return '<div class="eyebrow">Not a Marketplace order</div>' +
+    '<h1 class="display display--lg" style="margin-bottom:20px">' +
+      'Print a label</h1>';
+}
+
+function sendAnswer(pick, r) {
+  if (pick.error) {
+    /* The server's sentence, not a status code. "This may not be a
+       shipping label" and "say which with region" are the whole point of
+       the message - only the person holding the file can act on either,
+       and neither survives being turned into "failed". */
+    return '<div class="err" style="margin:16px 0 0">' +
+      esc(pick.error) + '</div>';
+  }
+  if (!r) {
+    return '<p class="prose muted" style="margin-top:14px;font-size:13px">' +
+      'Nothing measured yet. <b>Check only</b> converts it and reports ' +
+      'what it found without opening the printer.</p>';
+  }
+  var rows =
+    cell('Size', r.size_in[0] + ' × ' + r.size_in[1] + ' in') +
+    cell('Turned', r.rotation + '°', 'small') +
+    cell('Page', r.page, 'small');
+  var note = '';
+  if (r.rotation_source === 'aspect') {
+    note = '<p class="prose muted" style="font-size:12px;margin:10px 0 0">' +
+      'There is no text on this label to read an orientation from, so ' +
+      'that is its shape talking. It knows the label is on its side and ' +
+      'not which way up — look at it, and use <b>Turn</b> if it is ' +
+      'upside down.</p>';
+  } else if (r.rotation_source === 'forced') {
+    note = '<p class="prose muted" style="font-size:12px;margin:10px 0 0">' +
+      'You chose that turn.</p>';
+  } else {
+    note = '<p class="prose muted" style="font-size:12px;margin:10px 0 0">' +
+      'Read off the text on the label.</p>';
+  }
+  if (r.dry_run) {
+    note += '<p class="prose muted" style="font-size:12px;margin:8px 0 0">' +
+      'Nothing printed and no stock used. Turn <b>Check only</b> off when ' +
+      'it looks right.</p>';
+  } else {
+    note += '<p class="prose muted" style="font-size:12px;margin:8px 0 0">' +
+      'Job <span class="mono">' + esc(r.job) + '</span>, recorded in ' +
+      esc(r.recorded) + '.</p>';
+  }
+  return '<div class="stats" style="margin-top:14px;max-width:none">' +
+    rows + '</div>' + note;
+}
+
+function pickSendFile(input) {
+  var f = input.files && input.files[0];
+  if (f) takeSendFile(f);
+}
+
+function sendOver(ev, on) {
+  ev.preventDefault();
+  var el = document.getElementById('senddrop');
+  if (el) el.classList.toggle('drop--over', on);
+}
+
+function sendDrop(ev) {
+  ev.preventDefault();
+  sendOver(ev, false);
+  var files = ev.dataTransfer && ev.dataTransfer.files;
+  if (files && files.length) takeSendFile(files[0]);
+}
+
+function takeSendFile(f) {
+  releaseSend();
+  S.send = { name: f.name, file: f, dry: true, rotate: '', page: 1,
+             region: '', result: null, error: '', busy: false };
+  S.sendUrl = URL.createObjectURL(f);
+  renderMain();
+}
+
+function clearSend() {
+  releaseSend();
+  S.send = null;
+  renderMain();
+}
+
+function releaseSend() {
+  if (S.sendUrl) { URL.revokeObjectURL(S.sendUrl); S.sendUrl = null; }
+}
+
+function sendOpt(key, value) {
+  if (!S.send) return;
+  S.send[key] = value;
+  /* Any option changes what the answer would be, so the old one stops
+     being about this. Showing a stale crop beside a changed rotation is
+     how somebody prints the thing they were just told not to. */
+  S.send.result = null;
+  S.send.error = '';
+  renderMain();
+}
+
+function doSendLabel() {
+  var pick = S.send;
+  if (!pick || !pick.file || pick.busy) return;
+  if (pick.dry) return runSendLabel();
+  /* Spending stock asks first, like printing a parcel does. The phone
+     holds a button; a mouse makes that awkward. */
+  ask('Print ' + clip(pick.name, 40) + '?',
+      'One 4×6 goes to the printer and nothing about it is recorded — ' +
+      'there is no order for it to belong to. It cannot report back, so ' +
+      'if nothing comes out the paper is the only thing that knows.',
+      'Print', runSendLabel);
+}
+
+function runSendLabel() {
+  var pick = S.send;
+  if (!pick || !pick.file) return;
+  pick.busy = true;
+  pick.error = '';
+  renderMain();
+
+  var q = [];
+  if (pick.rotate !== '') q.push('rotate=' + pick.rotate);
+  if (pick.page > 1) q.push('page=' + pick.page);
+  if (pick.region !== '') q.push('region=' + pick.region);
+  if (pick.dry) q.push('dry_run=1');
+
+  (async function () {
+    try {
+      var body = await pick.file.arrayBuffer();
+      var d = await api('/api/print/label' + (q.length ? '?' + q.join('&') : ''),
+                        { method: 'POST', raw: body,
+                          type: 'application/pdf' });
+      pick.result = d.label;
+      if (!pick.dry) toast('Sent ' + pick.name + ' to the printer.');
+    } catch (e) {
+      if (e.message !== '401') pick.error = e.message;
+    }
+    pick.busy = false;
+    renderMain();
+  })();
 }
 
 /* -------------------------------------------------------------- writer */

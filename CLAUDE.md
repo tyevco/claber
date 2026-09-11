@@ -246,7 +246,9 @@ src/mplabel/
                              the phone: portrait, thumb-reachable, no media query
                  desk.html + desk.js + desk.css
                              the laptop portal at /desk: sidebar, master/detail,
-                             a table dense enough to bulk-edit
+                             a table dense enough to bulk-edit, and the
+                             stray-label screen the laptop is the right
+                             place for
 
 tests/test_mplabel.py     the whole Python suite, one file
 tests/fixtures/           synthetic stand-ins; make_label.py regenerates the PDF.
@@ -1520,6 +1522,16 @@ list endpoint does not carry photos and only the selected draft's are
 loaded. It shows titles only now. The same stripe on the inventory table
 is correct, because nothing there has photographs loaded either way.
 
+**Reference under the action, a third time.** The add-item screen put
+two AI panels between the form and its save button; the order screen put
+the label and the corrections between the order and its print button.
+The desk's stray-label screen then put the measured size and rotation
+between the options and **Print it**, which pushed the primary action to
+the fold on an 800px-tall window. The measurement is reference and
+printing is what the screen is for, so the buttons sit directly under
+the options and the numbers go below them. Three times now; assume the
+next new screen will get it wrong too and check by looking at it.
+
 **`.pane--col` and `.pane--flush` need `flex: 1` like `.pane` does.**
 Without it a screen shorter than the window stops where its content
 stops and the sidebar runs on past it. The tall screens hid this
@@ -1922,8 +1934,16 @@ Three things about it are worth keeping here rather than rediscovering:
 - **The palette and the helpers are shared, not copied.** `tokens.css`
   and `common.js` are loaded by both shells. `esc()` in two files is one
   that gets fixed in one of them.
+- **Printing a stray label is on the desk too**, and the laptop is where
+  those PDFs actually arrive - emailed by a buyer, downloaded from a
+  carrier. Same `POST /api/print/label`, same rules: check-only is on
+  when a file is chosen, and the real print asks first because a mouse
+  makes press-and-hold awkward. What the bigger screen adds is the page
+  itself beside the measurement, labelled as the file going **in** rather
+  than the 4x6 coming out - the crop is still what the numbers describe,
+  and a picture of the input must not be read as a preview of the output.
 - **What it does not do**: no scanning (the phone has the camera), no
-  printing beyond the two routes the queue already calls, no offline.
+  offline.
 
 What is left is a laptop, a real database and the tunnel. Everything so
 far is a seeded server on the machine the code was written on.
