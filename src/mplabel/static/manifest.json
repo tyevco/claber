@@ -2,7 +2,7 @@
   "name": "mplabel",
   "short_name": "mplabel",
   "description": "The Marketplace parcel queue",
-  "start_url": "/",
+  "start_url": "/?ui=phone",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait",

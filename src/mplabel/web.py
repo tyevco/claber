@@ -235,6 +235,45 @@ SHELLS = ("index.html", "desk.html")
 # containment check as everything else under `static/`.
 SHELL_ALIASES = {"": "index.html", "desk": "desk.html", "desk/": "desk.html"}
 
+# Which front end a browser gets at `/`, when nobody has said.
+#
+# **"Request Desktop Site" is not a separate thing to honour.** That
+# button works by rewriting the User-Agent: iOS Safari starts sending a
+# macOS one, and Android Chrome drops its `Mobi` token. So a sniff that
+# looks at those tokens respects the button for free, and a sniff that
+# looks at anything else (screen size guesses, a vendor header) actively
+# fights it. This list is short on purpose for that reason - it is
+# exactly the set of tokens the button manipulates.
+#
+# `ipad` is in it for iPadOS 12 and earlier. From 13 on, Safari on an
+# iPad reports itself as a Mac and there is nothing in the request that
+# says otherwise, so an iPad gets the desk. That is a real limitation
+# rather than an oversight: the preference cookie below is the answer,
+# and the phone app's manifest pins itself so an installed copy can
+# never be redirected away.
+MOBILE_TOKENS = ("iphone", "ipod", "ipad", "android", "mobi")
+
+# Set by `?ui=phone` / `?ui=desk`, and it beats the sniff. Every
+# auto-route needs a way to say "no, this one" that survives the next
+# visit, or the answer to guessing wrong is to stop using the thing.
+UI_COOKIE = "mplabel_ui"
+UI_CHOICES = ("phone", "desk")
+
+
+def prefers_desk(user_agent, sec_ch_ua_mobile=None):
+    """Would this browser rather have the desk portal?
+
+    `Sec-CH-UA-Mobile` first where it exists. It is the designed
+    replacement for reading the UA string, Chrome and Edge send it
+    unasked, and it flips with "Request Desktop Site" like everything
+    else does. Safari does not send it, which is what the token list is
+    for."""
+    hint = (sec_ch_ua_mobile or "").strip()
+    if hint in ("?0", "?1"):
+        return hint == "?0"
+    ua = (user_agent or "").lower()
+    return not any(token in ua for token in MOBILE_TOKENS)
+
 
 def safe_static_path(rel):
     """Resolve `rel` under STATIC, or None if it escapes.
@@ -430,6 +469,7 @@ class Handler(BaseHTTPRequestHandler):
         # A label from anywhere else. No order behind it and no row after
         # it - see h_print_label.
         ("POST", r"^/api/print/label$", "h_print_label", True),
+        ("POST", r"^/api/label/preview$", "h_label_preview", True),
         # The sourcing half. Cost basis enters the system here, which is
         # why every margin in the analytics is null until it does.
         ("GET", r"^/api/trips$", "h_trips", True),
@@ -593,6 +633,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.fail(400, "missing X-Mplabel header")
                 return getattr(self, name)(**match.groupdict())
             if method == "GET":
+                routed = self.route_shell(path)
+                if routed is not None:
+                    return routed
                 return self.serve_static(path)
             self.fail(404, "no such endpoint")
         except PrintError as exc:
@@ -1575,6 +1618,65 @@ class Handler(BaseHTTPRequestHandler):
                 failed.append({"id": row["id"], "error": str(exc)})
         self.json({"printed": printed, "failed": failed})
 
+    def _label_upload(self):
+        """The PDF and the crop options off one request. Shared by the
+        print route and the preview, so a preview cannot be measuring a
+        different page or a different block than the print would."""
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        if ctype.lower() not in ("application/pdf", "application/x-pdf"):
+            raise ValueError(
+                f"a label must be application/pdf - got {ctype or 'nothing'}")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ValueError("no PDF in the body")
+        if length > MAX_LABEL:
+            raise ValueError(
+                f"that PDF is {length // 1024}kB, over the "
+                f"{MAX_LABEL // 1024 // 1024}MB limit for a label")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("the upload was cut short")
+        if not raw.startswith(b"%PDF"):
+            raise ValueError("that file is not a PDF")
+
+        qs = parse_qs(urlparse(self.path).query)
+
+        def one(name):
+            return (qs.get(name) or [None])[0]
+
+        rotate = one("rotate")
+        if rotate is not None:
+            rotate = int(rotate)
+            if rotate not in (0, 90, 180, 270):
+                raise ValueError("rotate must be 0, 90, 180 or 270")
+        region = one("region")
+        return raw, {
+            "page_index": int(one("page") or 1) - 1,
+            "force_rotation": rotate,
+            "region": int(region) if region else None,
+        }, one
+
+    def h_label_preview(self):
+        """The page with the crop drawn on it, as a PNG.
+
+        The outline comes from `label.crop_box` - the same call the print
+        path makes - so it cannot show a rectangle the printer will not
+        use. That is the rule the marker band already follows: a crop and
+        the drawing of it come from one function, because a box computed
+        twice is a picture that agrees with nothing.
+
+        A picture rather than coordinates for a browser to plot, for the
+        same reason. Handing out numbers invites a second implementation
+        of where the crop is, and the one that is wrong would be the one
+        she is looking at."""
+        raw, opts, _one = self._label_upload()
+        with tempfile.TemporaryDirectory(prefix="mplabel_prev_") as tmpdir:
+            src = Path(tmpdir) / "in.pdf"
+            src.write_bytes(raw)
+            png, _info = label.preview_png(src, **opts)
+        self._send(200, png, ctype="image/png",
+                   extra_headers=[("Cache-Control", "no-store")])
+
     def h_print_label(self):
         """Print a 4x6 label this system has never seen before.
 
@@ -1606,37 +1708,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         from . import cli as cli_mod
 
-        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
-        if ctype.lower() not in ("application/pdf", "application/x-pdf"):
-            raise ValueError(
-                f"a label must be application/pdf - got {ctype or 'nothing'}")
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            raise ValueError("no PDF in the body")
-        if length > MAX_LABEL:
-            raise ValueError(
-                f"that PDF is {length // 1024}kB, over the "
-                f"{MAX_LABEL // 1024 // 1024}MB limit for a label")
-        raw = self.rfile.read(length)
-        if len(raw) != length:
-            raise ValueError("the upload was cut short")
-        if not raw.startswith(b"%PDF"):
-            raise ValueError("that file is not a PDF")
-
-        qs = parse_qs(urlparse(self.path).query)
-
-        def one(name):
-            v = (qs.get(name) or [None])[0]
-            return v
-
-        rotate = one("rotate")
-        if rotate is not None:
-            rotate = int(rotate)
-            if rotate not in (0, 90, 180, 270):
-                raise ValueError("rotate must be 0, 90, 180 or 270")
-        page = int(one("page") or 1)
-        region = one("region")
-        region = int(region) if region else None
+        raw, opts, one = self._label_upload()
         dry = str(one("dry_run") or "").lower() in ("1", "yes", "true")
         force = str(one("force") or "").lower() in ("1", "yes", "true")
 
@@ -1660,8 +1732,7 @@ class Handler(BaseHTTPRequestHandler):
             # sentence in it. That sentence is the whole feature when a
             # crop cannot be resolved: "this may not be a shipping label"
             # is actionable and "bad request" is not.
-            info = label.to_4x6(src, out, page_index=page - 1,
-                                force_rotation=rotate, region=region)
+            info = label.to_4x6(src, out, **opts)
             info["job"] = job
             info["sha256"] = digest
             info["bytes"] = len(raw)
@@ -1688,6 +1759,88 @@ class Handler(BaseHTTPRequestHandler):
             log.info("printed ad-hoc label %s (%d bytes, %s)",
                      job, len(raw), info["size_in"])
             return self.json({"ok": True, "label": info})
+
+    def route_shell(self, path):
+        """Send a browser to the front end built for it, once.
+
+        Returns None when this request is not about an entry point, so
+        every asset, every API route and every deep link falls straight
+        through. Only `/` and `/desk` are decided here.
+
+        Three rules, in order, and the order is the whole design:
+
+          1. `?ui=phone` / `?ui=desk` is a person saying which. It is
+             remembered in a cookie and it wins from then on.
+          2. The cookie, if there is one.
+          3. The request's own account of itself.
+
+        Without 1 and 2 the link each shell carries to the other is a
+        button that bounces you back where you came from - click "the
+        phone app" on a laptop, get redirected to the desk, forever. The
+        two links carry `?ui=`, which is what makes them work at all.
+        """
+        if path not in ("/", "/desk", "/desk/"):
+            return None
+        from . import cli as cli_mod
+        if not cli_mod.truthy(self.cfg.get("web_auto_route", "yes")):
+            return None
+        # Only a navigation gets routed. Every browser asks for
+        # `text/html` when following a link or typing an address, and
+        # nothing else does - so curl, a health check and anything
+        # scripted keep getting the same answer at `/` they always got,
+        # rather than a 302 they have to be taught to follow.
+        if "text/html" not in (self.headers.get("Accept") or ""):
+            return None
+
+        here = "desk" if path.startswith("/desk") else "phone"
+        asked = (parse_qs(urlparse(self.path).query).get("ui") or [None])[0]
+
+        if asked in UI_CHOICES:
+            # Remember it, then put her where she asked to be. Redirect
+            # even when she is already there, so the `?ui=` comes off the
+            # address bar and a later refresh is not a second vote.
+            target = "/desk" if asked == "desk" else "/"
+            return self._send(302, b"", ctype="text/plain", extra_headers=[
+                ("Location", target),
+                ("Set-Cookie", self._ui_cookie(asked)),
+                ("Cache-Control", "no-store")])
+
+        cookie = SimpleCookie(self.headers.get("Cookie") or "")
+        morsel = cookie.get(UI_COOKIE)
+        want = morsel.value if morsel and morsel.value in UI_CHOICES else None
+        if want is None:
+            want = "desk" if prefers_desk(
+                self.headers.get("User-Agent"),
+                self.headers.get("Sec-CH-UA-Mobile")) else "phone"
+        if want == here:
+            return None
+
+        # Vary, because this is one URL answering two ways off a header
+        # and a cookie, and the intended deployment has Cloudflare in
+        # front of it. `no-store` should already stop anything caching a
+        # redirect; saying which inputs it turns on costs nothing and the
+        # failure it prevents is her phone being handed the laptop's
+        # answer out of a cache she cannot see.
+        return self._send(302, b"", ctype="text/plain", extra_headers=[
+            ("Location", "/desk" if want == "desk" else "/"),
+            ("Cache-Control", "no-store"),
+            ("Vary", "User-Agent, Sec-CH-UA-Mobile, Cookie")])
+
+    def _ui_cookie(self, choice):
+        """A year, and not HttpOnly.
+
+        This is a display preference, not a credential: nothing can be
+        done with it, and letting the page read it is what would make a
+        client-side switch possible later. `Secure` follows the session
+        cookie's rule rather than inventing a second one."""
+        bits = [f"{UI_COOKIE}={choice}", "Path=/", "SameSite=Lax",
+                "Max-Age=31536000"]
+        secure = str(self.cfg.get("web_secure_cookie", "auto")).lower()
+        if secure in ("1", "yes", "true", "on") or (
+                secure == "auto"
+                and self.headers.get("X-Forwarded-Proto") == "https"):
+            bits.append("Secure")
+        return "; ".join(bits)
 
     def serve_static(self, path):
         target = safe_static_path(path)

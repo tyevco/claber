@@ -464,6 +464,12 @@ function settingsView() {
           '<button class="item" onclick="go(\'sendlabel\')">' +
             '<span>Print a label</span>' +
             '<span class="val">any 4x6 PDF →</span></button>' +
+          /* The way back out. Without it the desk's own "phone app"
+             link is a one-way door on a laptop: it pins the preference
+             to the phone and nothing here would un-pin it. */
+          '<a class="item" href="/desk?ui=desk">' +
+            '<span>The desk version</span>' +
+            '<span class="val">for a laptop →</span></a>' +
           '<button class="item" onclick="logout()">' +
             '<span>Sign out</span><span class="val">→</span></button>' +
         '</div>' +

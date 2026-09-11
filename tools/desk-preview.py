@@ -84,8 +84,15 @@ STOCK = [
 # local pickup with no tracking - the states the screen exists to tell
 # apart, rather than five rows of the same parcel.
 PARCELS = [
-    ("Harbor at dusk, 24x18, gilt frame", "Ellis Navarro", 215.0, 0, True,
-     "9405 5118 9922 3197 4284 90", "4 lb 6 oz"),
+    # Long on purpose. Her real titles run past a hundred characters and
+    # share their opening, and a queue row drawn against a forty-character
+    # invention looks fine right up until it meets one of these.
+    ("Original 1944 WWII Army Air Forces Officer Candidate School "
+     "Panoramic Photograph Miami Beach Florida", "Ellis Navarro", 215.0,
+     0, True, "9405 5118 9922 3197 4284 90", "4 lb 6 oz"),
+    ("Vintage Japanese 1980s Black Otagiri “Crown Iris” lacquer "
+     "music box, working", "Bhavneet Chaudhary", 28.0, -2, False,
+     None, "2 lb 4 oz"),
     ("Still life with pears, chip at corner", "Moses Okafor", 140.0, 0, False,
      None, "3 lb 1 oz"),
     ("Mid-century brass floor lamp, rewired", "Dana Haas", 95.0, 1, True,

@@ -233,7 +233,9 @@ def find_label(pdf_path, page_index=0, region=None):
         if _fits(whole[2] - whole[0], whole[3] - whole[1]):
             rot, source = _rotation(chars, whole)
             return whole, rot, page_size, {
-                "regions_found": 1, "region": 1, "rotation_source": source}
+                "regions_found": 1, "region": 1, "rotation_source": source,
+                "candidates": [tuple(round(v, 1)
+                                     for v in _to_pdf_space(whole, page_size))]}
 
         found = []
         for block in _carve(objs, MIN_GUTTER):
@@ -277,7 +279,15 @@ def find_label(pdf_path, page_index=0, region=None):
         rot, source = _rotation(inside, ext)
         return ext, rot, page_size, {
             "regions_found": len(found), "region": pick + 1,
-            "rotation_source": source}
+            "rotation_source": source,
+            # Every block that could have been the label, in PDF space.
+            # The count alone says a page was ambiguous; these say which
+            # part of it was taken and which was left, which is the
+            # question on a sheet carrying a packing slip.
+            "candidates": [
+                tuple(round(v, 1)
+                      for v in _to_pdf_space(e, page_size))
+                for _a, e in found]}
 
 
 def _snap(bbox, rot, page_size):
@@ -330,6 +340,26 @@ def _unrotate(box, source_rot, page_size):
     return (y0, pw - x1, y1, pw - x0)
 
 
+def crop_box(src, page_index=0, force_rotation=None, region=None):
+    """Where the 4 x 6 is coming from, without writing anything.
+
+    Pulled out of `to_4x6` so that the preview can draw the same
+    rectangle this crops to, rather than a second one computed from the
+    same inputs by different arithmetic. The marker went through exactly
+    this: `_marker_band` and `marker_box` are paired for the same reason,
+    because a box drawn from one calculation and read with another is a
+    picture that agrees with nothing.
+
+    Returns (box, ink_bbox, rot, page_size, info), boxes in PDF space."""
+    extent, detected_rot, page_size, info = find_label(src, page_index,
+                                                       region=region)
+    rot = force_rotation if force_rotation is not None else detected_rot
+    if force_rotation is not None:
+        info["rotation_source"] = "forced"
+    bbox = _to_pdf_space(extent, page_size)
+    return _snap(bbox, rot, page_size), bbox, rot, page_size, info
+
+
 def to_4x6(src, dst, page_index=0, force_rotation=None, region=None):
     """Write a 4 x 6 in, upright version of src to dst.
 
@@ -340,13 +370,8 @@ def to_4x6(src, dst, page_index=0, force_rotation=None, region=None):
     and a plausible-looking one is worse than an error.
 
     Returns a dict describing what was done, for logging."""
-    extent, detected_rot, page_size, info = find_label(src, page_index,
-                                                       region=region)
-    rot = force_rotation if force_rotation is not None else detected_rot
-    if force_rotation is not None:
-        info["rotation_source"] = "forced"
-    bbox = _to_pdf_space(extent, page_size)
-    box = _snap(bbox, rot, page_size)
+    box, bbox, rot, page_size, info = crop_box(
+        src, page_index, force_rotation, region)
 
     reader = PdfReader(src)
     page = reader.pages[page_index]
@@ -372,13 +397,91 @@ def to_4x6(src, dst, page_index=0, force_rotation=None, region=None):
     w, h = box[2] - box[0], box[3] - box[1]
     if rot in (90, 270):
         w, h = h, w
+    # Where the other candidate blocks were is how the preview draws what
+    # it did *not* take. It is a detail of detection, not something a
+    # print is about, so it does not ride along in every print response.
+    info.pop("candidates", None)
     info.update({"rotation": rot,
                  "page": page_index + 1,
                  "source_rotation": source_rot,
                  "ink_bbox": tuple(round(v, 1) for v in bbox),
                  "crop_bbox": tuple(round(v, 1) for v in box),
+                 # The page the crop came off, so a client can say where
+                 # on it the 4x6 is without guessing the paper size.
+                 "page_size": tuple(round(v, 1) for v in page_size),
                  "size_in": (round(w / PT_PER_IN, 3), round(h / PT_PER_IN, 3))})
     return info
+
+
+# What the outline is drawn in. The accent green for the crop that is
+# actually going to print, and a muted red for a block that was
+# considered and not chosen - which is the whole question on a page that
+# carries a packing slip beside the label.
+PREVIEW_TAKEN = (62, 154, 70)
+PREVIEW_PASSED = (173, 42, 27)
+
+
+def preview_png(src, page_index=0, force_rotation=None, region=None,
+                width=900):
+    """The source page, with the crop that will print drawn on it.
+
+    The rectangle comes from `crop_box` - the same call `to_4x6` makes -
+    so this cannot show a box the printer will not use. Drawing it here
+    rather than handing coordinates to a browser is the same decision:
+    one function owns where the crop is, and the picture is made from
+    that rather than from a second opinion about it.
+
+    Rejected candidates are outlined too, faintly. On a sheet that
+    carries a packing slip next to the label, "did it take the right
+    block" is the only question worth asking, and a count cannot answer
+    it."""
+    import pypdfium2 as pdfium
+    from PIL import Image, ImageDraw
+
+    box, _bbox, _rot, page_size, info = crop_box(
+        src, page_index, force_rotation, region)
+
+    doc = pdfium.PdfDocument(str(src))
+    try:
+        page = doc[page_index]
+        scale = max(0.2, min(4.0, width / float(page_size[0] or width)))
+        pil = page.render(scale=scale).to_pil().convert("RGB")
+    finally:
+        doc.close()
+
+    pw, ph = page_size
+    sx = pil.width / float(pw)
+    sy = pil.height / float(ph)
+
+    def to_pixels(b):
+        # PDF space is bottom-up and an image is top-down, so y flips.
+        x0, y0, x1, y1 = b
+        return [round(x0 * sx), round((ph - y1) * sy),
+                round(x1 * sx), round((ph - y0) * sy)]
+
+    taken = to_pixels(box)
+
+    # Dim everything that is not going to print. An outline alone leaves
+    # "which side of this line survives" to be worked out; darkening the
+    # rest answers it before it is asked, which is the whole job of a
+    # preview on a page that is mostly not the label.
+    shade = Image.new("RGBA", pil.size, (10, 8, 5, 130))
+    ImageDraw.Draw(shade).rectangle(taken, fill=(0, 0, 0, 0))
+    pil = Image.alpha_composite(pil.convert("RGBA"), shade).convert("RGB")
+
+    draw = ImageDraw.Draw(pil)
+    # After the shading, so a rejected block stays visible through it -
+    # it is the thing she is being asked to rule out.
+    for other in info.get("candidates") or []:
+        if other == tuple(round(v, 1) for v in box):
+            continue
+        draw.rectangle(to_pixels(other), outline=PREVIEW_PASSED, width=2)
+    draw.rectangle(taken, outline=PREVIEW_TAKEN,
+                   width=max(4, round(pil.width / 150)))
+
+    out = io.BytesIO()
+    pil.save(out, format="PNG", optimize=True)
+    return out.getvalue(), info
 
 
 def _code_placement(mediabox, rot, code, size, margin):
