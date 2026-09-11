@@ -313,6 +313,42 @@ struct MPNote: View {
     }
 }
 
+/// One of a short row of choices, with the chosen one lit.
+///
+/// Not `FlowChips`, which is for *suggestions* - it carries a plus and
+/// means "add this", where these are exclusive and one is always on.
+/// Not `Picker` either: the options here are two or three characters
+/// wide and a wheel or a menu hides the alternatives behind a tap, which
+/// is exactly wrong for a choice whose whole job is to be reconsidered
+/// after looking at the answer below it.
+struct MPPills: View {
+    let titles: [String]
+    let selected: String
+    let choose: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: MP.S.x2) {
+            ForEach(titles, id: \.self) { title in
+                let on = title == selected
+                Button { choose(title) } label: {
+                    Text(title)
+                        .font(.system(size: 13,
+                                      weight: on ? .semibold : .regular))
+                        .foregroundStyle(on ? MP.Palette.accentInk
+                                            : MP.Palette.muted)
+                        .padding(.horizontal, MP.S.x3)
+                        .padding(.vertical, MP.S.x2)
+                        .background(on ? MP.Palette.accent : MP.Palette.sunken,
+                                    in: RoundedRectangle(cornerRadius: MP.R.chip))
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(on ? [.isSelected] : [])
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
 /// Chips that wrap onto as many lines as they need.
 ///
 /// A horizontal `ScrollView` was the obvious thing and is wrong for

@@ -201,6 +201,13 @@ web_session_days = 30
 # auto = Secure only when X-Forwarded-Proto says https, which is right
 # behind a Cloudflare tunnel and wrong on plain loopback.
 web_secure_cookie = auto
+# Where `mplabel send` posts a label from another machine - the same
+# address the phone app uses. This one belongs in the *workstation's*
+# config, not the Pi's: the Pi has no reason to send a label to itself.
+#   mplabel send label.pdf --dry-run     crop it and measure, print nothing
+#   mplabel send label.pdf               print it
+# The token it gets back is kept in ~/.config/mplabel.token, not here.
+web_url         =
 
 # ------------------------------------------------------------ notifications
 

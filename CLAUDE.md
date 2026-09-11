@@ -30,6 +30,9 @@ pytest tests/test_mplabel.py::test_output_is_exactly_4x6   # one test
 pytest -k tspl                             # printer-language regressions
 python -m mplabel --help
 python -m mplabel file tests/fixtures/label_sample.pdf   # no config needed
+
+python tools/desk-preview.py       # a seeded server; prints a URL and a
+                                   # password. Open /desk and look at it
 ```
 
 The iOS client is a second gate, on a Mac with Xcode:
@@ -100,7 +103,8 @@ run against a real database.
 
 | Prints | |
 |---|---|
-| `file <pdf> [-o] [--rotate] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
+| `file <pdf> [-o] [--rotate] [--page N] [--region N] [--print] [--code NNN]` | convert one PDF. Needs no config and no DB |
+| `send <pdf> [--url] [--rotate] [--page N] [--region N] [--dry-run] [--force]` | send a PDF to the Pi to be printed, from a workstation. Records nothing but printd's journal. No DB |
 | `probe` | printers, USB devices, IEEE-1284 id |
 | `selftest` | tiny text-only TSPL label |
 | `inventory-label --code X [--qr\|--marker] [--size WxH[in]] [--preview PNG]` | draw one inventory label and show what the label maker would burn. `--size 4x1in` for a shelf label. No DB |
@@ -214,7 +218,8 @@ version in `pyproject.toml` never moving.
 src/mplabel/
   cli.py         argparse entrypoint, config, SQLite schema, poll loop
   mailparse.py   Marketplace email -> dict. stdlib HTMLParser, no bs4
-  label.py       letter-size PDF -> exact 4x6, + label-only field extraction
+  label.py       any label PDF -> exact 4x6, upright: finds the label on
+                 the page, works out which way up, + field extraction
   printers.py    TSPL/ZPL raw backends, CUPS backends, rasteriser, probe
   listings.py    listings schema, subject classification, analytics views
   backfill.py    one-off mailbox survey and historical import
@@ -228,20 +233,28 @@ src/mplabel/
   sheets.py      Google Sheets sync via service account
   supvan.py      T50M Pro label maker: HID transport, frames, status
   lzma1.py       LZMA1 encoder, match coded, no end-of-stream marker
-  web.py         the phone app's server: stdlib http.server, scrypt +
-                 signed tokens, the PWA and the /api/v1 surface
+  web.py         both front ends' server: stdlib http.server, scrypt +
+                 signed tokens, the PWA, the desk portal and /api/v1
   printd.py      the print side of the split: /print, /print-tag,
                  /printed, HMAC, spool, durable journal
   build.py       what code is actually running - install_pi.sh writes
                  _build.py beside it, so a checkout says "checkout"
-  static/        the PWA: index.html, app.js, app.css, manifest, icons,
-                 and marker.js - the marker decoder, a port of marker.py
+  static/        two front ends and what they share.
+                 tokens.css  the palette and the type stacks, both
+                 common.js   esc/api/money/due/split, both
+                 index.html + app.js + app.css + manifest + icons + marker.js
+                             the phone: portrait, thumb-reachable, no media query
+                 desk.html + desk.js + desk.css
+                             the laptop portal at /desk: sidebar, master/detail,
+                             a table dense enough to bulk-edit
 
 tests/test_mplabel.py     the whole Python suite, one file
 tests/fixtures/           synthetic stand-ins; make_label.py regenerates the PDF.
                           goodwill_won.eml / goodwill_payment.eml are
                           rebuilt by hand from real mail, invented names
 tests/make_ios_fixtures.py  captures real server payloads for the Swift tests
+tools/desk-preview.py     a seeded throwaway server, so the desk can be
+                          looked at. Same argument as ios/screenshots.sh
 ios/                      the native client; see ios/README.md and
                           docs/ios-handoff.md for what the Windows box
                           could not verify
@@ -323,6 +336,35 @@ the REFERENCES clause and
 compares the two directly. SQLite cannot add a constraint to an existing
 column without rebuilding the table, so a database that already migrated
 keeps the loose one.
+
+**A draft is a state, and one `WHERE` keeps it out of the numbers.**
+`listings.state` gained `draft` - photographed and costed, never written
+up - for the desk's writer screen. The risk is sell-through: every view
+is built on `v_listing_perf`, which selected every row, so a draft would
+have entered the denominator and dragged the percentage down exactly the
+way her own purchases would. The filter is `WHERE state != 'draft'` on
+that one view, so `v_price_band`, `v_monthly`, `v_aging` and
+`sheets.TABS` become right together rather than needing three edits.
+`upsert_listing`'s rank map gets `draft: -1`, so nothing inferred from an
+email can ever demote a real listing back to one.
+
+**`description` is not `notes`.** `notes` is the scribble field -
+"handle is loose", "buyer asked about the maker". `description` is the
+listing copy that gets pasted into Marketplace. One column for both means
+writing the copy silently eats a note, and they are read at completely
+different moments: the note when the thing is in her hand, the copy when
+it is being posted.
+
+**`listings.postage` exists so `kept` can be null instead of wrong.**
+The CSV wizard shows a Postage column, and postage lived only on `sales`
+- so committing would have displayed a figure and dropped it. The pair
+mirrors `sales` exactly, and `v_listing_perf` gained a **new** `kept`
+column rather than folding postage into `margin`: `COALESCE(postage, 0)`
+would read an unknown postage as free and report the whole price as kept,
+which is the failure the comments on `margin` and on `listings.kept` were
+both written about. `margin` is byte-identical to what it always was, and
+a test says so. Adding a view column is safe; renaming one breaks the
+sheet with no test failure.
 
 **`era` is free text, and that is the point.** Not a year and not a
 range of years: her titles say "Antique 1900-1915 American Edwardian",
@@ -502,6 +544,8 @@ hardware or a real Facebook account.
 | The on-device model | **Verified in the simulator, on real generations.** `FoundationModels` reports `available` and both halves run: the text draft (iOS 26) and the image path (iOS 27), which decoded straight into the `@Generable` type and correctly left `era` and `condition` **empty** on a picture it could not place. So the API, the guided decode and the availability handling are real rather than compiled. **Not** run on the phone, and the model there is the same size but not the same silicon. Nothing about the *quality* of a suggestion is verified - see the two findings below, both of which were measured rather than reasoned. |
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
 | **No email carries the postage charge** | **Verified from the real label email.** It is a *prepaid* label - Facebook pays the carrier and takes it out of the payout - so the one document this system reliably receives says what the parcel weighs and what service it went by, and not what it cost. A test pins that the fixture has no charge in it, because the temptation is to write a parser for a number that is not there. The payout email is the only plausible carrier and **none has ever been seen**, so whether one exists is still open: `mplabel scan` against the real mailbox is what settles it. Until then every figure is typed by a person, and `listings.estimate_postage` derives one only from parcels whose charge she actually confirmed - returning nothing at all when there is no basis, rather than a number that would be indistinguishable from a measured one a week later. |
+| Printing a label that is not a Marketplace one | **Verified on the hardware, on four real labels, over the tunnel.** Three FedEx Ground return labels and one eBay FedEx/USPS e-VS label went from a Windows workstation through `mplabel send` to the G4 and came out correctly. So the whole chain is real: login, the cached token, the upload, the crop, the orientation, and the print. Two things that had been reasoned about are now measured. **Three of the four carry no extractable text at all** - they are flattened images, exactly the case `rotation_source: aspect` exists for - and the shape-based orientation was **right on all three**. And the crop was right first time on both carriers' layouts, with every barcode complete. What is still **ASSUMED** is any *other* seller's layout, and in particular a page where the label shares the sheet with a packing slip: that path is unit-tested against a synthetic page and has never met a real one. `--dry-run` costs nothing and is still the thing to run first on a PDF from a new source. |
+| The desk portal | **Runs, and every screen has been looked at against seeded data in both themes.** Six screens at `/desk`, driven in headless Edge over CDP: the queue's confirm-and-print dialog, a bulk edit of three rows through `POST /api/inventory/bulk`, the search box keeping its caret, the CSV wizard through mapping and preview. That walk found five things the assertions did not - a figure that was really a `LIMIT`, a focus restore undone by a later render, a theme button that never changed its own label, an `era` column the endpoint had never sent, and a photo placeholder that lied about drafts with photographs. **Not** run against real data, and not on a real laptop over the tunnel - `tools/desk-preview.py` seeds a throwaway database and nothing here has met a real order. |
 | ShopGoodwill mail shapes | **Reconstructed from real mail, parser never run against a live mailbox.** Two real threads were read and the fixtures rebuilt by hand from them with invented names, so the field labels, the `<strong>Label:</strong> value` shape, the two sender hosts (`shopgoodwill.com` for a win, `txemail.shopgoodwill.com` for a payment) and every figure in the payment receipt are **verified against real mail**. What is **ASSUMED**: that a multi-item order lays its items out the way a single-item one does - every real order seen so far holds exactly one. `mplabel goodwill <eml> --write`-less is how to settle that against a real message before it writes anything. |
 | No auction mail carries a shipped/delivered notice | **ASSUMED.** Only the win and the payment receipt have been seen. If a dispatch mail exists it would give a real arrival date, which is the one thing the current pair cannot say - `scan` against the real mailbox is what settles it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
@@ -523,6 +567,44 @@ cropped to ink-plus-2pt margin, which is fine through CUPS but 824 dots
 wide at 203dpi — wider than the 812-dot print head. The overflow rows
 eject a second, near-blank label. `label._snap()` centres the ink in a
 nominal-size window instead. `test_output_is_exactly_4x6` guards this.
+
+**A label that is not a Marketplace one has to be *found* before it can
+be cropped.** `to_4x6` used to take the whole page's ink and snap it to
+4x6, which is exactly right when the label has the page to itself - and
+every Marketplace label does. Almost nothing else does: eBay, PirateShip
+and the carriers' own sites hand out a US Letter page with the label on
+the top half and a packing slip below it, and the ink then spans the
+sheet and is refused. `find_label` runs a recursive XY-cut over the ink
+when, and only when, the whole page does not already fit - so the one
+path with real labels behind it cannot be moved by a layout heuristic.
+
+Three things about it are load bearing. Two blocks that could both be
+the label are **refused** rather than guessed between, because printing
+the packing slip spends the stock either way and the person holding the
+file is the only one who can settle it (`--region`). A label with no
+extractable text - some carriers flatten theirs to one image - gets its
+orientation from its **shape**, which knows the label is on its side and
+cannot know which way up, so the answer carries `rotation_source` and
+the screens say "guessed from its shape" rather than presenting it as
+measured. That case is not the exotic one it sounds like: **three of the
+first four real labels put through this had no text on them at all**,
+and the shape was right on all three. It was right because they were
+already portrait and the answer was 0 - the guess that has never been
+tested is the one on a label lying on its side, where 90 and 270 are
+indistinguishable to it and `--rotate` is the only way through. And rotation is a **majority** of the characters rather than
+`chars[0]`: on a page with an upright slip above a rotated label, the
+first character in the content stream is a coin toss between the two.
+
+**A crop does not remove anything from the page.** It sets the boxes;
+the content stream keeps every object on the sheet. A rasteriser honours
+that - `render_bitmap` output is byte-identical with and without a
+packing slip below the label, which is what says the slip never reaches
+paper - but **pdfplumber does not**, and `extract_label_fields` anchors
+`ship_to` on the *last* CITY ST ZIP on the page. On a Marketplace label
+there is nothing else there, which is why this never mattered; on a
+shared page that last address is the slip's, and `ship_to` is the
+backstop against posting a parcel to a stranger. It reads through
+`page.within_bbox(page.bbox)` now.
 
 **Parse the label after rotation, not before.** `extract_text()` on the
 source PDF returns every line mirrored (`sIPA` for `USPS APIs`) because
@@ -673,6 +755,63 @@ returns and not before, `print_pi_http` deliberately does not retry, and
 its unreachable message says "may or may not have printed - ask it with
 GET /printed" rather than guessing. `mplabel reconcile` is the recovery
 path. Do not add a retry, and do not let a 409 read as a fresh print.
+
+**An ad-hoc label is not a sale, and nothing pretends otherwise.**
+`POST /api/print/label` takes a PDF nobody has seen before, crops it,
+prints it and writes **no row**: not `sales`, not `listings`, no file
+kept in `labels/`. There is no order for it to belong to, and inventing
+one would put a parcel nobody bought into revenue, into sell-through and
+into the Sheet. What records it is printd's journal - which is the only
+durable record this system has anyway, the G4 being write-only - and
+with `printer_backend` pointing straight at a device there is no journal
+at all. The answer says which, in those words, because a caveat that is
+false on this host is worse than no caveat.
+
+Two things follow. `label_belongs_to` has nothing to check against here,
+because there is no recorded recipient to compare the PDF with: the
+backstop is that a person chose the file a second ago, which is a
+weaker guarantee, and `--dry-run` exists so the crop can be checked
+without spending stock. And the job id is the **digest of the PDF**, so
+a request that timed out after the label came out gets a 409 from printd
+rather than a second label - she is on a phone behind a tunnel and the
+retry is the likely case, not the unusual one. Asking again on purpose
+is `--force`, which is a different intent and gets a different id. The
+id rides on the remote backend alone: a local device keeps no journal,
+so there is nothing there that could answer a duplicate.
+
+**An imported spreadsheet row is a listing, never a sale.** A `sales`
+row is the record of a Facebook order that produced a label email -
+keyed on a UNIQUE `message_id`, carrying a parcel code, a tracking
+number and an archived PDF - and a spreadsheet row has none of those.
+Inventing a `message_id` would put a fake email in the very table the
+poller de-duplicates against, and `sales.code` is worse: it is a live
+parcel handle recycled the moment a parcel ships, so a row about last
+November must never mint one. `listings` already has the right shape,
+and every view Month-end reads is built on it, which is the whole reason
+for importing.
+
+The key is the file's own `listing_id` where it has one, and
+`title_key(title)` where it does not. That order matters: `title_key`
+exists for rows with no key, not as a replacement for one that does -
+keying a row on its title while Facebook's id sits in the column beside
+it invents a second identity for one listing. Getting this backwards
+broke `test_csv_import`, which has pinned the id case since before any
+of this.
+
+**"Imported 5 sales" is the sentence that hides the thing worth
+knowing.** `upsert_listing` fills blanks and never overwrites, so
+re-importing a *corrected* spreadsheet reports five rows and changes
+none of them. The wizard reports `created` / `enriched` / `unchanged`
+and says per row which it is, because a correction that silently did
+nothing is the failure mode of every import tool.
+
+**The CLI and the wizard sit on one parser.** `read_csv` and
+`plan_import` write nothing - the same shape as `shopping.propose` and
+`savedpage.extract` - and both `mplabel import --format csv` and
+`POST /api/import/commit` go through `commit_import`. A test imports the
+same file both ways and compares the rows. Two parsers would disagree
+about what a column means eventually, and the disagreement would be
+invisible.
 
 **The phone app's token is a bearer token, and `/api/v1` is the name
 that will not move.** `issue_token`/`valid_token` were always stateless
@@ -1344,10 +1483,48 @@ all: every UI test passes with the session in any state. This came from
 the phone, twice - "the viewfinder is black" and then "the camera
 stopped responding".
 
-**A served asset missing from `asset_stamp` never reaches the phone.**
-It lists the files whose mtime busts the cache. `marker.js` is on that
-list; anything else added to `static/` must be too, or the phone goes on
-running the copy it has.
+**A served asset missing from `STAMPED_ASSETS` never reaches the client.**
+It lists the files whose mtime busts the cache. It used to be written out
+**twice** - once in `asset_stamp` and again in `shell_html` - which was
+two places to forget a file; it is one tuple now, and
+`test_every_served_asset_is_cache_busted` asks the directory rather than
+naming files, so adding a `.js` or `.css` to `static/` and not to the
+list is a test failure rather than a deploy that looks done and is not.
+`SHELLS` is the matching list of HTML entry points: `serve_static`
+special-cased the literal name `index.html`, so a second shell added
+without touching it ships unstamped.
+
+**A number that is really a query limit.** The desk's Today strip showed
+"10 oldest listed" and a total tied up in them. Both came from
+`len(stats.aging)`, and `/api/stats` serves that view with `LIMIT 10` -
+so the figure was the limit, dressed as a fact about the shelf, and it
+would have read 10 whether she had eleven things or four hundred. It
+comes off `v_price_band` now, which is a full `GROUP BY`. Nothing in a
+test could have seen this; it was obvious the moment the screen was
+looked at with forty rows behind it.
+
+**The focus restore belongs in the render, not in the caller.** The
+desk's search box lost focus on every keystroke despite `setSearch`
+putting it back: the reload went through the shared `once()` wrapper,
+which re-renders everything when it finishes, *after* the restore. So
+the caret was restored and then thrown away. `renderMain` captures the
+focused element id and its caret and puts them back itself, and
+`setSearch` deliberately does not go through `once()` - a query changing
+on every keystroke does not need the whole screen redrawn. Same failure
+the phone's `S.focusId` exists for, one layer further out.
+
+**A placeholder that is wrong about its subject is worse than none.**
+The writer's draft filmstrip drew the "nothing photographed" stripe for
+every draft, including the ones with three photographs - because the
+list endpoint does not carry photos and only the selected draft's are
+loaded. It shows titles only now. The same stripe on the inventory table
+is correct, because nothing there has photographs loaded either way.
+
+**`.pane--col` and `.pane--flush` need `flex: 1` like `.pane` does.**
+Without it a screen shorter than the window stops where its content
+stops and the sidebar runs on past it. The tall screens hid this
+completely - forty inventory rows fill the height whatever the container
+says - so it only appeared on the writer, which is the shortest.
 
 **The marker is one by four, and that is a layout decision as much as a
 format one.** A square marker took a bite out of the middle of a label
@@ -1726,6 +1903,30 @@ retried, which works because the server keys a photo on its sha256 -
 pressing retry cannot make a second row. A local queue would be a second
 source of truth for the same photographs.
 
+### The desk
+
+Built, and in the table above. Six screens at `/desk` off the same
+server, the same session cookie and the same `/api/v1` surface - the
+phone stays the shipping tool and this is the work it is bad at.
+
+Three things about it are worth keeping here rather than rediscovering:
+
+- **The design is populated with invented data, and four of its
+  sentences would have been false against real data.** A green "Printer
+  ready" dot on a write-only printer; a flat "kept, after cost, fees and
+  postage" over a `net` that covers only costed rows and no fee at all;
+  `$29.46 with no home` where `trip.unassigned` is null because nobody
+  wrote the till total down; and full buyer names in a list endpoint
+  that deliberately sends first names only. Each is handled, and each is
+  the kind of thing a mockup cannot know.
+- **The palette and the helpers are shared, not copied.** `tokens.css`
+  and `common.js` are loaded by both shells. `esc()` in two files is one
+  that gets fixed in one of them.
+- **What it does not do**: no scanning (the phone has the camera), no
+  printing beyond the two routes the queue already calls, no offline.
+
+What is left is a laptop, a real database and the tunnel. Everything so
+far is a seeded server on the machine the code was written on.
 ### The other selling channel
 
 eBay, and the reasoning that shaped it is in `docs/ebay.md`. **Phase 0 -

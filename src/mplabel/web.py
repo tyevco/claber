@@ -35,6 +35,7 @@ import mimetypes
 import re
 import secrets
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -48,6 +49,7 @@ from urllib.parse import urlparse, unquote, parse_qs
 # drift apart from the unit files that honour it.
 from . import printd as printd_mod
 
+from . import label
 from . import listings as listings_mod
 from . import shopping as shopping_mod
 from . import build as build_mod
@@ -83,6 +85,14 @@ MAX_BODY = 2 * 1024 * 1024
 # eight; twelve leaves room without letting any other endpoint become a
 # way to hand the Pi a hundred megabytes.
 MAX_PHOTO = 12 * 1024 * 1024
+
+# A label bought anywhere else. Same reasoning as MAX_PHOTO and the same
+# per-route treatment: a 4x6 of vector text is a few kilobytes, but a
+# carrier that flattens its label to a 300dpi image lands a couple of
+# megabytes, and a US Letter page carrying a packing slip as well can be
+# more. Four is comfortably above anything real and far below the number
+# that stops the printer.
+MAX_LABEL = 4 * 1024 * 1024
 
 # What the camera roll actually produces, and nothing else. The extension
 # is chosen here rather than taken from the request: a filename from a
@@ -204,7 +214,27 @@ class Throttle:
             self._fails.pop(who, None)
 
 
-# ----------------------------------------------------------- path safety
+# -------------------------------------------------- the static frontends
+
+# Every script and stylesheet either shell loads. A file missing from
+# here ships to a client that goes on using its cached copy - the change
+# is deployed, the service is restarted, and it is simply not there,
+# which reads as the deploy having failed rather than as a stale asset.
+#
+# One tuple, read by both `asset_stamp` and `shell_html`. It used to be
+# written out twice, which was two places to forget a file.
+STAMPED_ASSETS = ("app.js", "app.css", "marker.js",
+                  "tokens.css", "common.js", "desk.js", "desk.css")
+
+# The HTML that gets stamped and served no-store. Two front ends now: the
+# phone app at `/` and the desk portal at `/desk`.
+SHELLS = ("index.html", "desk.html")
+
+# What a bare entry point means. `/desk` is an alias resolved here rather
+# than a branch in the dispatcher, so it goes through the same
+# containment check as everything else under `static/`.
+SHELL_ALIASES = {"": "index.html", "desk": "desk.html", "desk/": "desk.html"}
+
 
 def safe_static_path(rel):
     """Resolve `rel` under STATIC, or None if it escapes.
@@ -214,8 +244,7 @@ def safe_static_path(rel):
     ../../../etc/passwd. Resolve first, then check containment - string
     prefix checks miss symlinks."""
     rel = unquote(rel or "").lstrip("/")
-    if not rel:
-        rel = "index.html"
+    rel = SHELL_ALIASES.get(rel, rel)
     try:
         target = (STATIC / rel).resolve()
         target.relative_to(STATIC.resolve())
@@ -227,9 +256,7 @@ def safe_static_path(rel):
 def asset_stamp():
     """A short hex stamp that moves whenever a served asset does."""
     newest = 0
-    # Every served asset, or a change to one that is missing here
-    # ships to a phone that goes on using its cached copy.
-    for name in ("app.js", "app.css", "marker.js"):
+    for name in STAMPED_ASSETS:
         try:
             newest = max(newest, int((STATIC / name).stat().st_mtime))
         except OSError:
@@ -238,12 +265,10 @@ def asset_stamp():
 
 
 def shell_html(path):
-    """index.html with its asset URLs version-stamped."""
+    """A shell with its asset URLs version-stamped."""
     stamp = asset_stamp()
     html = path.read_text(encoding="utf-8")
-    # Every served asset, or a change to one that is missing here
-    # ships to a phone that goes on using its cached copy.
-    for name in ("app.js", "app.css", "marker.js"):
+    for name in STAMPED_ASSETS:
         html = html.replace(f'"/{name}"', f'"/{name}?v={stamp}"')
     return html
 
@@ -276,6 +301,33 @@ def photo_dir(home):
 
 
 # ---------------------------------------------------------- serialisation
+
+# What a client is allowed to write on a listing. `paid` and `bin` are
+# not here because neither is a plain column write - one is a money parse
+# and the other resolves a code or a name against `bins`.
+#
+# One tuple, read by the single-item route and by the bulk one. Two lists
+# would mean a field editable one row at a time and not forty, which is
+# the kind of difference nobody notices until they hit it.
+ITEM_FIELDS = ("title", "price", "category", "condition", "era",
+               "notes", "description", "state")
+
+
+def _item_sets(body):
+    """The SET clause for whatever of `ITEM_FIELDS` a body carries."""
+    sets, params = [], []
+    for key in ITEM_FIELDS:
+        if key not in body:
+            continue
+        value = body[key]
+        if key == "price" and value not in (None, ""):
+            value = listings_mod.parse_money(value)
+            if value is None:
+                raise ValueError("price must be a number")
+        sets.append(f"{key}=?")
+        params.append(value if value != "" else None)
+    return sets, params
+
 
 def _order_row(r):
     """The queue payload. Deliberately no address.
@@ -375,6 +427,9 @@ class Handler(BaseHTTPRequestHandler):
         ("POST", r"^/api/orders/(?P<sid>\d+)/fields$", "h_fields", True),
         ("POST", r"^/api/orders/(?P<sid>\d+)/print$", "h_print", True),
         ("POST", r"^/api/print/pending$", "h_print_pending", True),
+        # A label from anywhere else. No order behind it and no row after
+        # it - see h_print_label.
+        ("POST", r"^/api/print/label$", "h_print_label", True),
         # The sourcing half. Cost basis enters the system here, which is
         # why every margin in the analytics is null until it does.
         ("GET", r"^/api/trips$", "h_trips", True),
@@ -406,6 +461,11 @@ class Handler(BaseHTTPRequestHandler):
         ("POST", r"^/api/inventory$", "h_make_item", True),
         ("POST", r"^/api/inventory/(?P<lid>\d+)/fields$", "h_item_fields",
          True),
+        ("POST", r"^/api/inventory/bulk$", "h_bulk_items", True),
+        ("GET", r"^/api/inventory/(?P<lid>\d+)/photos$", "h_item_photos",
+         True),
+        ("POST", r"^/api/import/preview$", "h_import_preview", True),
+        ("POST", r"^/api/import/commit$", "h_import_commit", True),
     ]
     _COMPILED = [(m, re.compile(p), h, a) for m, p, h, a in ROUTES]
 
@@ -646,9 +706,17 @@ class Handler(BaseHTTPRequestHandler):
         state = (qs.get("state") or [""])[0].strip()
         limit = min(int((qs.get("limit") or ["200"])[0] or 200), 500)
 
-        sql = ("SELECT l.id, l.listing_id, l.title, l.price, l.state, "
-               "l.category, l.inventory_code, l.bin_code, b.name AS bin, "
-               "l.listed_at, l.sold_at "
+        # `paid` and `days_listed` are here for the desk's table, which
+        # has Paid, Margin and Listed columns. `days_listed` is the
+        # expression `v_listing_perf` uses, copied rather than reworded:
+        # a table and the analytics beside it disagreeing about how old
+        # something is would be a bug nobody could see.
+        sql = ("SELECT l.id, l.listing_id, l.title, l.price, l.paid, "
+               "l.state, l.category, l.era, l.inventory_code, l.bin_code, "
+               "b.name AS bin, l.listed_at, l.sold_at, "
+               "CASE WHEN l.sold_at IS NULL AND l.listed_at IS NOT NULL "
+               "     THEN CAST(julianday('now') - julianday(l.listed_at) "
+               "               AS INTEGER) END AS days_listed "
                "FROM listings l LEFT JOIN bins b ON b.code = l.bin_code "
                "WHERE 1=1")
         args = []
@@ -967,23 +1035,26 @@ class Handler(BaseHTTPRequestHandler):
         is the same operation as a correction: someone is answering "what
         did this cost" from the receipt in front of them, and answering
         it twice must be allowed to overwrite."""
-        if self._item_row(int(lid)) is None:
+        row = self._item_row(int(lid))
+        if row is None:
             return self.fail(404, "no such item")
         body = self.body() or {}
         if "paid" in body:
             listings_mod.set_cost(self.db(), int(lid), body["paid"])
-        sets, params = [], []
-        for key in ("title", "price", "category", "condition", "era",
-                    "notes", "state"):
-            if key not in body:
-                continue
-            value = body[key]
-            if key == "price" and value not in (None, ""):
-                value = listings_mod.parse_money(value)
-                if value is None:
-                    raise ValueError("price must be a number")
-            sets.append(f"{key}=?")
-            params.append(value if value != "" else None)
+        sets, params = _item_sets(body)
+        # Publishing a draft dates it, here rather than in the client.
+        #
+        # The date a thing went up is a fact about the transition, not
+        # something a caller supplies - and `listed_at` is what
+        # `v_aging` and `days_listed` are computed from, so a client that
+        # simply forgot to send it would leave the row out of the aging
+        # report with nothing to show it had been missed. Only when it is
+        # unset: republishing must not restart the clock.
+        if (body.get("state") == "active"
+                and (row or {}).get("state") == "draft"
+                and not (row or {}).get("listed_at")):
+            sets.append("listed_at=?")
+            params.append(datetime.now().date().isoformat())
         if sets:
             params.append(int(lid))
             self.db().execute(
@@ -993,11 +1064,140 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("nothing to change")
         self.json({"ok": True, "item": self._item_row(int(lid))})
 
+    def _csv_body(self):
+        body = self.body() or {}
+        text = body.get("csv")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("no spreadsheet in the request")
+        mapping = body.get("mapping")
+        if mapping is not None and not isinstance(mapping, dict):
+            raise ValueError("the column mapping must be an object")
+        return text, mapping, body
+
+    def h_import_preview(self):
+        """What committing this file would do, having done none of it.
+
+        Stateless: the client holds the file and sends it again to
+        commit. The alternative is parking a parsed upload between two
+        requests, which needs a session store this server does not have
+        and would not want for one screen.
+
+        The CSV travels in the JSON body. `MAX_BODY` is 2MB and a
+        spreadsheet of old sales is kilobytes; `/api/photos`' raw-bytes
+        bypass exists only because a twelve-megabyte image cannot fit
+        through that limit, and nothing else should copy it."""
+        text, mapping, _ = self._csv_body()
+        self.json(listings_mod.plan_import(self.db(), text, mapping))
+
+    def h_import_commit(self):
+        """Write it. Returns counts by outcome, not a total.
+
+        "Imported 5 sales" is the sentence that hides the thing worth
+        knowing: `upsert_listing` fills blanks and never overwrites, so
+        re-importing a corrected spreadsheet reports five rows and
+        changes nothing."""
+        text, mapping, body = self._csv_body()
+        state = body.get("state") or None
+        if state and state not in ("active", "sold", "expired", "removed"):
+            raise ValueError(f"{state!r} is not a state a sale can be in")
+        result = listings_mod.commit_import(self.db(), text, mapping, state)
+        listings_mod.refresh(self.db())
+        self.json(result)
+
+    def h_item_photos(self, lid):
+        """The photographs of one thing.
+
+        `GET /api/photos` answers the opposite question - captures about
+        nothing yet - so the writer screen had no way to ask which
+        pictures belong to the draft it is showing."""
+        if self._item_row(int(lid)) is None:
+            return self.fail(404, "no such item")
+        self.json({"photos": listings_mod.photos_for(self.db(), int(lid))})
+
+    def h_bulk_items(self):
+        """The same edit on many things at once.
+
+        The desk's inventory table is where forty rows get a bin, an era
+        or a state in one go, and the confirm dialog in front of this
+        says there is no undo - so a half-applied edit is the one outcome
+        that must be impossible. One transaction, and a row the
+        allow-list refuses rolls back the ones before it.
+
+        A client-side loop over `/api/inventory/{id}/fields` was the
+        alternative and is worse in both directions: forty round trips
+        through a tunnel, and nothing able to say which of them landed
+        when the eleventh fails.
+        """
+        body = self.body() or {}
+        ids = body.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("no items selected")
+        # The same cap `h_inventory` puts on a page. Past this it is not a
+        # selection, it is a migration, and it belongs in the CLI.
+        if len(ids) > 500:
+            raise ValueError("too many items in one edit")
+        try:
+            ids = [int(i) for i in ids]
+        except (TypeError, ValueError):
+            raise ValueError("item ids must be numbers")
+
+        changes = body.get("set") or {}
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError("nothing to change")
+        unknown = set(changes) - set(ITEM_FIELDS) - {"bin", "paid"}
+        if unknown:
+            raise ValueError(f"cannot set {', '.join(sorted(unknown))}")
+
+        conn = self.db()
+        # Everything that can be refused is refused before anything is
+        # written. `set_bin` and `set_cost` each commit on their own, so
+        # calling them in a loop would leave the first ten edits standing
+        # when the eleventh is rejected - a rollback afterwards would have
+        # nothing left to undo. Validate, then one statement.
+        sets, params = _item_sets(changes)
+        if "bin" in changes:
+            needle = changes["bin"]
+            if needle in (None, ""):
+                code = None
+            else:
+                found = listings_mod.find_bin(conn, needle)
+                if not found:
+                    raise ValueError(
+                        f"no bin {needle!r}. Make it first - a thing cannot "
+                        f"be somewhere that has no name")
+                code = found["code"]
+            sets.append("bin_code=?")
+            params.append(code)
+        if "paid" in changes:
+            paid = changes["paid"]
+            value = None if paid in (None, "") else \
+                listings_mod.parse_money(paid)
+            if paid not in (None, "") and value is None:
+                raise ValueError("paid must be a number")
+            sets.append("paid=?")
+            params.append(value)
+        if not sets:
+            raise ValueError("nothing to change")
+
+        holes = ",".join("?" * len(ids))
+        found = conn.execute(
+            f"SELECT COUNT(*) FROM listings WHERE id IN ({holes})",
+            ids).fetchone()[0]
+        if found != len(set(ids)):
+            raise ValueError("some of those items no longer exist")
+
+        conn.execute(
+            f"UPDATE listings SET {', '.join(sets)} WHERE id IN ({holes})",
+            params + ids)
+        conn.commit()
+        self.json({"ok": True, "changed": len(set(ids))})
+
     def _item_row(self, lid):
         row = self.db().execute(
             "SELECT l.id, l.listing_id, l.title, l.price, l.paid, l.state, "
             "l.category, l.condition, l.era, l.inventory_code, l.bin_code, "
-            "b.name AS bin, l.listed_at, l.sold_at, l.notes, l.trip_id "
+            "b.name AS bin, l.listed_at, l.sold_at, l.notes, "
+            "l.description, l.trip_id "
             "FROM listings l LEFT JOIN bins b ON b.code = l.bin_code "
             "WHERE l.id=?", (int(lid),)).fetchone()
         return dict(row) if row else None
@@ -1375,6 +1575,120 @@ class Handler(BaseHTTPRequestHandler):
                 failed.append({"id": row["id"], "error": str(exc)})
         self.json({"printed": printed, "failed": failed})
 
+    def h_print_label(self):
+        """Print a 4x6 label this system has never seen before.
+
+        Everything else on this server prints a label it already has, off
+        a `sales` row, checked against the address recorded when that sale
+        was filed. This prints a PDF somebody just handed it - eBay,
+        PirateShip, a carrier's own site, a parcel that is not a sale at
+        all - and that difference is the whole design of it:
+
+        Nothing is recorded here. No sales row, no listing, no file kept
+        in `labels/`. There is no order for it to belong to, and inventing
+        one would put a parcel that is not a sale into revenue, into
+        sell-through and into the Sheet. What *is* recorded is printd's
+        journal, which is the only durable record this system has anyway -
+        the G4 is write-only, so a print is at-least-once and the paper is
+        the source of truth. With `printer_backend` pointing straight at a
+        device there is no journal at all, and the answer says so rather
+        than implying a record that does not exist.
+
+        `label_belongs_to` has nothing to check against for the same
+        reason - there is no recorded recipient to compare the PDF with.
+        The backstop here is that a person chose this file a second ago,
+        which is a different guarantee and a weaker one. Do not paper over
+        that by inventing a row to check against.
+
+        Raw bytes with a real Content-Type, like `POST /api/photos` and
+        for the same reason: one file, no other fields, everything else in
+        the query string, and so no multipart parser to add and get wrong.
+        """
+        from . import cli as cli_mod
+
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        if ctype.lower() not in ("application/pdf", "application/x-pdf"):
+            raise ValueError(
+                f"a label must be application/pdf - got {ctype or 'nothing'}")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ValueError("no PDF in the body")
+        if length > MAX_LABEL:
+            raise ValueError(
+                f"that PDF is {length // 1024}kB, over the "
+                f"{MAX_LABEL // 1024 // 1024}MB limit for a label")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("the upload was cut short")
+        if not raw.startswith(b"%PDF"):
+            raise ValueError("that file is not a PDF")
+
+        qs = parse_qs(urlparse(self.path).query)
+
+        def one(name):
+            v = (qs.get(name) or [None])[0]
+            return v
+
+        rotate = one("rotate")
+        if rotate is not None:
+            rotate = int(rotate)
+            if rotate not in (0, 90, 180, 270):
+                raise ValueError("rotate must be 0, 90, 180 or 270")
+        page = int(one("page") or 1)
+        region = one("region")
+        region = int(region) if region else None
+        dry = str(one("dry_run") or "").lower() in ("1", "yes", "true")
+        force = str(one("force") or "").lower() in ("1", "yes", "true")
+
+        # Derived from the bytes, so the same PDF sent twice is the same
+        # job. She is on a phone behind a tunnel; a request that times out
+        # after the label came out is exactly the case printd's journal
+        # exists to answer, and a random id would turn her retry into a
+        # second label instead of a 409. Asking for it again on purpose is
+        # `force`, which is a different intent and gets a different id.
+        digest = hashlib.sha256(raw).hexdigest()
+        job = f"adhoc-{digest[:16]}"
+        if force:
+            job += "-" + secrets.token_hex(4)
+
+        with tempfile.TemporaryDirectory(prefix="mplabel_adhoc_") as tmpdir:
+            src = Path(tmpdir) / "in.pdf"
+            src.write_bytes(raw)
+            out = Path(tmpdir) / "label_4x6.pdf"
+            # Any refusal in here is a ValueError carrying what it
+            # measured, which the dispatcher turns into a 400 with that
+            # sentence in it. That sentence is the whole feature when a
+            # crop cannot be resolved: "this may not be a shipping label"
+            # is actionable and "bad request" is not.
+            info = label.to_4x6(src, out, page_index=page - 1,
+                                force_rotation=rotate, region=region)
+            info["job"] = job
+            info["sha256"] = digest
+            info["bytes"] = len(raw)
+            backend = self.cfg.get("printer_backend")
+            info["recorded"] = ("printd journal"
+                                if backend in printers_mod.REMOTE_BACKENDS
+                                else "nowhere - this backend writes straight "
+                                     "to the device and keeps no journal")
+            if dry:
+                # Converts and measures, opens no device and journals
+                # nothing. This is the cheap way to find out whether a new
+                # seller's PDF crops correctly, and it costs no stock -
+                # which on a printer that cannot report a failure is the
+                # difference between one label and several.
+                info["dry_run"] = True
+                info["printed"] = False
+                return self.json({"ok": True, "label": info})
+
+            try:
+                cli_mod.print_label(self.cfg, str(out), job=job)
+            except printers_mod.PrinterUnavailable as exc:
+                raise PrintError(str(exc))
+            info["printed"] = True
+            log.info("printed ad-hoc label %s (%d bytes, %s)",
+                     job, len(raw), info["size_in"])
+            return self.json({"ok": True, "label": info})
+
     def serve_static(self, path):
         target = safe_static_path(path)
         if target is None:
@@ -1382,7 +1696,7 @@ class Handler(BaseHTTPRequestHandler):
         if not target.is_file():
             return self.fail(404, "not found")
 
-        if target.name == "index.html":
+        if target.name in SHELLS:
             # Stamp the asset URLs. Cache-Control alone is not enough:
             # the intended route in is a Cloudflare tunnel, and the edge
             # caches .js and .css by extension. A stale app.js against a

@@ -121,15 +121,36 @@ final class ScreenshotTests: XCTestCase {
             .waitForExistence(timeout: 15))
         shot("12-scan")
 
-        // Last, because it is the one screen that arrives as a sheet and
-        // a sheet does not reliably go away on a swipe - dismissing it
-        // failed silently mid-walk and took every screen after it with
-        // it. Nothing follows this now, so it cannot.
+        // Settings, and the screen pushed inside it. Worth a picture for
+        // one specific reason: this screen grows downwards as the server
+        // answers - an options card, then a result, then a region
+        // picker - and the hold button has to stay above all of it. That
+        // is the exact drift a screenshot found on the add-item screen
+        // and no assertion here would notice.
         app.buttons["To ship"].tap()
         XCTAssertTrue(app.staticTexts["To ship"].waitForExistence(timeout: 10))
+        app.buttons["Settings"].tap()
+        XCTAssertTrue(app.staticTexts["Settings"].waitForExistence(timeout: 10))
+        shot("13-settings")
+        app.staticTexts["Print a label"].tap()
+        XCTAssertTrue(app.staticTexts["Choose a PDF"]
+            .waitForExistence(timeout: 10))
+        shot("14-print-a-label")
+        // A drag dismisses the whole sheet, pushed screen and all. The
+        // assertion afterwards is the point: this used to fail silently
+        // and take every screen after it down, and the fix is to notice
+        // here rather than in a picture of the wrong thing.
+        dismissSheet(app)
+        XCTAssertTrue(app.staticTexts["To ship"].waitForExistence(timeout: 10),
+                      "the Settings sheet did not go away")
+
+        // Last, because it is a sheet and a sheet does not reliably go
+        // away on a swipe - dismissing one failed silently mid-walk and
+        // took every screen after it with it. Nothing follows this, so
+        // it cannot.
         app.staticTexts["to print"].tap()
         XCTAssertTrue(app.staticTexts["Pending labels"]
             .waitForExistence(timeout: 10))
-        shot("13-pending")
+        shot("15-pending")
     }
 }

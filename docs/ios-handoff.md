@@ -38,6 +38,23 @@ confirmed on her real orders rather than on a fixture.
   same reason.
 - **Nothing has been printed from the app.** That is the one action that
   spends physical stock, and the printer cannot confirm a print.
+- **`PrintLabelView` has never been compiled.** It was written on the
+  Windows box, which has no Xcode: the screen, `MPPills` in
+  `Design/Components.swift`, `APIClient.printLabel` and the
+  `PrintedLabel` model are all unbuilt Swift. The server half of it is
+  covered by the Python suite and the shape of the payload by
+  `Fixtures/print_label.json`, which is generated from a real server, so
+  what is genuinely unknown is whether it *builds* and whether the
+  screen reads well - not whether it is talking to the right endpoint.
+  Two specific things to look at on the first run:
+  - `.fileImporter` hands back a **security-scoped** URL.
+    `startAccessingSecurityScopedResource()` is called and balanced in
+    `take(_:)`; without it, reading a file she just chose in a system
+    picker fails with a permissions error that reads as a bug in the app.
+  - `testPrintingAnArbitraryLabelIsReachableFromSettings` stops at the
+    screen rather than choosing a file. The document picker is system UI
+    this suite cannot drive, and the print behind it spends real stock -
+    so the route is asserted and the payload is checked in Python.
 
 ## What the Mac's toolchain needed
 

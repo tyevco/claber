@@ -20,6 +20,7 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
+import pdfplumber
 import pytest
 
 from mplabel import (inventory, label, listings, mailparse, marker, qr, rs,
@@ -102,6 +103,9 @@ def test_ship_to_is_recipient_not_sender(tmp_path):
 
 
 def test_oversized_content_rejected(tmp_path):
+    """A page of ink is not a 4x6 label, and cropping to its middle would
+    print a corner of one. Refused - and since the region finder landed,
+    refused by it rather than by _snap, with the size it measured."""
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import letter
     big = tmp_path / "big.pdf"
@@ -109,8 +113,249 @@ def test_oversized_content_rejected(tmp_path):
     c.rect(20, 20, 550, 700)
     c.showPage()
     c.save()
-    with pytest.raises(ValueError, match="larger than"):
+    with pytest.raises(ValueError, match="no block on this page is a 4 x 6"):
         label.to_4x6(big, tmp_path / "o.pdf")
+
+
+# ------------------------------------------- finding the label on a page
+#
+# Every one of these is a shape a non-Facebook label actually arrives in.
+# A Marketplace label has its page to itself and needs none of this; eBay,
+# PirateShip and the carriers' own sites put a packing slip on the same
+# sheet, and cropping to all the ink then refuses a perfectly good label.
+
+
+def _label_block(c, x0=90, y0=450):
+    """The real Marketplace geometry - 432x288pt of ink with its text
+    running bottom-to-top - drawn wherever it is asked for."""
+    c.saveState()
+    c.translate(x0, y0)
+    c.rotate(90)
+    c.rect(0, -432, 288, 432)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(20, -120, "USPS GROUND ADVANTAGE")
+    c.setFont("Helvetica", 9)
+    for i, t in enumerate(["SAM SAMPLE", "9 EXAMPLE ST",
+                           "SHELBYVILLE IN 46176-0002"]):
+        c.drawString(20, -180 - i * 12, t)
+    c.setFont("Helvetica", 11)
+    c.drawString(20, -300, "9400100000000000000000")
+    c.restoreState()
+
+
+def _letter_with_slip(path, slip_first=True, slip=True):
+    """A US Letter sheet: the 4x6 label up top, a packing slip below it.
+
+    The slip is drawn first on purpose. `inspect` used to read the
+    rotation off `chars[0]`, which on this page is the slip's upright
+    text rather than the label's rotated text. It also carries an address
+    of its own, because that is what makes a loose text extraction
+    dangerous rather than merely untidy."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    c = canvas.Canvas(str(path), pagesize=letter)
+
+    def draw_slip():
+        c.setFont("Helvetica", 10)
+        c.drawString(72, 300, "PACKING SLIP - not the label")
+        for i in range(6):
+            c.drawString(72, 270 - i * 14, f"1 x item number {i} SLIPONLY")
+        for i, t in enumerate(["RETURNS DEPT", "5 WAREHOUSE RD",
+                               "NOWHERE OH 44101-0003"]):
+            c.drawString(72, 180 - i * 12, t)
+        c.line(72, 120, 540, 120)
+
+    if slip and slip_first:
+        draw_slip()
+    _label_block(c)
+    if slip and not slip_first:
+        draw_slip()
+    c.showPage()
+    c.save()
+    return path
+
+
+def test_a_label_sharing_a_page_with_a_packing_slip_is_found(tmp_path):
+    """The ink spans the whole sheet, so cropping to it is refused - but
+    the label is right there, separated by a clear gutter. Not finding it
+    is the difference between this working on eBay's labels and not."""
+    src = _letter_with_slip(tmp_path / "slip.pdf")
+    out = tmp_path / "o.pdf"
+    info = label.to_4x6(src, out)
+    assert info["size_in"] == (4.0, 6.0)
+    assert info["crop_bbox"] == (90.0, 450.0, 522.0, 738.0)
+
+
+def test_the_packing_slip_is_not_what_gets_printed(tmp_path):
+    """The failure this guards against is silent: a 4x6 crop of the wrong
+    half of the page looks like a label until it is on a parcel.
+
+    Asked of the raster, not of the crop box. Cropping a PDF sets the
+    boxes and leaves the content stream alone, so "the box is right" and
+    "only the label prints" are two different claims and only the second
+    one is about paper."""
+    from mplabel import printers
+    with_slip = tmp_path / "slip.pdf"
+    alone = tmp_path / "alone.pdf"
+    _letter_with_slip(with_slip)
+    _letter_with_slip(alone, slip=False)
+
+    rasters = []
+    for src in (with_slip, alone):
+        out = src.with_name(src.stem + "_4x6.pdf")
+        label.to_4x6(src, out)
+        rasters.append(bytes(printers.render_bitmap(out, 203)[0]))
+    assert rasters[0] == rasters[1]
+
+
+def test_a_crop_confines_the_field_reader_too(tmp_path):
+    """`ship_to` is the backstop against posting a parcel to a stranger,
+    and it anchors on the last CITY ST ZIP on the page. pdfplumber lists
+    every object on the sheet whatever the crop box says, so on a page
+    with a packing slip below the label that last address is the slip's."""
+    src = _letter_with_slip(tmp_path / "slip.pdf")
+    out = tmp_path / "o.pdf"
+    label.to_4x6(src, out)
+    got = label.extract_label_fields(out)
+    assert got["tracking"] == "9400100000000000000000"
+    assert "SHELBYVILLE IN 46176-0002" in got["ship_to"]
+    assert "NOWHERE" not in got["ship_to"]
+
+
+def test_rotation_is_the_majority_not_the_first_character(tmp_path):
+    """`chars[0]` is whatever the content stream drew first. On a page
+    with an upright slip above a rotated label that is a coin toss, and
+    the wrong answer crops a 6x4 window out of a 4x6 label."""
+    src = _letter_with_slip(tmp_path / "slip.pdf", slip_first=True)
+    info = label.to_4x6(src, tmp_path / "o.pdf")
+    assert info["rotation"] == 90
+    assert info["rotation_source"] == "text"
+
+
+def test_a_label_with_no_text_is_oriented_from_its_shape(tmp_path):
+    """Some carriers' labels are one flattened image and extract no text
+    at all. Those used to be called rotation 0 and then refused for being
+    "6.00 x 4.00 in, larger than the 4 x 6 in target" - a correct
+    measurement wearing a wrong diagnosis."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    src = tmp_path / "image_only.pdf"
+    c = canvas.Canvas(str(src), pagesize=letter)
+    c.rect(90, 450, 432, 288, fill=0)
+    for i in range(20):
+        c.rect(100 + i * 4, 470, 2, 60, fill=1)
+    c.showPage()
+    c.save()
+    info = label.to_4x6(src, tmp_path / "o.pdf")
+    assert info["size_in"] == (4.0, 6.0)
+    assert info["rotation"] == 90
+    # Said out loud, because the shape cannot say which way *up* - only
+    # that the label is on its side. --rotate is the override.
+    assert info["rotation_source"] == "aspect"
+
+
+def test_two_look_alike_blocks_are_refused_rather_than_guessed(tmp_path):
+    """Two 4x6-shaped blocks on one sheet. Picking wrong spends the stock
+    and prints the wrong thing, so this refuses and says where they are."""
+    from reportlab.pdfgen import canvas
+    src = tmp_path / "two.pdf"
+    c = canvas.Canvas(str(src), pagesize=(612, 936))
+    _label_block(c, x0=90, y0=40)
+    _label_block(c, x0=90, y0=500)
+    c.showPage()
+    c.save()
+    with pytest.raises(ValueError, match="--region"):
+        label.to_4x6(src, tmp_path / "o.pdf")
+
+
+def test_a_region_can_be_chosen_when_the_page_holds_two(tmp_path):
+    from reportlab.pdfgen import canvas
+    src = tmp_path / "two.pdf"
+    c = canvas.Canvas(str(src), pagesize=(612, 936))
+    _label_block(c, x0=90, y0=40)
+    _label_block(c, x0=90, y0=500)
+    c.showPage()
+    c.save()
+    first = label.to_4x6(src, tmp_path / "a.pdf", region=1)
+    second = label.to_4x6(src, tmp_path / "b.pdf", region=2)
+    assert first["size_in"] == second["size_in"] == (4.0, 6.0)
+    assert first["crop_bbox"] != second["crop_bbox"]
+    assert first["regions_found"] == 2
+
+
+def test_a_page_can_be_chosen_from_a_multi_page_pdf(tmp_path):
+    """Two labels, one per page - which is how a batch of them is bought."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    src = tmp_path / "pair.pdf"
+    c = canvas.Canvas(str(src), pagesize=letter)
+    _label_block(c, x0=90, y0=450)
+    c.showPage()
+    _label_block(c, x0=100, y0=300)
+    c.showPage()
+    c.save()
+    one = label.to_4x6(src, tmp_path / "a.pdf", page_index=0)
+    two = label.to_4x6(src, tmp_path / "b.pdf", page_index=1)
+    assert one["crop_bbox"] == (90.0, 450.0, 522.0, 738.0)
+    assert two["crop_bbox"] == (100.0, 300.0, 532.0, 588.0)
+    assert two["page"] == 2
+    with pytest.raises(ValueError, match="no page 3"):
+        label.to_4x6(src, tmp_path / "c.pdf", page_index=2)
+
+
+@pytest.mark.parametrize("source_rotation", [90, 180, 270])
+def test_a_page_that_already_carries_a_rotation_still_crops_to_its_label(
+        tmp_path, source_rotation):
+    """pdfplumber applies /Rotate before reporting coordinates and pypdf's
+    mediabox does not, so a box measured in one and written into the other
+    crops a different corner of the page entirely. Marketplace labels
+    carry no /Rotate, which is why nothing here had to know that.
+
+    Asserted by reading the label back rather than by comparing
+    arithmetic to itself: the failure is a crop that lands somewhere
+    plausible, and only the content says whether it landed on the label.
+    """
+    from pypdf import PdfReader, PdfWriter
+    turned = tmp_path / "turned.pdf"
+    reader = PdfReader(str(LABEL_PDF))
+    writer = PdfWriter()
+    page = reader.pages[0]
+    page.rotate(source_rotation)
+    writer.add_page(page)
+    with open(turned, "wb") as fh:
+        writer.write(fh)
+
+    out = tmp_path / "o.pdf"
+    info = label.to_4x6(turned, out)
+    assert info["size_in"] == (4.0, 6.0)
+    assert info["source_rotation"] == source_rotation
+    got = label.extract_label_fields(out)
+    assert got["tracking"] == "9400100000000000000000"
+    assert "SAM SAMPLE" in got["ship_to"]
+
+
+def test_a_label_already_on_a_4x6_page_is_left_alone(tmp_path):
+    """A label bought from PirateShip arrives as a 4x6 page with the ink
+    running to its edges. There is nothing to find and nothing to turn."""
+    from reportlab.pdfgen import canvas
+    src = tmp_path / "already.pdf"
+    c = canvas.Canvas(str(src), pagesize=(288, 432))
+    c.rect(4, 4, 280, 424)
+    c.setFont("Helvetica", 11)
+    c.drawString(20, 300, "9400100000000000000000")
+    c.showPage()
+    c.save()
+    info = label.to_4x6(src, tmp_path / "o.pdf")
+    assert info["size_in"] == (4.0, 6.0)
+    assert info["rotation"] == 0
+    assert info["regions_found"] == 1
+
+
+def test_a_forced_rotation_says_it_was_forced(tmp_path):
+    """--rotate is the override for the case the shape cannot settle, so
+    the answer has to distinguish it from something that was measured."""
+    info = label.to_4x6(LABEL_PDF, tmp_path / "o.pdf", force_rotation=90)
+    assert info["rotation_source"] == "forced"
 
 
 # ----------------------------------------------------------- parcel code
@@ -1154,6 +1399,267 @@ def test_csv_import(db):
     assert row["state"] == "sold" and row["price"] == 25.0
 
 
+SALES_CSV = (
+    "sale_date,item_title,gross,my_cost,shipping_paid\n"
+    "2025-11-04,Oak library table,320.00,80.00,24.10\n"
+    "2025-11-12,Set of 6 jadeite mugs,84.00,14.00,7.40\n"
+    "2025-12-02,Victorian hall tree,450.00,120.00,\n"
+)
+
+
+def test_an_import_preview_writes_nothing(db):
+    """The screen that shows this has not committed to anything, and the
+    parse has to be answerable twice with the same answer. Same shape as
+    `shopping.propose` and `savedpage.extract`."""
+    before = db.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    plan = listings.plan_import(db, SALES_CSV)
+    assert len(plan["rows"]) == 3
+    assert plan["created"] == 3
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == before
+
+
+def test_the_mapping_is_guessed_from_header_names(db):
+    plan = listings.plan_import(db, SALES_CSV)
+    assert plan["mapping"] == {"sale_date": "sold_at",
+                               "item_title": "title",
+                               "gross": "price",
+                               "my_cost": "paid",
+                               "shipping_paid": "postage"}
+
+
+def test_a_row_with_no_postage_says_so_rather_than_reading_as_free(db):
+    """A missing postage read as zero reports the whole price as kept,
+    which is the same failure as a missing cost reading as free - and
+    the wizard displays a Postage column, so a row without one has to be
+    the row that says why."""
+    plan = listings.plan_import(db, SALES_CSV)
+    warned = [p for p in plan["rows"]
+              if any("postage" in w for w in p["warnings"])]
+    assert [p["row"]["title"] for p in warned] == ["Victorian hall tree"]
+    assert "postage" not in plan["rows"][2]["row"]
+
+
+def test_a_reimport_changes_nothing_and_says_so(db):
+    """`upsert_listing` fills blanks and never overwrites, so a corrected
+    spreadsheet reports its rows and changes none of them. An import that
+    said "imported 3" both times would be describing a correction that
+    did not happen."""
+    first = listings.commit_import(db, SALES_CSV)
+    assert first["created"] == 3 and first["written"] == 3
+
+    corrected = SALES_CSV.replace("320.00", "999.00")
+    plan = listings.plan_import(db, corrected)
+    assert plan["created"] == 0
+    assert plan["unchanged"] == 3
+    assert any("will not change it" in w for w in plan["rows"][0]["warnings"])
+
+    listings.commit_import(db, corrected)
+    assert db.execute("SELECT price FROM listings WHERE title='Oak library "
+                      "table'").fetchone()[0] == 320.0
+
+
+def test_an_imported_row_is_a_listing_and_never_a_sale(db):
+    """A `sales` row is the record of a Facebook order that produced a
+    label email - a UNIQUE message_id, a parcel code, a tracking number,
+    an archived PDF - and a spreadsheet row has none of those. Inventing
+    a message_id would put a fake email in the table the poller
+    de-duplicates against, and `sales.code` is a live parcel handle that
+    is recycled the moment a parcel ships."""
+    listings.commit_import(db, SALES_CSV)
+    assert db.execute("SELECT COUNT(*) FROM sales").fetchone()[0] == 0
+    keys = [r[0] for r in db.execute("SELECT listing_id FROM listings")]
+    assert all(k.startswith("saved:") for k in keys), keys
+    assert db.execute(
+        "SELECT COUNT(*) FROM listings WHERE state='sold'").fetchone()[0] == 3
+
+
+def test_the_cli_and_the_web_import_the_same_csv_the_same_way(db, tmp_path):
+    """They sit on one parser, so `mplabel import --format csv` and the
+    wizard cannot disagree about what a column means - the rule
+    `title_key` already follows for both sides of reconciliation."""
+    path = tmp_path / "sales.csv"
+    path.write_text(SALES_CSV, encoding="utf-8")
+
+    from mplabel import cli
+
+    other = sqlite3.connect(":memory:")
+    other.row_factory = sqlite3.Row
+    other.executescript(cli.SCHEMA)
+    other.executescript(listings.SCHEMA)
+
+    assert listings.import_csv(db, path) == 3
+    listings.commit_import(other, SALES_CSV)
+
+    def shape(conn):
+        return sorted(map(tuple, conn.execute(
+            "SELECT listing_id, title, price, paid, sold_at, state "
+            "FROM listings ORDER BY listing_id")))
+
+    assert shape(db) == shape(other)
+
+
+def test_a_column_mapped_to_nothing_is_not_imported(db):
+    """The mapping screen offers "ignore this column", and a column left
+    there has to actually be left out - otherwise the screen is showing
+    a choice that does not exist."""
+    mapping = {"sale_date": "sold_at", "item_title": "title",
+               "gross": "price", "my_cost": None, "shipping_paid": None}
+    listings.commit_import(db, SALES_CSV, mapping)
+    assert db.execute(
+        "SELECT COUNT(*) FROM listings WHERE paid IS NOT NULL").fetchone()[0] == 0
+
+
+def test_a_csv_keeps_a_real_listing_id_rather_than_keying_on_its_title(db):
+    """`title_key` exists for rows that have no key, not as a replacement
+    for one that does. Keying a row on its title while Facebook's own id
+    sits in the column beside it invents a second identity for one
+    listing."""
+    listings.commit_import(
+        db, "listing_id,title,price\nFB123,Cast iron skillet,25\n")
+    assert db.execute("SELECT COUNT(*) FROM listings "
+                      "WHERE listing_id='FB123'").fetchone()[0] == 1
+
+
+def test_kept_is_null_when_postage_is_unknown_and_margin_never_moved(db):
+    """Postage is a new column on the view, not a term folded into
+    `margin`. `COALESCE(postage, 0)` would read an unknown postage as
+    free and report the whole price as kept - the same failure as a
+    missing cost reading as free, which is what the comment on `margin`
+    and on `listings.kept` were both written about.
+
+    So this pins two things: `kept` is null rather than flattering, and
+    `margin` is exactly what it was before the columns existed."""
+    db.execute("INSERT INTO listings (listing_id, title, price, paid, state) "
+               "VALUES ('A', 'No postage recorded', 100.0, 30.0, 'sold')")
+    db.execute("INSERT INTO listings (listing_id, title, price, paid, "
+               "postage, state) VALUES ('B', 'All three known', 100.0, 30.0, "
+               "12.50, 'sold')")
+    db.commit()
+    listings.build_views(db)
+
+    rows = {r["listing_id"]: r for r in
+            db.execute("SELECT listing_id, margin, kept FROM v_listing_perf")}
+    assert rows["A"]["kept"] is None, "an unknown postage read as free"
+    assert rows["A"]["margin"] == 70.0, "margin changed under the sheet"
+    assert rows["B"]["kept"] == 57.5
+    assert rows["B"]["margin"] == 70.0
+
+
+def test_a_draft_is_not_in_the_sell_through_denominator(db):
+    """A draft was never for sale. Counting one drags sell-through down
+    exactly the way her own purchases would - the failure `BUYER_KINDS`
+    exists to prevent, arriving from the other direction.
+
+    Filtered once, in `v_listing_perf`, because `v_price_band`,
+    `v_monthly`, `v_aging` and `sheets.TABS` are all built on it and have
+    to become right together."""
+    for i, state in enumerate(("active", "sold")):
+        db.execute("INSERT INTO listings (listing_id, title, price, state, "
+                   "listed_at, sold_at) VALUES (?,?,60.0,?,'2026-01-01',?)",
+                   (f"L{i}", f"Thing {i}", state,
+                    "2026-02-01" if state == "sold" else None))
+    db.commit()
+    listings.build_views(db)
+    before = db.execute("SELECT sell_through_pct FROM v_price_band "
+                        "WHERE price_band='$50-100'").fetchone()[0]
+    assert before == 50.0
+
+    db.execute("INSERT INTO listings (listing_id, title, price, state) "
+               "VALUES ('D1', 'Never written up', 60.0, 'draft')")
+    db.commit()
+    listings.build_views(db)
+    after = db.execute("SELECT sell_through_pct FROM v_price_band "
+                       "WHERE price_band='$50-100'").fetchone()[0]
+    assert after == before, "a draft entered the sell-through denominator"
+
+    # And it is genuinely on the shelf - only the analytics ignore it.
+    assert db.execute("SELECT COUNT(*) FROM listings "
+                      "WHERE state='draft'").fetchone()[0] == 1
+
+
+def test_nothing_demotes_a_listing_to_draft(db):
+    """A draft becoming active is progress. The reverse only happens
+    because she said so, which goes through the fields route - never
+    through something the poller inferred from an email."""
+    listings.upsert_listing(db, "L1", "email", title="Vase", state="active")
+    listings.upsert_listing(db, "L1", "email", title="Vase", state="draft")
+    assert db.execute("SELECT state FROM listings "
+                      "WHERE listing_id='L1'").fetchone()[0] == "active"
+
+
+def test_a_description_is_not_a_note(app):
+    """`notes` is the scribble field and `description` is the listing
+    copy. One column for both means writing the copy silently eats a
+    note, and the two are read at completely different moments."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (title, state, notes) "
+                 "VALUES ('Milk glass vase', 'draft', 'handle is loose')")
+    conn.commit()
+    lid = conn.execute("SELECT id FROM listings").fetchone()["id"]
+
+    status, _h, body = _http(f"{base}/api/inventory/{lid}/fields", "POST",
+                             {"description": "Sound, no chips."},
+                             cookie=cookie, headers=CSRF)
+    assert status == 200
+    item = json.loads(body)["item"]
+    assert item["description"] == "Sound, no chips."
+    assert item["notes"] == "handle is loose"
+
+
+def test_publishing_a_draft_stamps_the_day_it_went_up(app):
+    """`listed_at` is what `v_aging` and `days_listed` are computed from,
+    so a client that forgot to send it would leave the row out of the
+    aging report with nothing to show it had been missed. And
+    republishing must not restart the clock."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (title, state) "
+                 "VALUES ('Milk glass vase', 'draft')")
+    conn.execute("INSERT INTO listings (title, state, listed_at) "
+                 "VALUES ('Brass lamp', 'draft', '2026-01-04')")
+    conn.commit()
+    fresh, dated = [r["id"] for r in
+                    conn.execute("SELECT id FROM listings ORDER BY id")]
+
+    for lid in (fresh, dated):
+        status, _h, body = _http(f"{base}/api/inventory/{lid}/fields", "POST",
+                                 {"state": "active"}, cookie=cookie,
+                                 headers=CSRF)
+        assert status == 200, body
+
+    assert conn.execute("SELECT listed_at FROM listings WHERE id=?",
+                        (fresh,)).fetchone()[0] == date.today().isoformat()
+    assert conn.execute("SELECT listed_at FROM listings WHERE id=?",
+                        (dated,)).fetchone()[0] == "2026-01-04", \
+        "republishing restarted the clock"
+
+
+def test_the_writer_can_ask_which_photos_are_this_thing(app):
+    """`GET /api/photos` answers the opposite question - captures about
+    nothing yet - so before this there was no way to ask which pictures
+    belong to the draft on screen."""
+    base, conn = app
+    _status, cookie = _login(base)
+    conn.execute("INSERT INTO listings (title, state) VALUES ('Vase', 'draft')")
+    conn.commit()
+    lid = conn.execute("SELECT id FROM listings").fetchone()["id"]
+    conn.execute("INSERT INTO photos (path, listing_id, taken_at) "
+                 "VALUES ('photos/b.jpg', ?, '2026-01-02')", (lid,))
+    conn.execute("INSERT INTO photos (path, listing_id, taken_at) "
+                 "VALUES ('photos/a.jpg', ?, '2026-01-01')", (lid,))
+    conn.execute("INSERT INTO photos (path) VALUES ('photos/loose.jpg')")
+    conn.commit()
+
+    status, _h, body = _http(f"{base}/api/inventory/{lid}/photos",
+                             cookie=cookie)
+    assert status == 200
+    got = json.loads(body)["photos"]
+    # Oldest first: the writer offers the first as the cover, and the
+    # first one taken is the one she framed deliberately.
+    assert [p["path"] for p in got] == ["photos/a.jpg", "photos/b.jpg"]
+
+
 def test_dyi_import_walks_unknown_shape(db):
     n, examined = listings.import_dyi(db, FIXTURES / "dyi_export.zip")
     assert examined == 1, "must ignore non-marketplace files"
@@ -1943,6 +2449,7 @@ def test_system_endpoint_leaks_no_secrets(app):
 def test_the_app_shell_is_served(app):
     base, _ = app
     for path, needle in (("/", b"<title>mplabel</title>"),
+                         ("/common.js", b"function esc("),
                          ("/app.js", b"esc("),
                          ("/manifest.json", b"standalone")):
         status, _, body = _http(base + path)
@@ -1952,34 +2459,43 @@ def test_the_app_shell_is_served(app):
 
 def test_every_endpoint_the_client_calls_exists_on_the_server():
     """The two halves ship together and there is no build step, so a
-    renamed route fails silently on a phone that has already cached the
+    renamed route fails silently on a client that has already cached the
     old JavaScript - it is a screen that stays empty, not an error
-    anyone sees. Cheap to pin: read the paths out of app.js and check
-    the routing table answers each one."""
+    anyone sees. Cheap to pin: read the paths out of the client files and
+    check the routing table answers each one.
+
+    Every client file, not just app.js: the desk portal calls routes the
+    phone never touches, and a file left off this list is a whole front
+    end whose endpoints nothing checks."""
     import re as _re
 
     from mplabel import web
 
-    js = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
-          / "app.js").read_text(encoding="utf-8")
+    static = Path(__file__).parent.parent / "src" / "mplabel" / "static"
 
-    # `api('/api/thing/' + id + '/bin')` -> the literal head is enough to
-    # find the route; the variable parts are what the regexes match.
-    called = {m.rstrip("/") for m in
-              _re.findall(r"api\('(/api/[a-z0-9/_-]*)", js)}
-    assert called, "no API calls found - has the helper been renamed?"
+    for name in ("app.js", "desk.js"):
+        js = (static / name).read_text(encoding="utf-8")
 
-    for path in sorted(called):
-        probe = path
-        # Stand in for whatever the client concatenates on.
-        if path.rstrip("/") in ("/api/orders", "/api/inventory", "/api/bins",
-                                "/api/lookup"):
-            candidates = [path, path + "/1", path + "/AAA", path + "/1/bin"]
-        else:
-            candidates = [probe]
-        assert any(
-            any(rx.match(c) for _m, rx, _h, _a in web.Handler._COMPILED)
-            for c in candidates), f"app.js calls {path}, which no route serves"
+        # `api('/api/thing/' + id + '/bin')` -> the literal head is enough
+        # to find the route; the variable parts are what the regexes match.
+        called = {m.rstrip("/") for m in
+                  _re.findall(r"api\('(/api/[a-z0-9/_-]*)", js)}
+        assert called, f"no API calls found in {name} - helper renamed?"
+
+        for path in sorted(called):
+            probe = path
+            # Stand in for whatever the client concatenates on.
+            if path.rstrip("/") in ("/api/orders", "/api/inventory",
+                                    "/api/bins", "/api/lookup",
+                                    "/api/photos", "/api/trips"):
+                candidates = [path, path + "/1", path + "/AAA",
+                              path + "/1/bin", path + "/1/photos"]
+            else:
+                candidates = [probe]
+            assert any(
+                any(rx.match(c) for _m, rx, _h, _a in web.Handler._COMPILED)
+                for c in candidates), \
+                f"{name} calls {path}, which no route serves"
 
 
 def test_the_shelf_tab_is_wired_to_a_backend_that_exists():
@@ -2178,6 +2694,16 @@ def test_the_swift_models_use_the_keys_the_server_actually_sends(app):
                          {"ids": [], "dry_run": True}, cookie=cookie,
                          headers={"X-Mplabel": "1"})
     served |= set(json.loads(body))
+    # A label from anywhere else. A dry run: the crop and the measurement
+    # are real and no stock is spent, which is the whole point of the
+    # flag - and without it `rotation_source` looks like a key the server
+    # never sends, when it is the one that says whether an orientation
+    # was measured or guessed.
+    _s, _h, body = _http(base + web_mod.API_PREFIX + "/print/label?dry_run=1",
+                         "POST", raw=LABEL_PDF.read_bytes(), cookie=cookie,
+                         headers={"X-Mplabel": "1",
+                                  "Content-Type": "application/pdf"})
+    served |= set(json.loads(body)["label"])
     # `expires_in` only appears on login, which the fixture did above.
     served.add("expires_in")
 
@@ -2400,22 +2926,31 @@ def test_the_camera_string_is_present_because_its_absence_is_silent():
 
 def test_the_client_escapes_what_facebook_sends():
     """Item titles come from Marketplace listings, so their text is chosen
-    by someone else. app.js must route every one through esc()."""
+    by someone else. Every client must route every one through esc().
+
+    Both front ends are scanned. They render the same rows out of the
+    same endpoints, so the desk is exposed to exactly the same titles -
+    and a file this does not read is a file where the guard is
+    decoration. The single-letter loop variables are load bearing for the
+    same reason: naming one `order` does not fail this test, it makes it
+    stop looking."""
     # encoding, not the platform default: cp1252 chokes on this file, so
     # without it the test only passes where the locale happens to be UTF-8.
-    js = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
-          / "app.js").read_text(encoding="utf-8")
-    assert "function esc(" in js
+    static = Path(__file__).parent.parent / "src" / "mplabel" / "static"
+    assert "function esc(" in (static / "common.js").read_text(encoding="utf-8")
 
     # Anything concatenated straight into an HTML string is unescaped by
     # definition. o/d/p/a/b/s/t/m are the loop variables holding server
     # data, so a raw `+ o.title` is the bug this is looking for. Numeric
     # ids are the only safe exception - they cannot carry markup.
     numeric_ok = {"id", "print_count", "length"}
-    raw = [f"{v}.{f}" for v, f in
-           re.findall(r"\+\s*\b([odpabstm])\.(\w+)", js)
-           if f not in numeric_ok]
-    assert not raw, f"interpolated into HTML without esc(): {sorted(set(raw))}"
+    for name in ("app.js", "desk.js", "common.js"):
+        js = (static / name).read_text(encoding="utf-8")
+        raw = [f"{v}.{f}" for v, f in
+               re.findall(r"\+\s*\b([odpabstm])\.(\w+)", js)
+               if f not in numeric_ok]
+        assert not raw, \
+            f"{name} interpolates without esc(): {sorted(set(raw))}"
 
 
 # ------------------------------------- the web app meets the label backstop
@@ -4628,6 +5163,91 @@ def test_the_phone_can_make_a_bin_and_fill_it(app):
         ["Hobnail milk glass vase"]
 
 
+def _three_items(conn):
+    conn.executemany(
+        "INSERT INTO listings (title, state, era, price, paid) VALUES "
+        "(?, 'active', '1950s', 20.0, 5.0)",
+        [("Milk glass vase",), ("Jadeite mugs",), ("Enamel bread bin",)])
+    conn.commit()
+    return [r["id"] for r in
+            conn.execute("SELECT id FROM listings ORDER BY id")]
+
+
+def test_a_bulk_edit_is_all_or_nothing(app):
+    """The desk puts a confirm dialog in front of this saying there is no
+    undo, so a half-applied edit is the one outcome that must be
+    impossible - she would have no way to tell which rows moved.
+
+    The trap it is guarding is specific: `set_bin` and `set_cost` each
+    commit on their own, so applying the edit row by row through them
+    would leave the first ones standing when a later one is refused, and
+    a rollback afterwards would have nothing left to undo."""
+    base, conn = app
+    _status, cookie = _login(base)
+    ids = _three_items(conn)
+
+    # A bin nobody has made. The first two rows must not move either.
+    status, _h, body = _http(f"{base}/api/inventory/bulk", "POST",
+                             {"ids": ids, "set": {"bin": "NOWHERE"}},
+                             cookie=cookie, headers=CSRF)
+    assert status == 400, body
+    assert conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE bin_code IS NOT NULL"
+    ).fetchone()[0] == 0
+
+    # And one id that does not exist refuses the whole batch, rather than
+    # updating the real ones and quietly dropping the rest.
+    status, _h, _b = _http(f"{base}/api/inventory/bulk", "POST",
+                           {"ids": ids + [9999], "set": {"era": "1970s"}},
+                           cookie=cookie, headers=CSRF)
+    assert status == 400
+    assert conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE era='1970s'").fetchone()[0] == 0
+
+
+def test_a_bulk_edit_writes_every_row_it_was_given(app):
+    base, conn = app
+    _status, cookie = _login(base)
+    ids = _three_items(conn)
+
+    status, _h, body = _http(f"{base}/api/inventory/bulk", "POST",
+                             {"ids": ids, "set": {"era": "1970s"}},
+                             cookie=cookie, headers=CSRF)
+    assert status == 200
+    assert json.loads(body)["changed"] == 3
+    assert conn.execute(
+        "SELECT COUNT(*) FROM listings WHERE era='1970s'").fetchone()[0] == 3
+
+
+def test_a_bulk_edit_refuses_a_field_that_is_not_on_the_list(app):
+    """`state` is writable and `id` is not. Without the check a client
+    could rename the primary key of forty rows in one request."""
+    base, conn = app
+    _status, cookie = _login(base)
+    ids = _three_items(conn)
+    status, _h, body = _http(f"{base}/api/inventory/bulk", "POST",
+                             {"ids": ids, "set": {"id": 1}},
+                             cookie=cookie, headers=CSRF)
+    assert status == 400
+    assert b"cannot set id" in body
+
+
+def test_bulk_and_single_edits_share_one_allow_list():
+    """Two lists would mean a field editable one row at a time and not
+    forty, or the other way round - a difference nobody notices until
+    they hit it, and then it reads as the bulk bar being broken."""
+    import inspect
+
+    from mplabel import web
+
+    for fn in (web.Handler.h_item_fields, web.Handler.h_bulk_items):
+        src = inspect.getsource(fn)
+        assert "ITEM_FIELDS" in src or "_item_sets" in src, \
+            f"{fn.__name__} does not go through the shared allow-list"
+    assert "paid" not in web.ITEM_FIELDS, \
+        "paid is a money parse, not a plain column write"
+
+
 def test_the_item_view_carries_the_bin_name_not_just_its_code(app):
     """The phone shows "LOFT, NORTH WALL", not a three-character code -
     the code is for scanning. One join here rather than a second request
@@ -6612,13 +7232,88 @@ def test_marker_js_port_agrees_with_python(tmp_path):
     assert json.loads(out.stdout) == [], out.stdout
 
 
-def test_marker_js_is_listed_for_cache_busting():
-    """`asset_stamp` is what stops a phone going on using a cached copy
-    of a file that changed. A served asset missing from that list ships
-    a decoder update that never arrives."""
-    import inspect
+def test_every_served_asset_is_cache_busted():
+    """`STAMPED_ASSETS` is what stops a client going on using a cached
+    copy of a file that changed. A served asset missing from it ships an
+    update that never arrives - the deploy looks done and the behaviour
+    is the old one.
+
+    This asks the directory rather than naming files, because the failure
+    is always the same shape: someone adds an asset and does not think
+    about this list. It started life pinning marker.js alone, which is
+    exactly the file that had been forgotten once."""
     from mplabel import web
-    assert "marker.js" in inspect.getsource(web.asset_stamp)
+
+    static = Path(__file__).parent.parent / "src" / "mplabel" / "static"
+    served = {p.name for p in static.iterdir()
+              if p.suffix in (".js", ".css")}
+    missing = served - set(web.STAMPED_ASSETS)
+    assert not missing, f"served but never cache-busted: {sorted(missing)}"
+
+    # And nothing in the list has been deleted from under it - a stale
+    # name is a silent no-op in `shell_html`, not an error.
+    assert not set(web.STAMPED_ASSETS) - served
+
+
+def test_the_desk_shell_is_served(app):
+    """`/desk` is an alias resolved in `safe_static_path`, so it goes
+    through the same containment check as everything else - and it has to
+    get the shell treatment, or its scripts ship without a version stamp
+    and a laptop goes on running the copy it cached."""
+    base, _ = app
+    status, headers, body = _http(base + "/desk")
+    assert status == 200
+    assert b"<title>mplabel \xe2\x80\x94 desk</title>" in body
+    assert headers.get("Cache-Control") == "no-store"
+    for name in ("desk.js", "desk.css", "tokens.css", "common.js"):
+        assert f'"/{name}?v='.encode() in body, f"{name} is not stamped"
+    # The portrait, standalone manifest belongs to the phone. A laptop
+    # tab picking it up is an install prompt for the wrong application.
+    assert b'rel="manifest"' not in body
+
+    # And the trailing-slash form is the same page, not a 404.
+    assert _http(base + "/desk/")[0] == 200
+
+
+def test_the_desk_and_the_phone_share_one_palette():
+    """Both clients read the same tokens, so a colour changed for one
+    cannot leave the other behind. Nobody has the two open side by side,
+    which is exactly why nothing would report the drift."""
+    static = Path(__file__).parent.parent / "src" / "mplabel" / "static"
+    tokens = (static / "tokens.css").read_text(encoding="utf-8")
+    for name in ("--ac", "--al", "--wa", "--cbg", "--mv-font-mono"):
+        assert name in tokens, f"{name} is not in tokens.css"
+    for sheet in ("app.css", "desk.css"):
+        text = (static / sheet).read_text(encoding="utf-8")
+        assert "--ac:" not in text, f"{sheet} redefines the palette"
+        assert "--mv-font-sans:" not in text, f"{sheet} redefines the fonts"
+    for shell in ("index.html", "desk.html"):
+        assert "/tokens.css" in (static / shell).read_text(encoding="utf-8")
+
+
+def test_the_desk_queue_shows_no_full_buyer_name():
+    """`_order_row` sends a first name and `_order_detail` sends the whole
+    one, deliberately - a list is what gets left open on a kitchen table
+    and screenshotted. The desk renders a queue and a detail pane on the
+    same screen, so it is the one client that can mix them up."""
+    js = (Path(__file__).parent.parent / "src" / "mplabel" / "static"
+          / "desk.js").read_text(encoding="utf-8")
+    rows = js[js.index("function viewQueue("):js.index("function pickOrder(")]
+    assert "o.buyer" in rows, "the queue rows stopped naming the buyer"
+    assert "detail.buyer" not in rows and "d.buyer" not in rows, \
+        "the queue list is reading the detail payload's full name"
+
+
+def test_both_shells_are_stamped_and_never_cached():
+    """A shell served with an ETag is a client that revalidates its way
+    to the same stale asset URLs. `index.html` was special-cased by name;
+    the desk portal is a second one, and the check has to know that or it
+    ships unstamped."""
+    from mplabel import web
+    assert set(web.SHELLS) == {"index.html", "desk.html"}
+    for name in web.SHELLS:
+        assert (Path(__file__).parent.parent / "src" / "mplabel" / "static"
+                / name).is_file(), f"{name} is listed as a shell but absent"
     assert (Path(web.__file__).parent / "static" / "marker.js").exists()
 
 
@@ -7257,6 +7952,259 @@ def test_an_oversized_photo_is_refused_before_it_is_read(app):
         pass
 
     assert conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0] == 0
+
+
+# ------------------------------------------------- a label from anywhere
+#
+# Everything else on this server prints a label it already has, off a
+# sales row, checked against the address recorded when that sale was
+# filed. This route prints a PDF somebody just handed it and records
+# nothing beyond printd's journal, and every test here is about one of
+# those two halves staying true.
+
+def _adhoc(base, headers, body, query=""):
+    head = dict(headers or {})
+    head["Content-Type"] = "application/pdf"
+    return _http(f"{base}/api/v1/print/label{query}", "POST", raw=body,
+                 headers=head)
+
+
+def test_an_arbitrary_label_prints_through_the_same_path_as_everything_else(
+        app, monkeypatch):
+    """Not a reimplementation of printing. `cli.print_label` is what knows
+    to take the flock on a local backend and to skip it on a remote one,
+    and a second copy of that decision is how the loopback deadlock got
+    reintroduced against the second device."""
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+
+    sent = []
+    monkeypatch.setattr(cli, "print_label",
+                        lambda *a, **k: sent.append((a, k)))
+    status, _, body = _adhoc(base, head, LABEL_PDF.read_bytes())
+    assert status == 200
+    info = _json_of(body)["label"]
+    assert info["printed"] is True
+    assert info["size_in"] == [4.0, 6.0]
+    assert len(sent) == 1
+    # (cfg, path) and a job id, and no parcel code: codes come off the
+    # sales table and this has no row in it, so stamping one would put a
+    # parcel that does not exist on a real label.
+    assert len(sent[0][0]) == 2
+    assert sent[0][1] == {"job": info["job"]}
+
+
+def test_an_arbitrary_label_leaves_no_row_behind(app, monkeypatch):
+    """It is not a sale. A row here would put a parcel nobody bought into
+    revenue, into sell-through and into the Sheet, and `verify` would
+    then be checking a label against a buyer who does not exist."""
+    from mplabel import cli
+
+    base, conn = app
+    head = _auth(base)
+    before = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+    assert _adhoc(base, head, LABEL_PDF.read_bytes())[0] == 200
+    assert conn.execute("SELECT count(*) FROM sales").fetchone()[0] == before
+    assert conn.execute("SELECT count(*) FROM listings").fetchone()[0] == 0
+
+
+def test_the_same_pdf_twice_is_one_job(app, monkeypatch):
+    """She is on a phone behind a tunnel and the request timed out. A
+    random job id would turn her retry into a second label; the digest
+    lets printd answer 409 instead. Asking again on purpose is --force,
+    which is a different intent and gets a different id."""
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+
+    body = LABEL_PDF.read_bytes()
+    first = _json_of(_adhoc(base, head, body)[2])["label"]
+    again = _json_of(_adhoc(base, head, body)[2])["label"]
+    forced = _json_of(_adhoc(base, head, body, "?force=1")[2])["label"]
+
+    assert first["job"] == again["job"]
+    assert forced["job"] != first["job"]
+    assert first["job"].startswith("adhoc-")
+
+
+def test_the_job_id_reaches_the_printer_or_it_dedupes_nothing(tmp_path,
+                                                              monkeypatch):
+    """Deriving the id from the digest is only worth anything if printd
+    is the thing that sees it. It rides on the remote backend alone: a
+    local device keeps no journal, so there is nothing there that could
+    answer a duplicate."""
+    from mplabel import cli, printers
+
+    calls = []
+    monkeypatch.setattr(printers, "send",
+                        lambda path, backend, **kw: calls.append((backend, kw)))
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+
+    cli.print_label({"printer_backend": "pi-http", "printd_url": "http://x",
+                     "printd_secret": "s", "home": str(tmp_path)},
+                    str(pdf), job="adhoc-deadbeef")
+    assert calls[-1][1]["job"] == "adhoc-deadbeef"
+
+    cli.print_label({"printer_backend": "tspl", "printer_device": "/dev/null",
+                     "home": str(tmp_path)}, str(pdf), job="adhoc-deadbeef")
+    assert "job" not in calls[-1][1]
+
+
+def test_a_dry_run_prints_nothing_and_still_says_what_it_would_do(
+        app, monkeypatch):
+    """On a printer that cannot report a failure, the cheap way to find
+    out whether a new seller's PDF crops correctly has to cost no stock."""
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+
+    status, _, body = _adhoc(base, head, LABEL_PDF.read_bytes(), "?dry_run=1")
+    assert status == 200
+    info = _json_of(body)["label"]
+    assert sent == []
+    assert info["printed"] is False and info["dry_run"] is True
+    assert info["size_in"] == [4.0, 6.0]
+    assert info["rotation"] == 90
+
+
+@pytest.mark.parametrize("backend,expected", [("tspl", "nowhere"),
+                                              ("pi-http", "printd journal")])
+def test_the_answer_says_where_the_record_went(tmp_path, backend, expected):
+    """Journal-only is the whole design, so "which journal" has to be
+    answerable - and pointed straight at a device the honest answer is
+    "nowhere", not a quieter wording of it. A caveat that stops being
+    true, or was never true on this host, is worse than no caveat."""
+    import threading
+
+    from mplabel import cli, web
+
+    cli.connect_db(tmp_path)
+    cfg = {"home": str(tmp_path), "printer_backend": backend,
+           "web_password_hash": web.hash_password("hunter2"),
+           "web_secure_cookie": "no"}
+    srv = web.Server(("127.0.0.1", 0), cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        info = _json_of(_adhoc(base, _auth(base), LABEL_PDF.read_bytes(),
+                               "?dry_run=1")[2])["label"]
+        assert expected in info["recorded"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_body_that_is_not_a_pdf_is_refused_before_anything_opens(
+        app, monkeypatch):
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+
+    status, _, body = _adhoc(base, head, b"this is not a pdf at all")
+    assert status == 400
+    assert "not a PDF" in _json_of(body)["error"]
+
+    # And a PDF announced as something else. The type is checked as well
+    # as the magic, because the type is what says how to read the body.
+    status, _, _ = _http(f"{base}/api/v1/print/label", "POST",
+                         raw=b"%PDF-1.4\n",
+                         headers=dict(head, **{"Content-Type": "text/plain"}))
+    assert status == 400
+    assert sent == []
+
+
+def test_a_label_that_cannot_be_cropped_says_why(app, tmp_path, monkeypatch):
+    """"This may not be a shipping label" is actionable, "bad request" is
+    not, and this is the one screen where the reason *is* the feature -
+    the person holding the file is the only one who can resolve it."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+
+    src = tmp_path / "full.pdf"
+    c = canvas.Canvas(str(src), pagesize=letter)
+    c.rect(20, 20, 550, 700)
+    c.showPage()
+    c.save()
+
+    status, _, body = _adhoc(base, head, src.read_bytes())
+    assert status == 400
+    assert "4 x 6" in _json_of(body)["error"]
+
+
+def test_a_page_and_a_region_can_be_chosen_over_the_wire(app, tmp_path,
+                                                         monkeypatch):
+    """The server refuses to guess between two look-alike blocks, so the
+    way to resolve that has to survive the trip from the phone."""
+    from reportlab.pdfgen import canvas
+    from mplabel import cli
+
+    base, _conn = app
+    head = _auth(base)
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: None)
+
+    src = tmp_path / "two.pdf"
+    c = canvas.Canvas(str(src), pagesize=(612, 936))
+    _label_block(c, x0=90, y0=40)
+    _label_block(c, x0=90, y0=500)
+    c.showPage()
+    c.save()
+    body = src.read_bytes()
+
+    status, _, answer = _adhoc(base, head, body)
+    assert status == 400 and "--region" in _json_of(answer)["error"]
+
+    one = _json_of(_adhoc(base, head, body, "?region=1&dry_run=1")[2])["label"]
+    two = _json_of(_adhoc(base, head, body, "?region=2&dry_run=1")[2])["label"]
+    assert one["crop_bbox"] != two["crop_bbox"]
+    assert one["regions_found"] == 2
+
+    status, _, answer = _adhoc(base, head, body, "?region=9")
+    assert status == 400 and "no region 9" in _json_of(answer)["error"]
+
+
+def test_an_oversized_upload_is_refused_on_content_length(app, monkeypatch):
+    """Refused before a byte is read, like the photo route: pulling a
+    hundred megabytes into memory on a Pi is how the OOM killer gets to
+    stop the label printer."""
+    import urllib.error
+
+    from mplabel import cli, web
+
+    base, _conn = app
+    head = _auth(base)
+    sent = []
+    monkeypatch.setattr(cli, "print_label", lambda *a, **k: sent.append(a))
+    assert web.MAX_LABEL < web.MAX_PHOTO
+
+    try:
+        status, _, _ = _adhoc(base, head, b"%PDF-1.4\n" + b"\0" * web.MAX_LABEL)
+        assert status in (400, 413)
+    except (urllib.error.URLError, ConnectionError, BrokenPipeError):
+        pass
+    assert sent == []
+
+
+def test_the_ad_hoc_route_needs_authentication(app):
+    base, _conn = app
+    assert _adhoc(base, {"X-Mplabel": "1"}, b"%PDF-1.4\n")[0] == 401
 
 
 def test_the_sourcing_routes_need_authentication(app):
