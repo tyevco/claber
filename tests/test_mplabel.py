@@ -11,6 +11,7 @@ import argparse
 import csv
 import email
 import importlib.util
+import inspect
 import io
 import json
 import re
@@ -10466,3 +10467,288 @@ def test_the_sellers_city_wins_over_the_shipping_address(paid_mail):
 
     order = goodwill.parse(paid_mail)
     assert order["seller_city"] == "Springfield"
+# --- ebay: orders in
+#
+# The fixture is synthetic, like every other one here. A real eBay order
+# carries a buyer's home address and `.gitignore` exists for that reason.
+
+
+def _ebay_order(**over):
+    """One order, shaped the way eBay's Fulfillment API sends them.
+
+    ASSUMED, and the table in CLAUDE.md says so: this is built from the
+    documented schema and has never been compared with a real payload.
+    A green test here does not move that row up.
+    """
+    order = {
+        "orderId": "12-34567-89012",
+        "creationDate": "2026-09-10T14:22:01.000Z",
+        "orderFulfillmentStatus": "NOT_STARTED",
+        "buyer": {"username": "b***r"},
+        # Deliberately not equal to the line item: total carries delivery
+        # and tax, and reading it as the sale price is the whole trap.
+        "pricingSummary": {
+            "priceSubtotal": {"value": "42.00", "currency": "USD"},
+            "deliveryCost": {"value": "8.40", "currency": "USD"},
+            "tax": {"value": "3.15", "currency": "USD"},
+            "total": {"value": "53.55", "currency": "USD"},
+        },
+        "lineItems": [{
+            "lineItemId": "9876543210",
+            "sku": "MP-7QK3",
+            "title": "Milk glass vase with a chip",
+            "lineItemCost": {"value": "42.00", "currency": "USD"},
+            "quantity": 1,
+            "lineItemFulfillmentInstructions": {
+                "shipByDate": "2026-09-15T06:59:59.000Z"},
+        }],
+        "fulfillmentStartInstructions": [{
+            "fulfillmentInstructionsType": "SELLER_DEFINED",
+            "shippingStep": {
+                "shipTo": {
+                    "fullName": "Jane Doe",
+                    "contactAddress": {
+                        "addressLine1": "12 Main St",
+                        "city": "Springfield",
+                        "stateOrProvince": "IL",
+                        "postalCode": "62704",
+                        "countryCode": "US",
+                    },
+                },
+                "shippingCarrierCode": "USPS",
+                "shippingServiceCode": "USPSGroundAdvantage",
+            },
+        }],
+    }
+    order.update(over)
+    return order
+
+
+def test_ebay_price_is_the_line_items_not_the_order_total():
+    """The order total carries delivery and sales tax.
+
+    `amount_with_offset` in a new dress: reading the wrong money field
+    corrupts every average silently, and here it would put sales tax
+    into `v_monthly.gross` and into the median `listings.worth` prices
+    the next object off.
+    """
+    from mplabel import ebay
+
+    rec = ebay.order_to_sale(_ebay_order())
+    assert rec["price"] == 42.00
+    # And it is a number, not the decimal string eBay sent: a REAL
+    # column will happily store text and the averages go quiet.
+    assert isinstance(rec["price"], float)
+
+
+def test_ebay_message_id_is_not_null():
+    """Six call sites on the print path key on this column.
+
+    `ensure_code` returns early on a falsy one so no parcel code is
+    minted, `mark_printed` matches no row so a printed parcel never
+    leaves Pending, and `notify.failed_prints` then reports it daily.
+    The scheme prefix is `title_key`'s `saved:` move and cannot collide
+    with a real Message-ID, which is always `<...@...>`.
+    """
+    from mplabel import ebay
+
+    rec = ebay.order_to_sale(_ebay_order())
+    assert rec["message_id"] == "ebay:12-34567-89012"
+    assert "@" not in rec["message_id"]
+
+
+def test_ebay_ship_by_is_a_local_date_not_a_utc_stamp():
+    """`notify.due_parcels` compares this column as a *string*.
+
+    `'2026-09-15T06:59:59.000Z' <= '2026-09-15'` is false, so a parcel
+    due today would never be reported until the day after it was due -
+    and 06:59Z is the previous evening in Eastern anyway. Same trap
+    CLAUDE.md records for `date('now')` being UTC.
+    """
+    from mplabel import ebay
+    from datetime import datetime, timezone
+
+    rec = ebay.order_to_sale(_ebay_order())
+    assert rec["ship_by"] == datetime(
+        2026, 9, 15, 6, 59, 59,
+        tzinfo=timezone.utc).astimezone().date().isoformat()
+    # The shape `notify` and `cmd_pending` expect, and nothing more.
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", rec["ship_by"])
+
+
+def test_ebay_received_at_carries_an_offset_like_the_mail_path():
+    """`cmd_pending` slices ten characters off this and `notify` calls
+    `date()` on it, so a bare `Z` puts both on the wrong side of local
+    midnight all evening. `mailparse` writes an offset; match it."""
+    from mplabel import ebay
+
+    rec = ebay.order_to_sale(_ebay_order())
+    assert not rec["received_at"].endswith("Z")
+    assert re.search(r"[+-]\d{2}:\d{2}$", rec["received_at"])
+
+
+def test_ebay_buyer_prefers_the_shipping_name_to_the_masked_handle():
+    """eBay masks the username as `b***r` in places, and the parcel has
+    a real name on it. Fall back to the handle only when there is no
+    shipping name at all."""
+    from mplabel import ebay
+
+    assert ebay.order_to_sale(_ebay_order())["buyer"] == "Jane Doe"
+    bare = _ebay_order(fulfillmentStartInstructions=[])
+    assert ebay.order_to_sale(bare)["buyer"] == "b***r"
+
+
+def test_ebay_keeps_the_sku_so_a_pull_can_find_its_listing():
+    """This is what stops `link_sales` minting a phantom.
+
+    An 80-character keyword-stuffed eBay title will not match the local
+    one after `\\W+` collapsing, so the title fallback creates a second
+    listings row - the original stays `active` while the count grows,
+    and sell-through moves *down* on a sale. The SKU is the handle back
+    through `ebay_offers`.
+    """
+    from mplabel import ebay
+
+    assert ebay.order_to_sale(_ebay_order())["sku"] == "MP-7QK3"
+
+
+def test_ebay_sku_is_dropped_by_upsert_rather_than_erroring():
+    """`sku` is not a `sales` column, and `upsert` filters to its own
+    whitelist. Pinned because the mapping deliberately returns a key the
+    writer ignores, and a future reader will wonder whether that is a
+    bug."""
+    from mplabel import cli, ebay
+
+    rec = ebay.order_to_sale(_ebay_order())
+    assert "sku" in rec
+    source = inspect.getsource(cli.upsert)
+    assert '"sku"' not in source
+
+
+def test_ebay_pull_refuses_without_dry_run(ebay_cfg, db, capsys):
+    """A command that silently does less than its name says is worse
+    than one that stops. Writing is the next slice."""
+    from mplabel import cli
+
+    code = cli.cmd_ebay_pull(
+        ebay_cfg, db,
+        argparse.Namespace(dry_run=False, since=None, limit=None))
+    assert code == 2
+    assert "not built yet" in capsys.readouterr().err
+
+
+def test_ebay_pull_dry_run_writes_nothing_and_repeats_itself(ebay_cfg, db,
+                                                              monkeypatch,
+                                                              capsys):
+    """The honesty of a dry run is the whole feature.
+
+    `notify --dry-run` got this wrong once - it ran the decision and
+    then rolled back, which did nothing because `remember` had already
+    committed - so this asserts the table is untouched *and* that a
+    second run says the same thing.
+    """
+    from mplabel import cli, ebay
+
+    monkeypatch.setattr(ebay, "get_orders",
+                        lambda cfg, since=None, limit=None: [_ebay_order()])
+    args = argparse.Namespace(dry_run=True, since=None, limit=None)
+
+    assert cli.cmd_ebay_pull(ebay_cfg, db, args) == 0
+    first = capsys.readouterr().out
+    assert "would record 1 sale(s)" in first
+    assert db.execute("SELECT COUNT(*) FROM sales").fetchone()[0] == 0
+
+    assert cli.cmd_ebay_pull(ebay_cfg, db, args) == 0
+    assert capsys.readouterr().out == first
+
+
+def test_ebay_pull_does_not_offer_an_order_already_recorded(ebay_cfg, db,
+                                                             monkeypatch,
+                                                             capsys):
+    """The unit of a sale is the order, here as everywhere.
+
+    A second pull over the same window must not be able to produce a
+    second row, and the dry run has to say so or it is describing work
+    that would not happen.
+    """
+    from mplabel import cli, ebay
+
+    db.execute("INSERT INTO sales (order_id, message_id, item) "
+               "VALUES (?, ?, ?)",
+               ("12-34567-89012", "ebay:12-34567-89012", "Milk glass vase"))
+    db.commit()
+    monkeypatch.setattr(ebay, "get_orders",
+                        lambda cfg, since=None, limit=None: [_ebay_order()])
+
+    cli.cmd_ebay_pull(ebay_cfg, db,
+                      argparse.Namespace(dry_run=True, since=None, limit=None))
+    out = capsys.readouterr().out
+    assert "would record 0 sale(s)" in out
+    assert "1 already in the database" in out
+
+
+def test_ebay_order_filter_is_a_creationdate_range(ebay_cfg, monkeypatch):
+    """The brackets and the `..` are eBay's range syntax, not decoration.
+
+    Pinned because a filter that does not parse is not an error - eBay
+    ignores it and returns every order there has ever been, which reads
+    as the window being wrong rather than the query being malformed.
+    """
+    from mplabel import ebay
+    from urllib.parse import parse_qs, urlparse
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1"}),
+        (200, {"orders": [], "total": 0}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    ebay.get_orders(ebay_cfg, since="2026-09-01T00:00:00Z")
+    query = parse_qs(urlparse(transport.calls[1]["url"]).query)
+    assert query["filter"] == ["creationdate:[2026-09-01T00:00:00.000Z..]"]
+
+
+def test_ebay_order_pull_follows_the_next_page(ebay_cfg, monkeypatch):
+    """`next` is a full href when there is another page.
+
+    Following it rather than incrementing an offset keeps the filter
+    intact - rebuilding the query by hand is how a paginated pull
+    quietly starts returning the first page for ever.
+    """
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1"}),
+        (200, {"orders": [_ebay_order()],
+               "next": "https://api.sandbox.ebay.com/sell/fulfillment/v1/"
+                       "order?limit=50&offset=50"}),
+        (200, {"orders": [_ebay_order(orderId="12-00000-00001")]}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    orders = ebay.get_orders(ebay_cfg)
+    assert [o["orderId"] for o in orders] == ["12-34567-89012",
+                                              "12-00000-00001"]
+
+
+def test_ebay_order_refusal_names_the_field(ebay_cfg, monkeypatch):
+    """A 400 here is usually the filter, and eBay says which."""
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1"}),
+        (400, {"errors": [{"errorId": 1001, "message": "Invalid filter.",
+                           "parameters": [{"name": "filter",
+                                           "value": "creationdate"}]}]}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    with pytest.raises(ebay.EbayError) as caught:
+        ebay.get_orders(ebay_cfg)
+    assert "filter=creationdate" in str(caught.value)

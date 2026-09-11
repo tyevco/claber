@@ -114,6 +114,7 @@ run against a real database.
 | `config [--all]` | the resolved config, each key marked `default`/`file`/`env`, secrets redacted, and **which** file was read. No DB |
 | `ebay auth [--code C]` | consent for the eBay account. No `--code` prints the URL; the Pi is headless, so consent happens in a browser elsewhere and the code is pasted back. No DB |
 | `ebay check` | config, tokens, and how long the refresh token has left. Changes nothing, sends nothing, exits **78** if anything needs attention. No DB |
+| `ebay pull [--since D] [--limit N] --dry-run` | eBay orders as `sales` rows. `--dry-run` is the **only** mode: it prints what it would record and writes nothing, and refuses with exit **2** without the flag |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -2037,6 +2038,20 @@ here because each was expensive to find:
   existing analytic working - and a row in `listings` is a thing on a
   shelf, not a posting. Cross-posting one object to both channels is
   the normal case.
+**Three decisions taken, so they are not re-litigated.** The photographs
+reach eBay from **the tunnel** - an unauthenticated, unguessable
+`/photos/<sha256>` route that eBay fetches - rather than through the
+legacy Trading API's picture server. The sha256 is 256 bits so the URL
+is unguessable, but this is still the first unauthenticated route on the
+host that serves buyers' names and addresses, and that posture has been
+deliberate until now: whatever is built there must serve *only* photo
+bytes, by digest, and must not become a way to ask the server anything
+else. The business policies get **`mplabel ebay setup`**, which creates
+the three policies and the inventory location through the Account API -
+reproducible, and identical in sandbox and production. The one thing it
+cannot do is the Business Policies opt-in itself, which is a click in My
+eBay.
+
 - **Pulling her eBay orders in *is* the sold-comps feature.** Those are
   her own realised prices, and they reach `comparables()` through
   `link_sales` for free. eBay's Marketplace Insights is partner-only,

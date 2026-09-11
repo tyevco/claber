@@ -505,3 +505,236 @@ def check(cfg):
         add(label, value or "(unset)",
             None if value else "needed to publish, not to draft")
     return rows
+
+
+# ------------------------------------------------------------- orders
+
+ORDERS_PATH = "/sell/fulfillment/v1/order"
+
+# eBay's own maximum for this resource. Asking for more is a 400.
+PAGE_LIMIT = 50
+
+# How far back `pull` looks when nobody says. Deliberately shorter than
+# `lookback_days` for mail: a pulled order is deduplicated against the
+# database by order id, so a wide window costs API calls rather than
+# correctness - but there is no Gmail-threading problem here to need one.
+DEFAULT_SINCE_DAYS = 14
+
+
+def _money(node):
+    """A `{"value": "42.00", "currency": "USD"}` as a float.
+
+    eBay sends money as a decimal *string*, which is the right choice on
+    their side and a trap on ours: `float` is correct here because
+    `sales.price` is a REAL and every other price in this system already
+    is, but the string must not be handed straight to SQLite - a column
+    typed REAL will take "42.00" and store text, and the averages then
+    silently come out wrong.
+    """
+    if not node:
+        return None
+    value = node.get("value")
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _local_date(stamp):
+    """An eBay UTC timestamp as a **local** `YYYY-MM-DD`.
+
+    This is load bearing and the trap is recorded in CLAUDE.md: every
+    date in this system is local, and `notify.due_parcels` compares
+    `ship_by` as a *string* against `date.today().isoformat()`. eBay
+    sends RFC 3339 UTC, so storing it raw fails twice over -
+    `'2026-09-15T06:59:59.000Z' <= '2026-09-15'` is false because the
+    `T` sorts after nothing, so a parcel due today is never reported
+    until the day after it was due; and `06:59:59Z` is the previous
+    evening in Eastern anyway.
+    """
+    when = _parse_stamp(stamp)
+    return when.astimezone().date().isoformat() if when else None
+
+
+def _local_stamp(stamp):
+    """An eBay UTC timestamp as a local ISO string with its offset.
+
+    Matches the shape the mail path writes - `mailparse` stores
+    `received.isoformat()` carrying the sender's offset - because
+    `cmd_pending` slices the first ten characters off this column and
+    `notify.failed_prints` calls `date()` on it. A bare `Z` would put
+    those two on the wrong side of local midnight all evening.
+    """
+    when = _parse_stamp(stamp)
+    return when.astimezone().isoformat(timespec="seconds") if when else None
+
+
+def _parse_stamp(stamp):
+    if not stamp:
+        return None
+    text = stamp.strip()
+    # RFC 3339 says `Z`; `fromisoformat` only learned it in 3.11 and the
+    # Pi is not guaranteed to be there.
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        when = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    # A stamp with no offset is meaningless to `astimezone`, which would
+    # read it as local and shift it again. eBay always sends one; a
+    # fixture might not.
+    return when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when
+
+
+def _ship_to(order):
+    """The buyer's address as one line, the way the label path stores it.
+
+    Note this is the address eBay *says*. `sales.ship_to` is what
+    `label_belongs_to` compares against the recipient read back off the
+    printed PDF, and for a Facebook sale both sides come from the same
+    page - so they are string-equal by construction. They will not be
+    here, which is why the attach path has to cross-check the two loosely
+    once and then store the PDF's version. Do not wire this column
+    straight into a print-time comparison.
+    """
+    for instruction in order.get("fulfillmentStartInstructions") or []:
+        ship_to = (instruction.get("shippingStep") or {}).get("shipTo") or {}
+        address = ship_to.get("contactAddress") or {}
+        parts = [
+            ship_to.get("fullName"),
+            address.get("addressLine1"),
+            address.get("addressLine2"),
+            " ".join(p for p in (address.get("city"),
+                                 address.get("stateOrProvince"),
+                                 address.get("postalCode")) if p),
+        ]
+        line = ", ".join(p for p in parts if p)
+        if line:
+            return line
+    return None
+
+
+def order_to_sale(order):
+    """One eBay order as a `sales` row.
+
+    Every key here is a real column on `sales` except `sku`, which is
+    the line item's SKU - the handle back to `listings.inventory_code`
+    through `ebay_offers`. `cli.upsert` filters to its own whitelist, so
+    the extra key is dropped rather than erroring; it is here because the
+    dry run should show it and because resolving through it is what stops
+    `link_sales` minting a phantom listing beside the real one.
+
+    Three decisions in this mapping matter more than the rest.
+
+    **`message_id` is synthetic.** `ebay:<orderId>` rather than NULL,
+    because six call sites on the print path key on that column and all
+    six fail *silently* on a falsy one - `ensure_code` mints no parcel
+    code, `mark_printed` matches no row so a printed parcel never leaves
+    Pending, and `notify.failed_prints` then reports it every day. The
+    scheme prefix is the same move `title_key`'s `saved:` and
+    `import_dyi`'s `dyi:` already make, and it cannot collide with a real
+    Message-ID, which is always `<...@...>`.
+
+    **`price` is the line items, not the order total.**
+    `pricingSummary.total` carries delivery and sales tax. Putting it
+    here would put tax into `v_monthly.gross` and into the median
+    `listings.worth` prices the next object off - the
+    `amount_with_offset` trap in a new dress, and the same silent
+    corruption of every average.
+
+    **The dates are converted to local.** See `_local_date`.
+    """
+    line_items = order.get("lineItems") or []
+    costs = [_money(item.get("lineItemCost")) for item in line_items]
+    costs = [c for c in costs if c is not None]
+
+    ship_by = None
+    for item in line_items:
+        due = (item.get("lineItemFulfillmentInstructions")
+               or {}).get("shipByDate")
+        if due:
+            # The earliest deadline across the order: one parcel, and the
+            # tightest date is the one that matters.
+            local = _local_date(due)
+            if local and (ship_by is None or local < ship_by):
+                ship_by = local
+
+    buyer = order.get("buyer") or {}
+    ship_to_name = None
+    for instruction in order.get("fulfillmentStartInstructions") or []:
+        ship_to = (instruction.get("shippingStep") or {}).get("shipTo") or {}
+        ship_to_name = ship_to.get("fullName")
+        if ship_to_name:
+            break
+
+    service = None
+    for instruction in order.get("fulfillmentStartInstructions") or []:
+        step = instruction.get("shippingStep") or {}
+        service = " ".join(p for p in (step.get("shippingCarrierCode"),
+                                       step.get("shippingServiceCode")) if p)
+        if service:
+            break
+
+    return {
+        "order_id": order.get("orderId"),
+        # Not NULL. See the docstring - this one is not cosmetic.
+        "message_id": f"ebay:{order.get('orderId')}",
+        "channel": "ebay",
+        "received_at": _local_stamp(order.get("creationDate")),
+        # The name on the parcel, falling back to the eBay handle. eBay
+        # masks the username in some contexts (`b***r`), so the shipping
+        # name is both more useful and more reliable.
+        "buyer": ship_to_name or buyer.get("username"),
+        "item": line_items[0].get("title") if line_items else None,
+        "price": round(sum(costs), 2) if costs else None,
+        "ship_by": ship_by,
+        "ship_to": _ship_to(order),
+        "service": service or None,
+        "status": "to_ship",
+        # Not a `sales` column; `upsert` drops it.
+        "sku": line_items[0].get("sku") if line_items else None,
+    }
+
+
+def get_orders(cfg, since=None, limit=None):
+    """Every order created since `since`, newest page first.
+
+    `since` is a date or datetime; the default window is
+    `DEFAULT_SINCE_DAYS`. Returns a list rather than a generator so the
+    caller can count before printing anything - a dry run that says
+    "would insert 3" has to know that before the first line.
+    """
+    if since is None:
+        since = _now() - timedelta(days=DEFAULT_SINCE_DAYS)
+    if isinstance(since, str):
+        since = _parse_stamp(since) or (
+            _now() - timedelta(days=DEFAULT_SINCE_DAYS))
+    if not isinstance(since, datetime):
+        since = datetime(since.year, since.month, since.day,
+                         tzinfo=timezone.utc)
+
+    # eBay wants an RFC 3339 range with an open right end. The brackets
+    # and the `..` are part of the syntax, not decoration.
+    stamp = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    query = {"filter": f"creationdate:[{stamp}..]",
+             "limit": str(min(limit or PAGE_LIMIT, PAGE_LIMIT))}
+
+    orders = []
+    path = ORDERS_PATH + "?" + urllib.parse.urlencode(query)
+    while path:
+        status, payload = call(cfg, "GET", path)
+        if status != 200:
+            raise EbayError(
+                f"eBay refused the order list ({status}): "
+                + describe_errors(payload))
+        orders.extend(payload.get("orders") or [])
+        if limit and len(orders) >= limit:
+            return orders[:limit]
+        # `next` is a full href when there is another page and absent
+        # when there is not. Following it rather than incrementing an
+        # offset ourselves keeps the filter intact.
+        path = payload.get("next")
+    return orders
