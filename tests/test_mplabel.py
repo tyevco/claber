@@ -9462,8 +9462,17 @@ def test_ebay_auth_records_when_the_refresh_token_dies(ebay_cfg, monkeypatch):
     assert ebay.refresh_days_left(ebay.load_tokens(ebay_cfg)) > 500
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("fcntl") is None,
+    reason="no POSIX mode bits off-target; chmod(0o600) reads back 0o666")
 def test_ebay_token_file_is_not_world_readable(ebay_cfg, monkeypatch):
-    """A refresh token is a credential and this Pi also serves a web app."""
+    """A refresh token is a credential and this Pi also serves a web app.
+
+    Skipped where the permission cannot exist, the same way the flock
+    tests are: Windows honours only the read-only bit, so `chmod(0o600)`
+    reads back as `0o666` and the assertion would be about the platform
+    rather than about the code. The Pi is where this has to hold, and it
+    is the only place it means anything."""
     from mplabel import ebay
 
     monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
