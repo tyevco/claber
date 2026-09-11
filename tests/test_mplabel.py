@@ -9928,7 +9928,8 @@ def test_ebay_check_says_what_is_missing_and_changes_nothing(ebay_cfg):
     from mplabel import ebay
 
     rows = ebay.check(ebay_cfg)
-    problems = [(label_, problem) for label_, _, problem in rows if problem]
+    problems = [(label_, problem)
+                for label_, _, problem, _blocking in rows if problem]
     # No tokens yet, so that is the thing to say - and it is the only
     # blocking one, because the policies are needed to publish and this
     # design deliberately never publishes.
@@ -9947,7 +9948,7 @@ def test_ebay_check_warns_before_the_refresh_token_dies(ebay_cfg,
         "refresh_token_expires_in": 10 * 86400})]))
     ebay.exchange_code(ebay_cfg, "code")
 
-    warnings = [problem for label_, _, problem in ebay.check(ebay_cfg)
+    warnings = [problem for label_, _, problem, _b in ebay.check(ebay_cfg)
                 if problem and "ebay auth" in problem]
     assert warnings, "a token with ten days left should be warned about"
 
@@ -10933,3 +10934,37 @@ def test_ebay_skus_reads_every_page(ebay_cfg, monkeypatch):
     ebay.exchange_code(ebay_cfg, "code")
 
     assert ebay.existing_skus(ebay_cfg) == ["OLD-1", "OLD-2", "OLD-3"]
+
+
+def test_ebay_check_passes_on_an_install_that_cannot_publish_yet(tmp_path,
+                                                                  monkeypatch):
+    """Exit 78 means *permanently misconfigured*, and must stay that.
+
+    The four publish-time policy ids are unset on every install until
+    someone sets up Business Policies, and nothing in this system
+    publishes - so counting them as faults reported a healthy sandbox
+    install that authenticates and pulls orders as broken, and exit 78 is
+    the code `RestartPreventExitStatus=78` is built on. A note is not a
+    fault.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path),
+               ebay_app_id="app", ebay_cert_id="cert",
+               ebay_ru_name="Ru-Name")
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
+        "access_token": "a", "expires_in": 7200, "refresh_token": "r",
+        "refresh_token_expires_in": 47304000})]))
+    ebay.exchange_code(cfg, "code")
+
+    rows = ebay.check(cfg)
+    unset = [r for r in rows if r[2] and not r[3]]
+    assert len(unset) == 4, "the policies should be notes, not faults"
+    assert not [r for r in rows if r[2] and r[3]], \
+        "nothing about this install is actually broken"
+    assert cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="check")) == 0
+
+    # And a genuinely unconfigured one still refuses, or the exit code
+    # has stopped meaning anything.
+    bare = dict(cli.DEFAULTS, home=str(tmp_path))
+    assert cli.cmd_ebay(bare, argparse.Namespace(ebaycmd="check")) == 78

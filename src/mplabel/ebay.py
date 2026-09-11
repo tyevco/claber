@@ -485,13 +485,21 @@ def check(cfg):
     production, and a genuinely unauthorised account with three
     variations on the same 401.
 
-    Returns a list of (label, value, problem_or_None) so the caller does
-    the printing and this stays testable.
+    Returns a list of (label, value, problem_or_None, blocking) so the
+    caller does the printing and this stays testable.
+
+    `blocking` is the difference between "this install is broken" and
+    "you have not got to that part yet", and it decides the exit code.
+    Exit 78 means a *permanent* misconfiguration - the unit carries
+    `RestartPreventExitStatus=78` on the strength of that - so it must
+    not fire for the publish-time policies, which nothing here needs
+    because nothing here publishes. Reporting a healthy sandbox install
+    as a failure is how an exit code stops being believed.
     """
     rows = []
 
-    def add(label, value, problem=None):
-        rows.append((label, value, problem))
+    def add(label, value, problem=None, blocking=True):
+        rows.append((label, value, problem, blocking))
 
     try:
         env = environment(cfg)
@@ -545,9 +553,12 @@ def check(cfg):
         value = (cfg.get(key) or "").strip()
         # Not required to create a draft - required to publish one. Said
         # plainly here because the failure otherwise arrives weeks later
-        # inside eBay's own UI, where it looks like eBay's problem.
+        # inside eBay's own UI, where it looks like eBay's problem - but
+        # *not* blocking, or a sandbox install that authenticates and
+        # pulls orders perfectly well reports itself broken.
         add(label, value or "(unset)",
-            None if value else "needed to publish, not to draft")
+            None if value else "needed to publish, not to draft",
+            blocking=False)
     return rows
 
 

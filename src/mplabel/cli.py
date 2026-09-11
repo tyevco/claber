@@ -2266,21 +2266,33 @@ def cmd_ebay(cfg, args):
     from . import ebay as ebay_mod
 
     if args.ebaycmd == "check":
-        problems = 0
-        for label, value, problem in ebay_mod.check(cfg):
+        blocking, notes = 0, 0
+        for label, value, problem, is_blocking in ebay_mod.check(cfg):
             print(f"{label:20}: {value}")
-            if problem:
-                problems += 1
+            if not problem:
+                continue
+            if is_blocking:
+                blocking += 1
                 print(f"{'':20}  ^ {problem}", file=sys.stderr)
-        if problems:
+            else:
+                # A note, not a fault. Printed on stdout beside the row
+                # it belongs to, and it does not reach the exit code.
+                notes += 1
+                print(f"{'':20}    {problem}")
+        if blocking:
             # 78, not 1: an unconfigured install is a permanent error and
             # a timer must not retry it for ever. Same refusal printd
-            # makes for a missing secret.
-            noun = "thing needs" if problems == 1 else "things need"
-            print(f"\n{problems} {noun} attention - see docs/ebay.md",
+            # makes for a missing secret - which is why only a *blocking*
+            # problem earns it. The publish-time policies are notes.
+            noun = "thing needs" if blocking == 1 else "things need"
+            print(f"\n{blocking} {noun} attention - see docs/ebay.md",
                   file=sys.stderr)
             return 78
-        print("\nnothing to fix")
+        if notes:
+            print(f"\nnothing broken. {notes} thing(s) are only needed to "
+                  f"publish, which nothing here does yet.")
+        else:
+            print("\nnothing to fix")
         return 0
 
     if args.ebaycmd == "skus":
