@@ -94,22 +94,29 @@ CREATE TABLE IF NOT EXISTS listings (
     removed_at    TEXT,
     renewed_count INTEGER DEFAULT 0,
     inquiries     INTEGER DEFAULT 0,
-    -- active | sold | expired | removed | draft
+    -- acquired | draft | active | sold | expired | removed
     --
-    -- `draft` is a thing photographed and costed and never written up.
-    -- It is kept out of `v_listing_perf`, and so out of sell-through:
-    -- it was never for sale, and counting it would drag the percentage
-    -- down exactly the way her own purchases would.
+    -- Two of those mean "not for sale yet", and they arrived from
+    -- different directions in the same week:
+    --
+    --   `acquired` is bought and not yet listed, which nothing could say
+    --   before the ShopGoodwill importer - a row used to be born when
+    --   Facebook first mentioned it, by which time it was already for
+    --   sale.
+    --   `draft` is photographed and costed and never written up, which
+    --   is what the desk's writer screen works through.
+    --
+    -- Both are kept out of the sell-through denominator, in
+    -- `v_listing_perf`, so every view built on it agrees: a box she has
+    -- won and not yet photographed has not failed to sell, and neither
+    -- has a listing she has not finished writing.
+    --
+    -- They are deliberately not merged into one value. The question
+    -- "what have I bought and not listed" and the question "what have I
+    -- photographed and not written up" have different answers and
+    -- different screens, and one state could only answer one of them.
     state         TEXT DEFAULT 'active',
-    source        TEXT,                    -- email | dyi | csv | manual
-    -- acquired | active | sold | expired | removed. 'acquired' is bought
-    -- and not yet listed, which nothing could say before the ShopGoodwill
-    -- importer: a row used to be born when Facebook first mentioned it,
-    -- by which time it was already for sale. It is kept out of the
-    -- sell-through denominator in `v_price_band` - a box of things she
-    -- has won and not yet photographed has not failed to sell.
-    state         TEXT DEFAULT 'active',
-    source        TEXT,          -- email | dyi | csv | manual | goodwill
+    source        TEXT,   -- email | dyi | csv | manual | saved | goodwill
     first_seen    TEXT,
     last_seen     TEXT,
     inventory_code TEXT,
@@ -318,11 +325,14 @@ def upsert_listing(conn, listing_id, source, **fields):
     existing = dict(row)
     # 'sold' is terminal and beats anything else we might later infer.
     #
-    # 'draft' is below everything, so nothing can demote a real listing
-    # back to one. A draft becoming active is progress and the reverse is
-    # not a thing that happens by observation - only by her saying so,
-    # which goes through `h_item_fields`, not here.
-    rank = {"draft": -1, "active": 0, "expired": 1, "removed": 2, "sold": 3}
+    # 'acquired' and 'draft' are below everything, so nothing can demote a
+    # real listing back to one. Either becoming active is progress, and
+    # the reverse is not a thing that happens by observation - only by her
+    # saying so, which goes through `h_item_fields`, not here. Without an
+    # entry each they would rank 0, the same as 'active', and `>=` would
+    # let a later mention of an auction win overwrite a live listing.
+    rank = {"acquired": -2, "draft": -1,
+            "active": 0, "expired": 1, "removed": 2, "sold": 3}
     for k, v in fields.items():
         if v is None:
             continue
