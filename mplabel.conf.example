@@ -287,3 +287,16 @@ ebay_verification_token =
 # string eBay is configured with: the challenge hash covers it, so a
 # trailing slash difference fails the handshake with no explanation.
 ebay_notification_endpoint =
+
+# The outside of the tunnel, without a path - the same host the phone
+# reaches. eBay fetches listing photographs from here, because the Sell
+# REST APIs have no image upload and `imageUrls` must be a public https
+# URL. A plain-http value is refused: eBay rejects it and names the
+# field rather than the scheme.
+#
+# Only photographs attached to a listing that has already been pushed to
+# eBay are served. Every receipt, every untriaged capture and every
+# photo of something unlisted is a 404 - the join through `ebay_offers`
+# is the allowlist, and it is the reason this is the narrowest public
+# hole that works rather than a photo directory on the internet.
+ebay_photo_base =

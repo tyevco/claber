@@ -504,6 +504,22 @@ class Handler(BaseHTTPRequestHandler):
         ("POST", r"^/api/inventory/bulk$", "h_bulk_items", True),
         ("GET", r"^/api/inventory/(?P<lid>\d+)/photos$", "h_item_photos",
          True),
+        # The one unauthenticated route that serves data, and the only
+        # reason it exists is that eBay fetches listing images itself:
+        # the Sell REST APIs have no upload, and `imageUrls` must be a
+        # public HTTPS URL.
+        #
+        # Deliberately outside `/api`. `_dispatch` rewrites anything
+        # under `/api/v1/` onto `/api/`, and this URL is held by a third
+        # party - eBay stores it against a live listing - so it must sit
+        # where that aliasing cannot reach and where a future `v2` does
+        # not move it.
+        #
+        # The digest is matched in the pattern, 64 lowercase hex and
+        # nothing else, so no path can be traversed and no other shape
+        # even reaches the handler.
+        ("GET", r"^/ebay/photo/(?P<digest>[0-9a-f]{64})$", "h_ebay_photo",
+         False),
         ("POST", r"^/api/import/preview$", "h_import_preview", True),
         ("POST", r"^/api/import/commit$", "h_import_commit", True),
     ]
@@ -1034,6 +1050,43 @@ class Handler(BaseHTTPRequestHandler):
         path = safe_home_path(self.cfg.get("home"), row["path"])
         if path is None:
             return self.fail(404, "the file is gone")
+        ctype = next((k for k, v in PHOTO_TYPES.items()
+                      if v == path.suffix.lower()), "application/octet-stream")
+        self._send(200, path.read_bytes(), ctype=ctype)
+
+    def h_ebay_photo(self, digest):
+        """One photograph, to anyone who asks, because eBay has to fetch it.
+
+        This is the only unauthenticated route in this server that
+        answers with data, so what it will *not* serve is the whole
+        design. A photo is served only when its digest is attached to a
+        listing that has been pushed to eBay - the join through
+        `ebay_offers` is the allowlist. Everything else is 404: every
+        receipt, every untriaged capture, every photograph of something
+        that was never listed. A receipt carries what she paid and where
+        she was, and it can never be served here even by someone who
+        learns its sha256.
+
+        Note both refusals say the same thing. "No such photo" and "that
+        photo exists but is not listed" must be indistinguishable, or an
+        anonymous caller has an oracle for which digests are in the
+        database.
+
+        The bytes are already public: eBay shows them on the listing.
+        What is not public is anything else in `photos/`, and the join is
+        what keeps it that way. If this ever grows a second query
+        parameter, it has stopped being a way to hand eBay some bytes
+        and become a way to ask this server questions without a token.
+        """
+        row = self.db().execute(
+            "SELECT p.path FROM photos p "
+            "JOIN ebay_offers e ON e.listing_id = p.listing_id "
+            "WHERE p.sha256 = ?", (digest,)).fetchone()
+        if row is None:
+            return self.fail(404, "no such photo")
+        path = safe_home_path(self.cfg.get("home"), row["path"])
+        if path is None or not path.exists():
+            return self.fail(404, "no such photo")
         ctype = next((k for k, v in PHOTO_TYPES.items()
                       if v == path.suffix.lower()), "application/octet-stream")
         self._send(200, path.read_bytes(), ctype=ctype)

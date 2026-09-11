@@ -115,6 +115,7 @@ run against a real database.
 | `ebay auth [--code C]` | consent for the eBay account. No `--code` prints the URL; the Pi is headless, so consent happens in a browser elsewhere and the code is pasted back. No DB |
 | `ebay check` | config, tokens, and how long the refresh token has left. Changes nothing, sends nothing, exits **78** if anything needs attention. No DB |
 | `ebay pull [--since D] [--limit N] --dry-run` | eBay orders as `sales` rows. `--dry-run` is the **only** mode: it prints what it would record and writes nothing, and refuses with exit **2** without the flag |
+| `ebay skus` | every SKU already on the eBay account. Read only, and worth one call before the first push - eBay's SKU uniqueness is permanent. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -265,9 +266,9 @@ ios/                      the native client; see ios/README.md and
                  and openssl rather than two large packages
   shopping.py    the aisle: candidates, the receipt read as lines, and a
                  proposal that never writes a cost by itself
-  ebay.py        the other selling channel: urllib client, OAuth and the
-                 token store. One seam out - `_transport` - and the
-                 tests replace it
+  ebay.py        the other selling channel: urllib client, OAuth, the
+                 token store, the order pull and `ebay_offers`. One seam
+                 out - `_transport` - and the tests replace it
 
 docs/                     ios-handoff, ios-release, notifications,
                           split-architecture, supvan-t50m-protocol,
@@ -722,6 +723,30 @@ would rather queue behind the poller than be refused. And a *stale* lock
 is not a thing that can happen - flock is held by an open file
 description, so the kernel drops it when a killed process's descriptors
 close. What survives a kill is an empty file that locks nobody out.
+
+**One unauthenticated route serves data, and the join is the
+allowlist.** eBay fetches `imageUrls` itself - the Sell REST APIs have
+no image upload - so `/ebay/photo/<sha256>` answers without a token.
+What makes that narrow rather than a photo directory on the internet is
+that it serves a digest **only** when it is attached to a listing with a
+row in `ebay_offers`: every receipt, every untriaged capture and every
+photo of something unlisted is a 404. A receipt carries what she paid
+and where she was.
+
+Three things hold that line and each would fail quietly. The digest is
+matched in the *route pattern*, 64 lowercase hex, so nothing else
+reaches the handler and no path can be traversed. Both refusals are
+byte-identical, because "no such photo" and "exists but not listed"
+being distinguishable is an existence oracle for anyone with no token.
+And it takes no query parameters: the moment it grows one it has stopped
+being a way to hand eBay some bytes and become a way to ask this server
+questions anonymously. A test pins the whole set of unauthenticated
+routes for that reason - adding one should have to be deliberate.
+
+Note `photos.path` is stored **absolute** (`h_add_photo` builds it from
+`photo_dir(home)`) and `safe_home_path` resolves what it is given, so a
+relative path resolves against the process CWD and is refused. A fixture
+that stored a relative one looked exactly like the route being broken.
 
 **An exit code nothing propagates is a contract with one end.**
 `cli.main` wrapped `_main()` and threw its return value away, and
