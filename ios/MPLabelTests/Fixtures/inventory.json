@@ -35,7 +35,7 @@
     },
     {
       "bin": "ATTIC",
-      "bin_code": "HW5",
+      "bin_code": "J14",
       "category": "Home",
       "days_listed": 72,
       "era": null,
@@ -49,5 +49,9 @@
       "state": "active",
       "title": "Hobnail milk glass vase"
     }
-  ]
+  ],
+  "states": {
+    "active": 1,
+    "sold": 2
+  }
 }

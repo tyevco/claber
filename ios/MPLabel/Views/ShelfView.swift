@@ -19,6 +19,11 @@ struct ShelfView: View {
     @State private var addingItem = false
     @State private var trips: [Trip] = []
     @State private var path = NavigationPath()
+    /// How many things are bought and not yet listed, counted server-side
+    /// over the whole table so it does not fall to nothing while she
+    /// types in the search box.
+    @State private var notListed = 0
+    @State private var onlyNotListed = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -70,6 +75,45 @@ struct ShelfView: View {
                 }
                 .buttonStyle(.plain)
 
+                // Things that have arrived and are not for sale yet.
+                // Nothing could be in this state before the auction
+                // importer - a row was born when Facebook first
+                // mentioned it, by which time it was already listed -
+                // and these sort by title amongst everything else, so
+                // they are present on the shelf and invisible as a
+                // group. Shown only when there is something in it: a
+                // banner permanently reading "0 waiting" is furniture,
+                // and this one is a queue.
+                if notListed > 0 || onlyNotListed {
+                    Button {
+                        onlyNotListed.toggle()
+                        Task { await loadItems() }
+                    } label: {
+                        MPCard {
+                            HStack(spacing: MP.S.x2) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(onlyNotListed
+                                         ? "Showing what is not listed"
+                                         : "\(notListed) arrived, not listed yet")
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .foregroundStyle(MP.Palette.fg)
+                                    Text(onlyNotListed
+                                         ? "Tap to show the whole shelf again"
+                                         : "Bought and on a shelf, but not for sale")
+                                        .font(.system(size: 11.5))
+                                        .foregroundStyle(MP.Palette.muted)
+                                }
+                                Spacer(minLength: MP.S.x2)
+                                Image(systemName: onlyNotListed
+                                      ? "xmark" : "tray.full")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(MP.Palette.subtle)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 if !bins.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: MP.S.x2) {
@@ -97,7 +141,9 @@ struct ShelfView: View {
 
                 if items.isEmpty {
                     MPEmpty(title: "Nothing here",
-                            detail: query.isEmpty
+                            detail: onlyNotListed
+                                ? "Everything on the shelf is listed."
+                                : query.isEmpty
                                 ? "No listings imported yet."
                                 : "No item matches that.",
                             symbol: "shippingbox")
@@ -152,7 +198,10 @@ struct ShelfView: View {
 
     private func loadItems() async {
         do {
-            items = try await APIClient.shared.inventory(query: query)
+            let page = try await APIClient.shared.inventory(
+                query: query, state: onlyNotListed ? "acquired" : "")
+            items = page.items
+            notListed = page.states?["acquired"] ?? 0
             error = nil
         } catch is CancellationError {
             // A newer keystroke replaced this one. Not a failure.
@@ -211,6 +260,13 @@ struct ItemRow: View {
                     Text("sold")
                         .font(.system(size: 11))
                         .foregroundStyle(MP.Palette.subtle)
+                }
+                // Spelled out rather than echoing the column. What she
+                // needs to know about one of these is that it is not
+                // listed - a thing to do - where "acquired" names a
+                // thing that happened.
+                if item.state == "acquired" {
+                    MPTag(text: "Not listed", style: .absent)
                 }
                 Spacer(minLength: 0)
                 Text(money(item.price))
