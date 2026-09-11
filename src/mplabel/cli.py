@@ -31,6 +31,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -151,6 +152,37 @@ DEFAULTS = {
     "printd_secret": "",
     "printd_timeout": "45",
     "printd_state_dir": "",
+    # eBay, the other selling channel. Every value is empty by default
+    # and `mplabel ebay` exits 78 rather than half-trying, like notify.
+    #
+    # sandbox or production. It picks the host *and* which credentials
+    # are meant, because the two keysets are different strings that look
+    # alike, and sending a sandbox key to production is a 401 that says
+    # nothing about environments.
+    "ebay_environment": "sandbox",
+    # From the developer portal's Application Keys page, per environment.
+    # eBay calls the first two "Client ID" and "Client Secret" on some
+    # pages and App ID / Cert ID on others; they are the same values.
+    "ebay_app_id": "",
+    "ebay_cert_id": "",
+    # The RuName, not a URL - eBay resolves it to the redirect configured
+    # against the keyset, and sending the URL itself is rejected.
+    "ebay_ru_name": "",
+    "ebay_marketplace": "EBAY_US",
+    # Needed to *publish* an offer, not to draft one. Set up in My eBay
+    # and the Account API; see docs/ebay.md.
+    "ebay_merchant_location": "",
+    "ebay_fulfillment_policy": "",
+    "ebay_payment_policy": "",
+    "ebay_return_policy": "",
+    # Ours, not eBay's: 32-80 characters that we invent and eBay echoes
+    # back in the account-deletion challenge. See web.py.
+    "ebay_verification_token": "",
+    # The public HTTPS URL eBay sends account-deletion notices to. It has
+    # to be the exact string eBay is configured with - the challenge hash
+    # covers it, so a trailing slash difference fails the handshake with
+    # no explanation.
+    "ebay_notification_endpoint": "",
 }
 
 SCHEMA = """
@@ -1525,8 +1557,18 @@ def cmd_status(cfg):
 
 
 # Anything whose value must not be echoed to a terminal or a paste.
+# `mplabel config` is the command you run *and paste* when something is
+# broken, which is exactly when a credential leaks.
+#
+# `ebay_cert_id` is the OAuth client secret under one of the two names
+# eBay gives it, and `ebay_verification_token` is what proves an
+# account-deletion notice came from eBay rather than from anyone who
+# found the URL. The app id and the RuName are deliberately not here:
+# both are public halves and seeing them is how you check the right
+# keyset is loaded.
 SECRET_KEYS = ("imap_password", "printd_secret", "web_password_hash",
-               "sheets_key", "sheets_key_json")
+               "sheets_key", "sheets_key_json",
+               "ebay_cert_id", "ebay_verification_token")
 
 
 def config_sources(path=None):
@@ -2016,6 +2058,70 @@ def cmd_notify(cfg, conn, args):
     return 0
 
 
+def cmd_ebay(cfg, args):
+    """`ebay auth` and `ebay check`. Neither touches the database.
+
+    Above `connect_db` for the same reason `probe` and `selftest` are: a
+    credential test must not need a writable home directory. It is the
+    one thing you want working when nothing else is.
+    """
+    from . import ebay as ebay_mod
+
+    if args.ebaycmd == "check":
+        problems = 0
+        for label, value, problem in ebay_mod.check(cfg):
+            print(f"{label:20}: {value}")
+            if problem:
+                problems += 1
+                print(f"{'':20}  ^ {problem}", file=sys.stderr)
+        if problems:
+            # 78, not 1: an unconfigured install is a permanent error and
+            # a timer must not retry it for ever. Same refusal printd
+            # makes for a missing secret.
+            noun = "thing needs" if problems == 1 else "things need"
+            print(f"\n{problems} {noun} attention - see docs/ebay.md",
+                  file=sys.stderr)
+            return 78
+        print("\nnothing to fix")
+        return 0
+
+    # auth
+    try:
+        if not args.code:
+            url = ebay_mod.consent_url(cfg)
+            print("Open this on a machine with a browser, sign in as the "
+                  "seller, and agree:\n")
+            print(f"  {url}\n")
+            print("eBay then redirects to the URL configured against the "
+                  "RuName with ?code=... on the end. That code is "
+                  "url-encoded and expires in a few minutes, so paste it "
+                  "back promptly:\n")
+            print("  mplabel ebay auth --code '<the code>'")
+            return 0
+        # The code arrives url-encoded in a browser's address bar and is
+        # routinely pasted that way. Unquoting an already-clean code is a
+        # no-op, so this is safe in both directions.
+        tokens = ebay_mod.exchange_code(
+            cfg, urllib.parse.unquote(args.code))
+    except ebay_mod.EbayConfigError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 78
+    except ebay_mod.EbayError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"stored {ebay_mod.token_path(cfg)} (0600)")
+    days = ebay_mod.refresh_days_left(tokens)
+    if days is None:
+        print("eBay did not say how long the refresh token lasts, which "
+              "means the expiry cannot be recorded - `ebay check` will "
+              "not be able to warn you before it dies.")
+    else:
+        print(f"the refresh token lasts {days} days. `ebay check` counts "
+              f"it down; there is no second warning from eBay.")
+    return 0
+
+
 def cmd_inventory(cfg, conn, args):
     """Write a CSV of inventory labels for the label maker.
 
@@ -2228,7 +2334,13 @@ def _close_sale(conn, ref, status):
 
 def main():
     try:
-        _main()
+        # `return`, not a bare call. `notify` and `ebay check` answer a
+        # configuration error with 78 (EX_CONFIG) so that systemd's
+        # RestartPreventExitStatus=78 can keep a permanent error dead
+        # where it can be seen - and dropping the value here turned every
+        # one of those refusals into a success, which is the half of that
+        # pair that has no unit test to notice.
+        return _main()
     except printers.PrinterUnavailable as exc:
         # An Exception everywhere else, so the poll loop and the web app
         # can catch it - but at a terminal it should still just print the
@@ -2579,6 +2691,19 @@ def _main():
     p.add_argument("--bind")
     p.add_argument("--port", type=int)
 
+    p = sub.add_parser("ebay", help="the other selling channel")
+    esub = p.add_subparsers(dest="ebaycmd", required=True)
+    e = esub.add_parser("auth",
+                        help="grant this application access to the eBay "
+                             "account; the Pi is headless, so consent "
+                             "happens in a browser elsewhere")
+    e.add_argument("--code",
+                   help="the authorization code from the redirect URL. "
+                        "Without it this prints the consent URL and stops")
+    esub.add_parser("check",
+                    help="configuration, tokens and how long they have "
+                         "left. Changes nothing and sends nothing")
+
     args = ap.parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -2650,6 +2775,11 @@ def _main():
         from . import printd as printd_mod
         printd_mod.serve(cfg, bind=args.bind, port=args.port)
         return
+    if args.cmd == "ebay" and args.ebaycmd in ("auth", "check"):
+        # Same reasoning as probe and selftest: checking a credential
+        # must not need the database. The subcommands that read or write
+        # listings fall through to the block below.
+        return cmd_ebay(cfg, args)
 
     conn = connect_db(cfg["home"])
 

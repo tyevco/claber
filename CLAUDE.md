@@ -108,6 +108,8 @@ run against a real database.
 | `supvan-test-print --style edges` | the edge test: eight bars per side, 8 dots apart, each a different length so it names itself without a number beside it. Reads where each edge starts printing and nothing else. Moves paper |
 | `shelf-tag --code XXX [--name N] [--marker\|--qr] [--size WxH[in]] [--preview PNG] [--print]` | a tag for a shelf, bin or area. Code big, name under it, marker beside it. **Three** characters, where an item code is four. No DB |
 | `config [--all]` | the resolved config, each key marked `default`/`file`/`env`, secrets redacted, and **which** file was read. No DB |
+| `ebay auth [--code C]` | consent for the eBay account. No `--code` prints the URL; the Pi is headless, so consent happens in a browser elsewhere and the code is pasted back. No DB |
+| `ebay check` | config, tokens, and how long the refresh token has left. Changes nothing, sends nothing, exits **78** if anything needs attention. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -132,8 +134,8 @@ run against a real database.
 | `reconcile [--since JOB] [--dry-run]` | reconcile the local DB against printd's journal. The recovery path for an ambiguous print |
 | `notify [--dry-run]` | say the three things that earn a notification. `--dry-run` prints the whole decision and records nothing, so it says the same thing twice. Exit **78** if push is not configured |
 
-`probe`, `selftest`, `supvan-probe` and `file` run above `connect_db` in
-`main()` - see the note below on why.
+`probe`, `selftest`, `supvan-probe`, `file` and `ebay auth|check` run
+above `connect_db` in `main()` - see the note below on why.
 
 ## Deploying to the Pi
 
@@ -247,6 +249,9 @@ ios/                      the native client; see ios/README.md and
                  and openssl rather than two large packages
   shopping.py    the aisle: candidates, the receipt read as lines, and a
                  proposal that never writes a cost by itself
+  ebay.py        the other selling channel: urllib client, OAuth and the
+                 token store. One seam out - `_transport` - and the
+                 tests replace it
 
 docs/                     ios-handoff, ios-release, notifications,
                           split-architecture, supvan-t50m-protocol,
@@ -500,6 +505,10 @@ hardware or a real Facebook account.
 | ShopGoodwill mail shapes | **Reconstructed from real mail, parser never run against a live mailbox.** Two real threads were read and the fixtures rebuilt by hand from them with invented names, so the field labels, the `<strong>Label:</strong> value` shape, the two sender hosts (`shopgoodwill.com` for a win, `txemail.shopgoodwill.com` for a payment) and every figure in the payment receipt are **verified against real mail**. What is **ASSUMED**: that a multi-item order lays its items out the way a single-item one does - every real order seen so far holds exactly one. `mplabel goodwill <eml> --write`-less is how to settle that against a real message before it writes anything. |
 | No auction mail carries a shipped/delivered notice | **ASSUMED.** Only the win and the payment receipt have been seen. If a dispatch mail exists it would give a real arrival date, which is the one thing the current pair cannot say - `scan` against the real mailbox is what settles it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
+| eBay OAuth on a headless Pi | **ASSUMED.** The consent URL, the code exchange and the refresh are written and unit-tested against a replaced `_transport`; none has been sent to eBay. The refresh token's ~18-month lifetime is reported *only* on the initial exchange, so `exchange_code` records the absolute expiry there or it cannot be recovered - `ebay check` counts it down. |
+| eBay business-policy prerequisites | **ASSUMED, and they bite earlier than they read.** Opt-in plus fulfillment/payment/return policies and an inventory location look like publish-time requirements; eBay validates them when the **offer is created**. So they gate the first push even though nothing here ever publishes. |
+| eBay account-deletion compliance | **ASSUMED and not built.** Subscribing or opting out is required before the first *production* call, and opting out needs storing no eBay data - which we will. Sandbox needs none of it, which is why sandbox is first. |
+| eBay order JSON, label geometry, SKU rules | **ASSUMED.** Nothing has been pulled, attached or pushed. In particular an eBay 4x6 is a different page from Facebook's and `extract_label_fields` is verified against exactly one real label. |
 | The release workflow | **UNRUN.** Every piece of it is a command that works on a Mac, and none of it has been executed once - not the runner label, not cloud signing, not the upload. The first tag is the experiment. What is checked in software: `version.sh` against good and bad tags, both workflows' shell blocks parse, and `check-archive.sh` refuses XcodeGen's placeholder version numbers. What cannot be: whether the API key's role is sufficient, whether `macos-26` has an iOS 26 SDK today, and whether App Store Connect accepts a three-part build number of this shape. |
 
 When the user reports real-world results, move rows up this table and
@@ -625,6 +634,26 @@ would rather queue behind the poller than be refused. And a *stale* lock
 is not a thing that can happen - flock is held by an open file
 description, so the kernel drops it when a killed process's descriptors
 close. What survives a kill is an empty file that locks nobody out.
+
+**An exit code nothing propagates is a contract with one end.**
+`cli.main` wrapped `_main()` and threw its return value away, and
+`__main__.py` called `main()` and threw that away too - so `notify`'s
+carefully documented **78** arrived at the shell as **0**, through the
+installed script and `python -m mplabel` alike. The unit's
+`RestartPreventExitStatus=78` had a test; the exit code it depends on
+had none, because every test called `cmd_notify` directly and got the
+right answer. Both halves are needed and only one was being checked -
+which is the same shape as the exit-78 note below, one layer further
+out. `test_the_module_entrypoint_passes_the_exit_code_on` is the guard.
+
+**An environment check on the refresh path is two hours late.**
+`ebay.access_token` returned a cached token without looking at which
+eBay it was minted for, and only `refresh_access` compared. An access
+token is good for 7200 seconds, so pointing a sandbox install at
+production sent sandbox credentials to the live account for up to two
+hours before anything noticed - and what it answers is a 401 that says
+nothing about environments. The check guards *use*, not just renewal.
+Caught by the test, not by reading it.
 
 **A configuration refusal must not be retried.** `printd` will not start
 without `printd_secret` - a print request is a physical action and it
@@ -1696,6 +1725,47 @@ Uploads go straight up and a failed one keeps its bytes on screen to be
 retried, which works because the server keys a photo on its sha256 -
 pressing retry cannot make a second row. A local queue would be a second
 source of truth for the same photographs.
+
+### The other selling channel
+
+eBay, and the reasoning that shaped it is in `docs/ebay.md`. **Phase 0 -
+the plumbing - is built**: `ebay.py` with a urllib client, the OAuth
+auth-code and refresh flows, a 0600 token store under `<data>/ebay/`,
+and `ebay auth` / `ebay check`. Nothing touches the database and nothing
+has reached eBay; sandbox is first precisely so a bug cannot list
+anything real.
+
+Four things settled the shape of the rest, and they are worth keeping
+here because each was expensive to find:
+
+- **Draft-only, and there is no `ebay publish` method.** Going live is a
+  decision made in eBay's own UI where the whole listing is visible. It
+  also happens to dodge the image problem: `imageUrls` must be public
+  HTTPS, her photos sit behind bearer auth, and the Sell REST APIs have
+  no upload at all - but images are required to *publish* an offer, not
+  to create an unpublished one. What draft-only does **not** dodge is
+  the business policies, which eBay validates at offer-creation time.
+- **`message_id` cannot be NULL for an eBay sale.** Six call sites on
+  the *print* path key on it - `ensure_code` returns early on a falsy
+  one and mints no parcel code, `mark_printed`'s `WHERE message_id=?`
+  matches nothing and leaves a printed parcel in Pending for ever, and
+  `notify.failed_prints` then cries wolf daily. A synthetic
+  `ebay:<orderId>` keeps all six working, and it is the scheme-prefixed
+  key `title_key`'s `saved:` and `import_dyi`'s `dyi:` already
+  established.
+- **The channel goes on `sales`, not `listings`.** All four analytics
+  views are `FROM listings`, so leaving that table alone keeps every
+  existing analytic working - and a row in `listings` is a thing on a
+  shelf, not a posting. Cross-posting one object to both channels is
+  the normal case.
+- **Pulling her eBay orders in *is* the sold-comps feature.** Those are
+  her own realised prices, and they reach `comparables()` through
+  `link_sales` for free. eBay's Marketplace Insights is partner-only,
+  and Browse returns *asking* prices, which this repo already refuses to
+  treat as evidence. So there is nothing to build and roughly twice the
+  evidence to gain - provided a pulled order resolves back through
+  `ebay_offers` to the listing it came from, or `link_sales` mints a
+  phantom beside it and sell-through moves **down** on a sale.
 
 ### Older, still true
 

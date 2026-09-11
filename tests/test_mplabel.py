@@ -8420,6 +8420,332 @@ def test_the_jwt_signature_verifies_end_to_end(tmp_path):
     assert b"Verified OK" in done.stdout
 
 
+# ------------------------------------------------------------------ ebay
+#
+# Every test here replaces `ebay._transport`, which is the module's only
+# way out. Nothing in this file may touch the network: a suite that can
+# fail because eBay is having an afternoon is a suite nobody trusts.
+
+
+@pytest.fixture
+def ebay_cfg(tmp_path):
+    """A configured-enough sandbox install, with its own home."""
+    from mplabel import cli
+    cfg = dict(cli.DEFAULTS)
+    cfg.update(home=str(tmp_path),
+               ebay_app_id="app-id", ebay_cert_id="cert-id",
+               ebay_ru_name="Her-Name-abcde-xyz")
+    return cfg
+
+
+def _fake_transport(replies):
+    """Answer each call from `replies`, recording what was asked.
+
+    `replies` is a list of (status, payload); the recorded calls come
+    back on the function itself so a test can assert on the request as
+    well as on what was made of the answer.
+    """
+    calls = []
+
+    def transport(method, url, headers, body=None, timeout=None):
+        calls.append({"method": method, "url": url, "headers": headers,
+                      "body": body})
+        status, payload = replies[len(calls) - 1]
+        return status, {}, json.dumps(payload).encode()
+
+    transport.calls = calls
+    return transport
+
+
+def test_ebay_consent_url_sends_the_runame_not_a_url(ebay_cfg):
+    """redirect_uri is the RuName.
+
+    eBay resolves it to the redirect configured against the keyset. It
+    looks like it wants a URL and sending one is rejected as a mismatch,
+    which reads like the redirect is misconfigured rather than that the
+    wrong kind of value was sent.
+    """
+    from mplabel import ebay
+    from urllib.parse import parse_qs, urlparse
+
+    query = parse_qs(urlparse(ebay.consent_url(ebay_cfg)).query)
+    assert query["redirect_uri"] == ["Her-Name-abcde-xyz"]
+    assert query["client_id"] == ["app-id"]
+    assert query["response_type"] == ["code"]
+
+
+def test_ebay_consent_scopes_stay_on_the_production_host(ebay_cfg):
+    """The scope strings are identifiers, not endpoints.
+
+    They are always api.ebay.com even in sandbox. Rewriting them to the
+    sandbox host produces a rejection that reads as a permissions problem
+    with the account.
+    """
+    from mplabel import ebay
+
+    assert ebay.environment(ebay_cfg) == "sandbox"
+    assert "sandbox" in ebay.auth_host(ebay_cfg)
+    assert all(s.startswith("https://api.ebay.com/oauth/") for s in ebay.SCOPES)
+
+
+def test_ebay_auth_records_when_the_refresh_token_dies(ebay_cfg, monkeypatch):
+    """The eighteen-month fuse is only mentioned once.
+
+    `refresh_token_expires_in` comes back on the authorization-code
+    exchange and a refresh never repeats it, so if it is not written down
+    here the expiry cannot be recovered - and the failure eighteen months
+    from now is every call returning invalid_grant with no warning.
+    """
+    from mplabel import ebay
+
+    transport = _fake_transport([(200, {
+        "access_token": "access-1", "expires_in": 7200,
+        "refresh_token": "refresh-1",
+        "refresh_token_expires_in": 47304000,
+    })])
+    monkeypatch.setattr(ebay, "_transport", transport)
+
+    tokens = ebay.exchange_code(ebay_cfg, "code-from-the-redirect")
+    assert tokens["refresh_token"] == "refresh-1"
+    assert ebay.refresh_days_left(tokens) > 500
+
+    # And it survives the round trip to disk, which is the only place it
+    # will be read from eighteen months later.
+    assert ebay.refresh_days_left(ebay.load_tokens(ebay_cfg)) > 500
+
+
+def test_ebay_token_file_is_not_world_readable(ebay_cfg, monkeypatch):
+    """A refresh token is a credential and this Pi also serves a web app."""
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
+        "access_token": "a", "expires_in": 7200, "refresh_token": "r"})]))
+    ebay.exchange_code(ebay_cfg, "code")
+    mode = ebay.token_path(ebay_cfg).stat().st_mode & 0o777
+    assert mode == 0o600, oct(mode)
+
+
+def test_ebay_refresh_asks_for_the_scopes_again(ebay_cfg, monkeypatch):
+    """`scope` is required on a refresh and is easy to leave off.
+
+    Without it eBay mints a token carrying no scopes at all, and every
+    call then fails 403 - which reads as the seller account lacking a
+    permission rather than as this request lacking a parameter.
+    """
+    from mplabel import ebay
+    from urllib.parse import parse_qs
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1", "refresh_token_expires_in": 47304000}),
+        (200, {"access_token": "a2", "expires_in": 7200}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+
+    ebay.exchange_code(ebay_cfg, "code")
+    ebay.refresh_access(ebay_cfg)
+
+    form = parse_qs(transport.calls[1]["body"].decode())
+    assert form["grant_type"] == ["refresh_token"]
+    assert form["refresh_token"] == ["r1"]
+    assert set(form["scope"][0].split()) == set(ebay.SCOPES)
+
+
+def test_ebay_reuses_an_access_token_that_is_still_good(ebay_cfg, monkeypatch):
+    """Two hours is two hours; refreshing per call is a rate limit waiting."""
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1"}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    assert ebay.access_token(ebay_cfg) == "a1"
+    assert ebay.access_token(ebay_cfg) == "a1"
+    assert len(transport.calls) == 1
+
+
+def test_ebay_refreshes_an_access_token_about_to_expire(ebay_cfg, monkeypatch):
+    """A token that dies between the check and the call is a needless 401."""
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        # expires_in inside EXPIRY_SLACK, so it is already too old to use.
+        (200, {"access_token": "a1", "expires_in": 60,
+               "refresh_token": "r1"}),
+        (200, {"access_token": "a2", "expires_in": 7200}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    assert ebay.access_token(ebay_cfg) == "a2"
+    assert len(transport.calls) == 2
+
+
+def test_ebay_will_not_send_a_sandbox_token_to_production(ebay_cfg,
+                                                          monkeypatch):
+    """The 401 for this says nothing about environments.
+
+    The two keysets are different strings that look alike, so the
+    mistake is one edited config line - and the answer is a refusal that
+    reads as the credentials being wrong rather than as being pointed at
+    the wrong eBay.
+    """
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
+        "access_token": "a", "expires_in": 7200, "refresh_token": "r"})]))
+    ebay.exchange_code(ebay_cfg, "code")
+
+    ebay_cfg["ebay_environment"] = "production"
+    with pytest.raises(ebay.EbayConfigError) as caught:
+        ebay.access_token(ebay_cfg)
+    assert "sandbox" in str(caught.value)
+
+
+def test_ebay_keeps_the_body_of_a_refusal(ebay_cfg, monkeypatch):
+    """eBay puts the reason in the body, so a non-2xx must not raise away.
+
+    `urlopen` raises on a 400 and the handle closes with it; reading the
+    body first is the difference between "eBay said no" and knowing
+    which field it objected to.
+    """
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(400, {
+        "error": "invalid_grant",
+        "error_description": "the provided authorization code is expired"})]))
+    with pytest.raises(ebay.EbayError) as caught:
+        ebay.exchange_code(ebay_cfg, "stale-code")
+    assert "invalid_grant" in str(caught.value)
+    assert "expired" in str(caught.value)
+
+
+def test_ebay_names_the_field_a_refusal_objected_to():
+    """The useful half of an eBay error is two levels down in `parameters`."""
+    from mplabel import ebay
+
+    line = ebay.describe_errors({"errors": [{
+        "errorId": 25002, "message": "A user error has occurred.",
+        "parameters": [{"name": "sku", "value": "7QK9"}]}]})
+    assert "25002" in line and "sku=7QK9" in line
+
+
+def test_ebay_call_carries_the_marketplace_and_the_bearer(ebay_cfg,
+                                                           monkeypatch):
+    """Both headers are required and neither fails loudly when missing."""
+    from mplabel import ebay
+
+    transport = _fake_transport([
+        (200, {"access_token": "a1", "expires_in": 7200,
+               "refresh_token": "r1"}),
+        (200, {"total": 0}),
+    ])
+    monkeypatch.setattr(ebay, "_transport", transport)
+    ebay.exchange_code(ebay_cfg, "code")
+
+    status, _ = ebay.call(ebay_cfg, "GET", "/sell/inventory/v1/inventory_item")
+    assert status == 200
+    sent = transport.calls[1]
+    assert sent["headers"]["Authorization"] == "Bearer a1"
+    assert sent["headers"]["X-EBAY-C-MARKETPLACE-ID"] == "EBAY_US"
+    # And it went to the sandbox host, not the production one.
+    assert sent["url"].startswith("https://api.sandbox.ebay.com/")
+
+
+def test_ebay_check_says_what_is_missing_and_changes_nothing(ebay_cfg):
+    """`notify --check` exists because a refusal cannot say whose fault it
+    is. eBay is worse: an unscoped token, a sandbox token sent to
+    production and a genuinely unauthorised account are three variations
+    on the same 401."""
+    from mplabel import ebay
+
+    rows = ebay.check(ebay_cfg)
+    problems = [(label_, problem) for label_, _, problem in rows if problem]
+    # No tokens yet, so that is the thing to say - and it is the only
+    # blocking one, because the policies are needed to publish and this
+    # design deliberately never publishes.
+    assert any("auth" in problem for _, problem in problems)
+    assert not ebay.token_path(ebay_cfg).exists()
+
+
+def test_ebay_check_warns_before_the_refresh_token_dies(ebay_cfg,
+                                                         monkeypatch):
+    """Thirty days is enough notice to redo the consent calmly."""
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "_transport", _fake_transport([(200, {
+        "access_token": "a", "expires_in": 7200, "refresh_token": "r",
+        # Ten days. Nothing is broken yet, and that is the point.
+        "refresh_token_expires_in": 10 * 86400})]))
+    ebay.exchange_code(ebay_cfg, "code")
+
+    warnings = [problem for label_, _, problem in ebay.check(ebay_cfg)
+                if problem and "ebay auth" in problem]
+    assert warnings, "a token with ten days left should be warned about"
+
+
+def test_ebay_unconfigured_exits_78_rather_than_half_trying(tmp_path,
+                                                             capsys):
+    """78 is EX_CONFIG, the refusal printd and notify already make.
+
+    A permanent error retried by a timer for ever is a permanent error in
+    the journal for ever, with the one line that says what is wrong
+    buried under it.
+    """
+    from mplabel import cli
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path))
+    assert cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="check")) == 78
+
+
+def test_the_module_entrypoint_passes_the_exit_code_on():
+    """`python -m mplabel` discarded it, so every 78 read as success.
+
+    The exit code and the unit's RestartPreventExitStatus=78 are both
+    needed and only one of them had a test. This is the other half.
+    """
+    source = (Path(__file__).parent.parent / "src" / "mplabel"
+              / "__main__.py").read_text()
+    assert "sys.exit(main())" in source
+
+    from mplabel import cli
+    import inspect
+    # And the wrapper has to return what it wraps, or the entrypoint
+    # above faithfully exits on None.
+    assert "return _main()" in inspect.getsource(cli.main)
+
+
+def test_ebay_secrets_are_not_echoed_by_the_config_command():
+    """`mplabel config` is the command you run *and paste* when stuck.
+
+    `ebay_cert_id` is the OAuth client secret under the other of the two
+    names eBay gives it, and `ebay_verification_token` is the only thing
+    proving an account-deletion notice came from eBay rather than from
+    anyone who found the URL. The app id and the RuName are public
+    halves and stay visible - seeing them is how you check the right
+    keyset is loaded.
+    """
+    from mplabel import cli
+
+    assert "ebay_cert_id" in cli.SECRET_KEYS
+    assert "ebay_verification_token" in cli.SECRET_KEYS
+    assert "ebay_app_id" not in cli.SECRET_KEYS
+    assert "ebay_ru_name" not in cli.SECRET_KEYS
+
+
+def test_the_installer_makes_the_token_directory():
+    """A pull and a pip install do not run install_pi.sh.
+
+    `photos/` went wrong exactly this way: the route the docs give for
+    updating leaves the directory missing and the first write failing on
+    something it cannot create. Tokens are worse than photographs, so the
+    directory is 0700.
+    """
+    script = (Path(__file__).parent.parent / "install_pi.sh").read_text()
+    assert 'install -d -m 700' in script and '$DATA_DIR/ebay' in script
 # --------------------------------------------------------------------------
 # ShopGoodwill auction mail: what she bought, and what it really cost.
 #
