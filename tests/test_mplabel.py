@@ -10415,6 +10415,58 @@ def test_the_documented_config_has_no_inline_comments():
                 "keeps it, so the value is not what it looks like"
 
 
+def test_the_win_fixture_still_carries_its_font_interleaving():
+    """Four of the five real win mails wrap arbitrary spans in
+    `<font color="#550055">`, opening one mid-sentence right before the
+    price and giving the seller line its own `</font><font ...>` pair.
+    The fixture was a tidier document than anything the parser will meet
+    until this was put back, so a cleanup that removes it removes the
+    only coverage of the shape real mail actually has."""
+    raw = GOODWILL_WON.read_text(encoding="utf-8")
+    assert raw.count('<font color=') >= 3
+    assert '</font><font color="#550055">The Seller of this Item' in raw
+
+
+def test_a_font_tag_does_not_end_the_title_or_hide_the_seller(won_mail):
+    """`font` is not a block breaker, so an open tag mid-sentence must
+    not split the title from its item number - and the seller line,
+    which arrives with a closing tag stuck to its front, still has to
+    match at the start of its block."""
+    from mplabel import goodwill
+
+    order = goodwill.parse(won_mail)
+    item, = order["items"]
+    assert item["title"] == "Pair Of Painted Tin Toy Banks 1930s."
+    assert item["price"] == 24.50
+    assert order["seller"] == "Goodwill of the Example Valley of Springfield, IL"
+
+
+def test_a_quote_in_a_title_survives():
+    """Real titles carry inch marks and quoted names - `16.5X29.75"
+    FRAME` and `ANTIQUE 1855 EDITION OF "THE DAILY HERALD".` are both
+    real. The title is the whole block, so a quote is only text, and
+    this pins that nothing downstream starts treating it as a
+    delimiter."""
+    from mplabel import goodwill
+
+    raw = GOODWILL_PAID.read_text(encoding="utf-8").replace(
+        "VINTAGE BLUE AND WHITE PORCELAIN MINI TEAPOT",
+        'FRAMED INK PAINTING SIGNED 16.5X29.75&quot; FRAME')
+    order = goodwill.parse(email.message_from_string(raw))
+    item, = order["items"]
+    assert item["title"] == 'FRAMED INK PAINTING SIGNED 16.5X29.75" FRAME'
+    assert item["item_id"] == "911100037"
+
+
+def test_the_sellers_city_wins_over_the_shipping_address(paid_mail):
+    """Both blocks carry a `City:` line and the seller's comes first, so
+    `_labelled` keeps that one. Worth pinning because the other one is
+    her home address, and a field that quietly became where *she* lives
+    would be a private detail stored under a name that says otherwise."""
+    from mplabel import goodwill
+
+    order = goodwill.parse(paid_mail)
+    assert order["seller_city"] == "Springfield"
 # --- ebay: orders in
 #
 # The fixture is synthetic, like every other one here. A real eBay order
