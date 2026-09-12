@@ -2,13 +2,26 @@
 backfill.py - walk the whole mailbox once and reconstruct her history
 from every Facebook Marketplace and ShopGoodwill email she has received.
 
-**The whole mailbox, which is not the inbox.** `survey_folder` prefers
+**The whole mailbox, which is not the inbox.** `survey_folders` prefers
 the `\All` special-use mailbox - Gmail's archive - over the configured
 `imap_folder`, and the reason is a real survey: INBOX held 99 messages
 and not one of them was a win or a payment receipt, the two kinds the
 auction importer exists for. They had been archived. Walking the inbox
 would have imported no acquisitions and no costs at all, and said
 nothing was wrong.
+
+**And Trash, because she deletes this mail often.** `\All` excludes it,
+so the archive alone still misses purchases. A deleted receipt does not
+undo the purchase it recorded - the money left her account either way.
+Gmail empties Trash after 30 days, which makes this a *rescue window*
+rather than a second archive, and means "reconstruct her history" is
+only true of the history that has not been purged yet.
+
+**This is the half that may read the bin, and the poller is not.**
+Nothing here prints: it records events and fills in listings. The poller
+prints, and reprocessing a label email she deleted could put a parcel
+back on the printer - so `poll_once` stays on the configured folder
+deliberately. The asymmetry is the safety property, not an oversight.
 
 This is the only way to get a listing catalogue without an API. It gives
 you listing dates, sale dates, inquiry counts and payouts going back as
@@ -57,13 +70,13 @@ def _connect(cfg):
     return imap
 
 
-def _all_mail_folder(imap):
-    """The mailbox holding everything, archived included, or None.
+def _special_folder(imap, flag):
+    """The mailbox carrying an RFC 6154 special-use flag, or None.
 
-    Asked for by its RFC 6154 special-use flag rather than by name:
-    Gmail calls it `[Gmail]/All Mail` in English and something else in
-    every other locale, and a hardcoded name would silently find nothing
-    and fall back without saying so."""
+    Asked for by the flag rather than by name: Gmail calls these
+    `[Gmail]/All Mail` and `[Gmail]/Trash` in English and something
+    else in every other locale, and a hardcoded name would silently
+    find nothing and fall back without saying so."""
     try:
         typ, data = imap.list()
     except imaplib.IMAP4.error:
@@ -77,7 +90,7 @@ def _all_mail_folder(imap):
             continue
         text = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
         flags = text[1:text.index(")")] if ")" in text else ""
-        if "\\All" not in flags:
+        if flag not in flags:
             continue
         # `(\HasNoChildren \All) "/" "[Gmail]/All Mail"` - the name is
         # the last field, quoted when it has a space in it, which this
@@ -87,6 +100,22 @@ def _all_mail_folder(imap):
         name = parts[1].strip() if len(parts) > 1 else rest
         return name[1:-1] if name.startswith('"') and name.endswith('"') else name
     return None
+
+
+def _all_mail_folder(imap):
+    """Everything, archived included - but **not** deleted."""
+    return _special_folder(imap, "\\All")
+
+
+def _trash_folder(imap):
+    """Where deleted mail waits to be purged.
+
+    Gmail's `\All` mailbox deliberately excludes Trash, and she deletes
+    ShopGoodwill mail often - so the archive alone still misses
+    purchases. Gmail empties Trash after 30 days, which makes this a
+    rescue window rather than a second archive: what is in there now is
+    recoverable and what was in there last month is gone."""
+    return _special_folder(imap, "\\Trash")
 
 
 def survey_folder(imap, cfg):
@@ -107,6 +136,31 @@ def survey_folder(imap, cfg):
     if configured.upper() != "INBOX":
         return configured
     return _all_mail_folder(imap) or configured
+
+
+def survey_folders(imap, cfg):
+    """Every mailbox worth walking, in order, deduplicated.
+
+    **Trash is on this list, and that is the point.** She deletes
+    ShopGoodwill mail often, and a deleted receipt does not undo the
+    purchase it recorded - the money left her account either way, and
+    the cost basis is still true. Gmail's `\All` mailbox excludes
+    Trash, so walking the archive alone still misses whatever she
+    cleared out.
+
+    Message numbers are per-mailbox, so these are walked one at a time
+    rather than searched together; `mail_events.message_id` is what
+    stops a message counted twice.
+
+    The poller deliberately does *not* use this. Reprocessing a message
+    she put in the bin is the opposite of what deleting it meant, and
+    the poller is about what happens next rather than what already
+    did."""
+    folders = [survey_folder(imap, cfg)]
+    trash = _trash_folder(imap)
+    if trash and trash not in folders:
+        folders.append(trash)
+    return folders
 
 
 def quote_mailbox(name):
@@ -196,23 +250,27 @@ def scan(cfg, limit=2000):
     """Survey the mailbox without changing anything."""
     imap = _connect(cfg)
     try:
-        folder = survey_folder(imap, cfg)
-        nums = _search_all(imap, folder)
-        # Name the folder, always. "99 messages" means one thing out of
-        # an inbox and another out of everything she has ever received,
-        # and the first survey of this mailbox was read as the second.
-        print(f"{len(nums)} Facebook/ShopGoodwill message(s) in {folder}")
-        if folder != (cfg.get("imap_folder") or "INBOX"):
-            print(f"  (not {cfg.get('imap_folder') or 'INBOX'}: archived "
-                  f"mail is still history, and the mails carrying a cost "
-                  f"basis are the ones most likely to have been filed)")
-        if not nums:
+        # Name every folder and count them apart. "99 messages" means
+        # one thing out of an inbox and another out of everything she
+        # has ever received, and the first survey of this mailbox was
+        # read as the second.
+        folders = survey_folders(imap, cfg)
+        trash = _trash_folder(imap)
+        msgs, found = [], []
+        for folder in folders:
+            nums = _search_all(imap, folder)
+            found.append((folder, len(nums)))
+            if nums:
+                msgs.extend(_headers_only(imap, nums[-limit:]))
+        for folder, n in found:
+            note = "  <- deleted; Gmail purges this after 30 days" \
+                if folder == trash and n else ""
+            print(f"{n} Facebook/ShopGoodwill message(s) in {folder}{note}")
+        if not msgs:
             print("\nNothing found. If her Facebook mail is filtered into a "
                   "label rather than the inbox, set imap_folder to that "
                   "label name.")
             return
-        nums = nums[-limit:]
-        msgs = _headers_only(imap, nums)
     finally:
         try:
             imap.close()
@@ -274,90 +332,97 @@ def run(cfg, conn, limit=None, resume=True):
     imap = _connect(cfg)
     added = skipped = unmatched = bought = noted = 0
     try:
-        folder = survey_folder(imap, cfg)
-        nums = _search_all(imap, folder)
-        if limit:
-            nums = nums[-limit:]
-        log.info("%d message(s) to consider in %s", len(nums), folder)
+        # One folder at a time: a message number means nothing outside
+        # the mailbox it was searched in. `mail_events.message_id` is
+        # what stops the same message being counted twice.
+        work = []
+        for folder in survey_folders(imap, cfg):
+            nums = _search_all(imap, folder)
+            if limit:
+                nums = nums[-limit:]
+            log.info("%d message(s) to consider in %s", len(nums), folder)
+            work.append((folder, nums))
 
-        for i in range(0, len(nums), BATCH):
-            chunk = nums[i:i + BATCH]
-            for num in chunk:
-                typ, raw = imap.fetch(num, "(RFC822)")
-                if typ != "OK" or not raw or not raw[0]:
-                    continue
-                msg = email.message_from_bytes(raw[0][1])
-                mid = mailparse._decode(msg.get("Message-ID"))
-                if mid and mid in seen:
-                    skipped += 1
-                    continue
+        for folder, nums in work:
+            _search_all(imap, folder)   # re-select; the last loop moved on
+            for i in range(0, len(nums), BATCH):
+                chunk = nums[i:i + BATCH]
+                for num in chunk:
+                    typ, raw = imap.fetch(num, "(RFC822)")
+                    if typ != "OK" or not raw or not raw[0]:
+                        continue
+                    msg = email.message_from_bytes(raw[0][1])
+                    mid = mailparse._decode(msg.get("Message-ID"))
+                    if mid and mid in seen:
+                        skipped += 1
+                        continue
 
-                # ShopGoodwill first, because it is decided by the sender
-                # and cannot be confused with the seller side. Its own
-                # importer writes the row: a purchase has a cost and no
-                # Facebook listing id, so there is nothing for
-                # `apply_events` to replay it into.
-                if goodwill.is_from_goodwill(msg):
-                    try:
-                        result = goodwill.import_mail(conn, msg)
-                        if result:
-                            # A classified mail is recorded either way,
-                            # but only some of them are a purchase.
-                            # Counting a return ticket as an order would
-                            # report sixty acquisitions from a mailbox
-                            # that had eleven.
-                            if result["listing_ids"]:
-                                bought += 1
+                    # ShopGoodwill first, because it is decided by the sender
+                    # and cannot be confused with the seller side. Its own
+                    # importer writes the row: a purchase has a cost and no
+                    # Facebook listing id, so there is nothing for
+                    # `apply_events` to replay it into.
+                    if goodwill.is_from_goodwill(msg):
+                        try:
+                            result = goodwill.import_mail(conn, msg)
+                            if result:
+                                # A classified mail is recorded either way,
+                                # but only some of them are a purchase.
+                                # Counting a return ticket as an order would
+                                # report sixty acquisitions from a mailbox
+                                # that had eleven.
+                                if result["listing_ids"]:
+                                    bought += 1
+                                else:
+                                    noted += 1
+                                if mid:
+                                    seen.add(mid)
                             else:
-                                noted += 1
-                            if mid:
-                                seen.add(mid)
-                        else:
+                                unmatched += 1
+                        except Exception:
+                            log.exception("could not import ShopGoodwill mail")
                             unmatched += 1
-                    except Exception:
-                        log.exception("could not import ShopGoodwill mail")
+                        continue
+
+                    # The server-side search is by From domain, but X-GM-RAW
+                    # and IMAP SEARCH both match loosely. Verify per message.
+                    if not mailparse.is_from_facebook(msg):
                         unmatched += 1
-                    continue
+                        continue
 
-                # The server-side search is by From domain, but X-GM-RAW
-                # and IMAP SEARCH both match loosely. Verify per message.
-                if not mailparse.is_from_facebook(msg):
-                    unmatched += 1
-                    continue
+                    subject = mailparse._decode(msg.get("Subject"))
+                    kind = listings.classify(subject)
+                    if not kind:
+                        unmatched += 1
+                        continue
 
-                subject = mailparse._decode(msg.get("Subject"))
-                kind = listings.classify(subject)
-                if not kind:
-                    unmatched += 1
-                    continue
+                    try:
+                        occurred = parsedate_to_datetime(msg.get("Date")).isoformat()
+                    except Exception:
+                        occurred = None
 
-                try:
-                    occurred = parsedate_to_datetime(msg.get("Date")).isoformat()
-                except Exception:
-                    occurred = None
-
-                parsed = mailparse.parse(msg)
-                # Her own purchases carry the *seller's* listing id. Drop it
-                # rather than record it: everything downstream treats a
-                # listing id as one of her listings, so keeping it would
-                # invent rows for items that were never for sale.
-                buyer_side = kind in listings.BUYER_KINDS
-                listings.record_event(
-                    conn, mid, occurred, kind, subject,
-                    listing_id=None if buyer_side else parsed.get("listing_id"),
-                    amount=parsed.get("price"),
-                    counterparty=parsed.get("buyer"))
-                # The title is worth capturing on any event type, not just
-                # sales - it is how an unsold listing gets a name.
-                if not buyer_side and parsed.get("listing_id"):
-                    listings.upsert_listing(
-                        conn, parsed["listing_id"], "email",
-                        title=parsed.get("item"), price=parsed.get("price"))
-                added += 1
-                if mid:
-                    seen.add(mid)
-            conn.commit()
-            log.info("  %d/%d processed", min(i + BATCH, len(nums)), len(nums))
+                    parsed = mailparse.parse(msg)
+                    # Her own purchases carry the *seller's* listing id. Drop it
+                    # rather than record it: everything downstream treats a
+                    # listing id as one of her listings, so keeping it would
+                    # invent rows for items that were never for sale.
+                    buyer_side = kind in listings.BUYER_KINDS
+                    listings.record_event(
+                        conn, mid, occurred, kind, subject,
+                        listing_id=None if buyer_side else parsed.get("listing_id"),
+                        amount=parsed.get("price"),
+                        counterparty=parsed.get("buyer"))
+                    # The title is worth capturing on any event type, not just
+                    # sales - it is how an unsold listing gets a name.
+                    if not buyer_side and parsed.get("listing_id"):
+                        listings.upsert_listing(
+                            conn, parsed["listing_id"], "email",
+                            title=parsed.get("item"), price=parsed.get("price"))
+                    added += 1
+                    if mid:
+                        seen.add(mid)
+                conn.commit()
+                log.info("  %d/%d processed", min(i + BATCH, len(nums)), len(nums))
     finally:
         try:
             imap.close()
