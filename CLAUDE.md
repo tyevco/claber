@@ -781,6 +781,28 @@ rather than a prompt, and it is what makes the path testable at all: a
 design where publish cannot be called means that code runs against her
 real account the first time anybody tries it.
 
+**A cosmetic call must not be able to fail a command.** `ebay push`
+asked for the category suggestions unconditionally, and a sandbox **500
+- `62000: There was a problem with an eBay internal system`** on that
+endpoint killed a `push --category 38204 --publish` that carried every
+value it needed. Once `--category` is given the suggestions are only the
+list the choice is *printed against*; without it, one of them becomes
+the category. So the same failure is fatal in one case and cosmetic in
+the other, and it says which happened - a missing comparison reads as
+agreement. `required_aspects` is deliberately **not** made tolerant the
+same way: those gate `--publish`, and swallowing their failure would
+publish without knowing what eBay requires, which is the one thing
+asking for them early exists to prevent.
+
+The other half of that run: a category **not among the suggestions** is
+now said out loud. Overriding is legitimate - eBay's first guess was
+plainly wrong on three of twelve real titles - but it is also exactly
+what a mis-pasted id looks like, and one reached eBay from a worked
+example in a chat message. It was caught only because that id happened
+not to be a leaf (`62009: The specified category ID must be a leaf
+category`); a valid leaf would have listed the thing somewhere nobody
+searching for it would ever look, silently.
+
 **eBay's title limit is 80 and hers run past a hundred.** So the cut
 fires often rather than never. It falls at a word boundary where there
 is one - a mid-word cut reads as a corrupted listing rather than a long

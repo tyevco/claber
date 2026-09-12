@@ -12273,3 +12273,92 @@ def test_a_cut_title_does_not_end_in_an_en_dash():
     for dash in "-‐‑‒–—―−":
         padded = "Milk glass vase " * 4 + f"and a compote {dash} x"
         assert not ebay.ebay_title(padded).rstrip().endswith(dash)
+
+
+def test_push_survives_a_suggestion_failure_when_the_category_is_given(
+        db, tmp_path, capsys, monkeypatch):
+    """A cosmetic call must not be able to fail a command.
+
+    `push --category 38204 --publish` carried every value it needed and
+    died on `62000: There was a problem with an eBay internal system` -
+    a 500 from the *suggestion* endpoint, whose only job once
+    `--category` is given is to print the list the choice is compared
+    against. Same shape as `setup` falling back on the shipping-service
+    list rather than stopping.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    monkeypatch.setattr(ebay, "suggest_categories",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            ebay.EbayError("500: 62000: internal system")))
+    monkeypatch.setattr(ebay, "required_aspects", lambda *a, **k: [])
+    sent = []
+    monkeypatch.setattr(ebay, "put_inventory_item",
+                        lambda *a, **k: sent.append("item"))
+    monkeypatch.setattr(ebay, "create_or_update_offer",
+                        lambda *a, **k: ("offer1", "created"))
+
+    code = cli.cmd_ebay_push(cfg, db, argparse.Namespace(
+        listing="1", category="38204", aspect=[], publish=False,
+        dry_run=False))
+    assert code == 0, capsys.readouterr()
+    assert sent == ["item"]
+    out = capsys.readouterr().out
+    # And it says the comparison did not happen, because a missing
+    # comparison reads as agreement.
+    assert "could not suggest" in out and "unchecked" in out
+
+
+def test_push_still_fails_on_a_suggestion_failure_with_no_category(
+        db, tmp_path, monkeypatch):
+    """There it is load bearing: one of them becomes the category.
+
+    The asymmetry is the whole point - tolerating it here would push an
+    offer with no category at all.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    monkeypatch.setattr(ebay, "suggest_categories",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            ebay.EbayError("500: 62000: internal system")))
+    sent = []
+    monkeypatch.setattr(ebay, "put_inventory_item",
+                        lambda *a, **k: sent.append("item"))
+
+    code = cli.cmd_ebay_push(cfg, db, argparse.Namespace(
+        listing="1", category=None, aspect=[], publish=False, dry_run=False))
+    assert code == 1
+    assert sent == [], "nothing may be sent without a category"
+
+
+def test_push_says_when_the_named_category_is_not_a_suggestion(
+        db, tmp_path, capsys, monkeypatch):
+    """Overriding is legitimate; a mis-pasted id looks identical.
+
+    A real run reached eBay with a category invented for a worked
+    example, and it was caught only because that id happened not to be
+    a leaf. A valid leaf would have listed the thing in the wrong place
+    silently.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [
+        {"id": "38204", "name": "Tables", "path": "Furniture > Tables"}])
+    monkeypatch.setattr(ebay, "required_aspects", lambda *a, **k: [])
+    monkeypatch.setattr(ebay, "put_inventory_item", lambda *a, **k: None)
+    monkeypatch.setattr(ebay, "create_or_update_offer",
+                        lambda *a, **k: ("offer1", "created"))
+
+    assert cli.cmd_ebay_push(cfg, db, argparse.Namespace(
+        listing="1", category="13905", aspect=[], publish=False,
+        dry_run=False)) == 0
+    assert "13905 is not one of these" in capsys.readouterr().out
