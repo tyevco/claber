@@ -2,6 +2,14 @@
 backfill.py - walk the whole mailbox once and reconstruct her history
 from every Facebook Marketplace and ShopGoodwill email she has received.
 
+**The whole mailbox, which is not the inbox.** `survey_folder` prefers
+the `\All` special-use mailbox - Gmail's archive - over the configured
+`imap_folder`, and the reason is a real survey: INBOX held 99 messages
+and not one of them was a win or a payment receipt, the two kinds the
+auction importer exists for. They had been archived. Walking the inbox
+would have imported no acquisitions and no costs at all, and said
+nothing was wrong.
+
 This is the only way to get a listing catalogue without an API. It gives
 you listing dates, sale dates, inquiry counts and payouts going back as
 far as her mail does - and, since the ShopGoodwill importer landed, what
@@ -47,6 +55,58 @@ def _connect(cfg):
     imap = imaplib.IMAP4_SSL(cfg["imap_host"], int(cfg["imap_port"]))
     imap.login(cfg["imap_user"], cfg["imap_password"])
     return imap
+
+
+def _all_mail_folder(imap):
+    """The mailbox holding everything, archived included, or None.
+
+    Asked for by its RFC 6154 special-use flag rather than by name:
+    Gmail calls it `[Gmail]/All Mail` in English and something else in
+    every other locale, and a hardcoded name would silently find nothing
+    and fall back without saying so."""
+    try:
+        typ, data = imap.list()
+    except imaplib.IMAP4.error:
+        return None
+    if typ != "OK" or not data:
+        return None
+    for line in data:
+        if isinstance(line, tuple):
+            line = line[0]
+        if not line:
+            continue
+        text = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+        flags = text[1:text.index(")")] if ")" in text else ""
+        if "\\All" not in flags:
+            continue
+        # `(\HasNoChildren \All) "/" "[Gmail]/All Mail"` - the name is
+        # the last field, quoted when it has a space in it, which this
+        # one does.
+        rest = text[text.index(")") + 1:].strip()
+        parts = rest.split(" ", 1)
+        name = parts[1].strip() if len(parts) > 1 else rest
+        return name[1:-1] if name.startswith('"') and name.endswith('"') else name
+    return None
+
+
+def survey_folder(imap, cfg):
+    """Which mailbox to walk, and why.
+
+    **Not the configured `imap_folder`, where that is the inbox.** A
+    real `mplabel scan` against INBOX found 99 messages and *none* of
+    them were a win or a payment receipt - the two kinds this whole
+    importer is built on - while turning up 47 return tickets and 9
+    refunds. Those mails exist; they had been archived. So `backfill`,
+    whose own first line says it walks the whole mailbox once, would
+    have imported zero acquisitions and zero costs from that account
+    and reported success.
+
+    A configured folder that is *not* the inbox is a deliberate answer
+    to "her mail is filtered into a label", so it wins."""
+    configured = cfg.get("imap_folder") or "INBOX"
+    if configured.upper() != "INBOX":
+        return configured
+    return _all_mail_folder(imap) or configured
 
 
 def _search_all(imap, folder, since=None):
@@ -95,9 +155,16 @@ def scan(cfg, limit=2000):
     """Survey the mailbox without changing anything."""
     imap = _connect(cfg)
     try:
-        nums = _search_all(imap, cfg["imap_folder"])
-        print(f"{len(nums)} Facebook/ShopGoodwill message(s) "
-              f"in {cfg['imap_folder']}")
+        folder = survey_folder(imap, cfg)
+        nums = _search_all(imap, folder)
+        # Name the folder, always. "99 messages" means one thing out of
+        # an inbox and another out of everything she has ever received,
+        # and the first survey of this mailbox was read as the second.
+        print(f"{len(nums)} Facebook/ShopGoodwill message(s) in {folder}")
+        if folder != (cfg.get("imap_folder") or "INBOX"):
+            print(f"  (not {cfg.get('imap_folder') or 'INBOX'}: archived "
+                  f"mail is still history, and the mails carrying a cost "
+                  f"basis are the ones most likely to have been filed)")
         if not nums:
             print("\nNothing found. If her Facebook mail is filtered into a "
                   "label rather than the inbox, set imap_folder to that "
@@ -166,10 +233,11 @@ def run(cfg, conn, limit=None, resume=True):
     imap = _connect(cfg)
     added = skipped = unmatched = bought = noted = 0
     try:
-        nums = _search_all(imap, cfg["imap_folder"])
+        folder = survey_folder(imap, cfg)
+        nums = _search_all(imap, folder)
         if limit:
             nums = nums[-limit:]
-        log.info("%d message(s) to consider", len(nums))
+        log.info("%d message(s) to consider in %s", len(nums), folder)
 
         for i in range(0, len(nums), BATCH):
             chunk = nums[i:i + BATCH]

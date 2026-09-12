@@ -11445,7 +11445,20 @@ def test_a_buy_now_confirmation_creates_no_cost(db):
 
 
 class _QuietIMAP:
-    """Enough of an IMAP connection for `scan`'s finally block."""
+    """Enough of an IMAP connection for `scan` to run against.
+
+    `list` answers the way Gmail does, including the `\\All` special-use
+    flag, because which mailbox gets walked is now a decision rather
+    than the configured default."""
+
+    def __init__(self, mailboxes=None):
+        self.mailboxes = mailboxes if mailboxes is not None else [
+            br'(\HasNoChildren \Sent) "/" "[Gmail]/Sent Mail"',
+            br'(\HasNoChildren \All) "/" "[Gmail]/All Mail"',
+        ]
+
+    def list(self):
+        return "OK", self.mailboxes
 
     def close(self):
         pass
@@ -11601,3 +11614,68 @@ def test_the_programme_opt_in_is_a_post_to_the_documented_path(monkeypatch):
     ebay.opt_in_to_program({})
     assert seen == [("POST", "/sell/account/v1/program/opt_in",
                      {"programType": "SELLING_POLICY_MANAGEMENT"})]
+# --------------------------------------------------------------------------
+# The survey that found nothing, and why that was the finding.
+#
+# A second `mplabel scan` came back with every subject classified - and
+# with *no* `goodwill_won` and *no* `goodwill_paid` in the recognised
+# list at all, against 47 return tickets and 9 refunds. The two kinds
+# the auction importer exists for were not in the inbox; they had been
+# archived. `backfill` walks one folder, so it would have imported no
+# acquisitions and no costs and reported success.
+
+def test_the_survey_walks_the_archive_not_the_inbox():
+    """Its own first line says it walks the whole mailbox once. It was
+    walking INBOX, where the mails carrying a cost basis are exactly the
+    ones most likely to have been filed away."""
+    from mplabel import backfill
+
+    imap = _QuietIMAP()
+    assert backfill.survey_folder(imap, {"imap_folder": "INBOX"}) \
+        == "[Gmail]/All Mail"
+    assert backfill.survey_folder(imap, {}) == "[Gmail]/All Mail"
+
+
+def test_a_configured_folder_that_is_not_the_inbox_wins():
+    """Setting `imap_folder` to a label is a deliberate answer to "her
+    mail is filtered", and the scan's own advice tells her to do it. It
+    must not be second-guessed."""
+    from mplabel import backfill
+
+    assert backfill.survey_folder(_QuietIMAP(),
+                                  {"imap_folder": "Marketplace"}) == "Marketplace"
+
+
+def test_the_archive_is_found_by_its_flag_not_its_name():
+    """Gmail calls it `[Gmail]/All Mail` in English and something else
+    in every other locale. Matching the name would find nothing abroad
+    and fall back to the inbox without saying so."""
+    from mplabel import backfill
+
+    localised = _QuietIMAP([
+        br'(\\HasNoChildren \\All) "/" "[Gmail]/Alle Nachrichten"',
+    ])
+    assert backfill.survey_folder(localised, {}) == "[Gmail]/Alle Nachrichten"
+
+    none_advertised = _QuietIMAP([br'(\\HasNoChildren) "/" "INBOX"'])
+    assert backfill.survey_folder(none_advertised, {}) == "INBOX"
+
+
+def test_the_survey_names_the_folder_it_walked(monkeypatch, capsys):
+    """"99 messages" means one thing out of an inbox and another out of
+    everything she has ever received, and the first survey of this
+    mailbox was read as the second."""
+    from mplabel import backfill
+
+    msgs = [email.message_from_string("Subject: Refund Issued\n\n")]
+    monkeypatch.setattr(backfill, "_connect", lambda cfg: _QuietIMAP())
+    monkeypatch.setattr(backfill, "_search_all",
+                        lambda imap, folder, since=None: [b"1"])
+    monkeypatch.setattr(backfill, "_headers_only", lambda imap, nums: msgs)
+
+    backfill.scan({"imap_folder": "INBOX"})
+    out = capsys.readouterr().out
+    assert "in [Gmail]/All Mail" in out
+    assert "not INBOX" in out
+    # And the family that was crowding the list is recognised now.
+    assert "goodwill_refund" in out
