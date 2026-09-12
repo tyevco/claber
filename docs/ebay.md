@@ -170,6 +170,13 @@ is not the API: **eBay shows buyers a delivery estimate computed from
 this address**, so a placeholder would be a wrong promise on every
 listing rather than a tidy default.
 
+And the location is settled **before** the policies, which is a fix
+rather than an arrangement. It used to come last, so a run against an
+account with no postcode set created all three business policies, then
+refused - and reported none of the three, whose ids are minted by eBay
+and printed nowhere else. Whatever `setup` has actually done is now
+printed on the way out of a failure as well as a success.
+
 If the metadata call itself fails, `setup` falls back to the first
 preference and **says it did**. Asking is better than assuming, stopping
 is worse than both, and saying which happened is what makes a later
@@ -195,6 +202,11 @@ It will **not** rewrite a policy that already exists. A policy is how
 she actually ships and returns; a tool that overwrites one because its
 own defaults differ is a tool that changed her terms without being
 asked.
+
+Which is why the `shipping:` line it prints says whether the service was
+applied. On every run after the first it was not - the existing
+fulfillment policy decides - and a bare service code there reads as a
+statement about the policy printed beside it.
 
 ## The one public route, and what it will not serve
 

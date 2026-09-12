@@ -2270,6 +2270,42 @@ def cmd_notify(cfg, conn, args):
     return 0
 
 
+def _ebay_setup_report(done, policies, service):
+    """What `ebay setup` actually did, printed even when it then failed.
+
+    Two things here are deliberate. It runs on the failure paths as
+    well as the success one, because the policy ids are minted by eBay
+    and this is the only place they are ever printed - a run that
+    created three policies and then refused on the address said nothing
+    about the three, which is this repo's own recurring failure shape:
+    work done, bookkeeping silent.
+
+    And the shipping service is reported **after** the policies and
+    says whether it was applied. `ensure_policies` will not rewrite a
+    policy that already exists, so on every run after the first the
+    chosen service is a service nothing used - and printing it as a
+    bare fact read as "this is what your policy ships by", which was
+    untrue on exactly the run where it mattered.
+    """
+    lines = list(done)
+    for kind, (pid, said) in sorted(policies.items()):
+        lines.append((kind + " policy", f"{pid or '-'}  ({said})"))
+    if service and service.get("code"):
+        note = ""
+        settled = (policies.get("fulfillment") or (None, ""))[1] or ""
+        if settled.startswith("already there"):
+            note = ("  - chosen, but the fulfillment policy above "
+                    "already existed"
+                    + chr(10) + " " * 24
+                    + "and decides for itself; nothing was changed")
+        lines.append(("shipping", f"{service['code']}"
+                      + (f"  ({service.get('description')})"
+                         if service.get("description") else "")
+                      + note))
+    for label, value in lines:
+        print(f"{label:22}: {value}")
+
+
 def cmd_ebay(cfg, args):
     """`ebay auth` and `ebay check`. Neither touches the database.
 
@@ -2310,6 +2346,9 @@ def cmd_ebay(cfg, args):
         return 0
 
     if args.ebaycmd == "setup":
+        # What has actually happened, so far. Printed whether or not a
+        # later step raises - see the note on the ordering below.
+        done, policies, service = [], {}, None
         try:
             tokens = ebay_mod.load_tokens(cfg)
             if not ebay_mod.has_scope(tokens, ebay_mod.ACCOUNT_SCOPE):
@@ -2396,32 +2435,47 @@ def cmd_ebay(cfg, args):
                           "account can use.\n`--shipping-service list` "
                           "shows what it said.", file=sys.stderr)
                     return 78
-            print(f"{'shipping':22}: {service['code']}"
-                  + (f"  ({service.get('description')})"
-                     if service.get("description") else ""))
-
-            policies = ebay_mod.ensure_policies(cfg, dry_run=args.dry_run,
-                                                service=service)
+            # The location goes first, and that ordering is the fix for
+            # a real incident rather than tidiness. It is the one step
+            # that can refuse for a *configuration* reason - the
+            # ship-from address is hers and cannot be guessed - and it
+            # ran last, so a run against an account with no postcode
+            # set created all three business policies and then raised,
+            # reporting none of them. Three real policies existed on
+            # her account and the command's output said nothing about
+            # any of them. Refuse before creating, not after.
             key, what = ebay_mod.ensure_location(cfg, dry_run=args.dry_run)
+            done.append(("location", f"{key}  ({what})"))
+
+            ebay_mod.ensure_policies(cfg, dry_run=args.dry_run,
+                                     service=service, out=policies)
         except ebay_mod.EbayConfigError as exc:
+            _ebay_setup_report(done, policies, service)
             print(f"ebay: {exc}", file=sys.stderr)
             return 78
         except ebay_mod.EbayError as exc:
+            # Same reasoning one layer out: whatever was created before
+            # the refusal is said out loud, because the ids are minted
+            # by eBay and this is the only place they are printed.
+            _ebay_setup_report(done, policies, service)
             print(f"ebay: {exc}", file=sys.stderr)
             return 1
 
-        print(f"{'location':22}: {key}  ({what})")
-        for kind, (pid, said) in sorted(policies.items()):
-            print(f"{kind + ' policy':22}: {pid or '-'}  ({said})")
+        _ebay_setup_report(done, policies, service)
         if args.dry_run:
             print("\nnothing created. Drop --dry-run to apply.")
             return 0
         print("\nPut these in /etc/mplabel.conf, or an offer will be "
               "refused:\n")
-        print(f"ebay_merchant_location  = {key}")
-        for kind in ("fulfillment", "payment", "return"):
-            print(f"ebay_{kind}_policy{'':{max(0, 9 - len(kind))}} = "
-                  f"{policies[kind][0] or ''}")
+        # Padded to the longest key rather than to a hand-counted width:
+        # this block is meant to be copied into a config file, and a
+        # ragged one reads as three unrelated lines.
+        settings = [("ebay_merchant_location", key)] + [
+            (f"ebay_{kind}_policy", policies.get(kind, (None,))[0] or "")
+            for kind in ("fulfillment", "payment", "return")]
+        width = max(len(name) for name, _ in settings)
+        for name, value in settings:
+            print(f"{name:<{width}} = {value}")
         return 0
 
     if args.ebaycmd == "skus":
