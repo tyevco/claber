@@ -11784,10 +11784,14 @@ def test_setup_falls_back_rather_than_stopping_when_eBay_will_not_list(
                         lambda cfg_: (_ for _ in ()).throw(
                             ebay.EbayError("403 nope")))
     used = {}
-    monkeypatch.setattr(ebay, "ensure_policies",
-                        lambda cfg_, dry_run=False, service=None:
-                        used.update(service or {}) or
-                        {k: ("id", "created") for k in ebay.POLICY_KINDS})
+
+    def _policies(cfg_, dry_run=False, service=None, out=None):
+        used.update(service or {})
+        out = {} if out is None else out
+        out.update({k: ("id", "created") for k in ebay.POLICY_KINDS})
+        return out
+
+    monkeypatch.setattr(ebay, "ensure_policies", _policies)
     monkeypatch.setattr(ebay, "ensure_location",
                         lambda *a, **k: ("home", "created"))
 
@@ -12075,3 +12079,171 @@ def test_a_dry_run_refuses_a_missing_address_rather_than_promising_one(
     with pytest.raises(ebay.EbayConfigError):
         ebay.ensure_location({"ebay_merchant_location": "home"},
                              dry_run=True)
+
+
+# --------------------------------------------------------------------------
+# What `ebay setup` did, said out loud even when it then failed.
+#
+# A real run against the sandbox account created all three business
+# policies and then raised on the ship-from address, which had never
+# been configured - and reported none of the three. The ids are minted
+# by eBay and `setup` is the only place they are ever printed, so the
+# account grew three policies nobody could name. Work done, bookkeeping
+# silent: the same shape as the fsync/EINVAL incident and the dry run
+# that committed.
+# --------------------------------------------------------------------------
+
+
+def _setup_cfg(tmp_path):
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    ebay.save_tokens(cfg, {"environment": "sandbox", "access_token": "a",
+                           "refresh_token": "r", "scopes": list(ebay.SCOPES)})
+    return cfg
+
+
+def _setup_ready(monkeypatch, ebay):
+    """Everything before the location and the policies, stubbed out."""
+    monkeypatch.setattr(ebay, "opted_in_programs",
+                        lambda cfg_: [ebay.POLICY_PROGRAM])
+    monkeypatch.setattr(ebay, "shipping_services", lambda cfg_: [
+        {"code": "USPSParcel", "carrier": "USPS", "usable": True,
+         "international": False, "description": "USPS Ground Advantage"}])
+
+
+def test_setup_settles_the_address_before_it_creates_a_policy(tmp_path,
+                                                               monkeypatch,
+                                                               capsys):
+    """The one step that can refuse for a configuration reason goes first.
+
+    It ran last, so a run on an account with no `ebay_location_postcode`
+    created three real business policies on eBay and *then* refused -
+    and printed nothing about the three, whose ids are minted by eBay
+    and printed nowhere else. Refuse before creating, not after.
+    """
+    from mplabel import cli, ebay
+
+    cfg = _setup_cfg(tmp_path)
+    _setup_ready(monkeypatch, ebay)
+    # 404: the location does not exist yet, which is when the address
+    # is needed and when this used to happen far too late.
+    monkeypatch.setattr(ebay, "call", lambda *a, **k: (404, {}))
+    created = []
+    monkeypatch.setattr(ebay, "ensure_policies",
+                        lambda *a, **k: created.append("policies"))
+
+    code = cli.cmd_ebay(cfg, argparse.Namespace(
+        ebaycmd="setup", dry_run=False, opt_in=False, shipping_service=None))
+    assert code == 78
+    assert created == [], "nothing may be created before the address is known"
+    assert "ebay_location_postcode" in capsys.readouterr().err
+
+
+def test_setup_names_the_policies_it_created_even_when_it_then_fails(
+        tmp_path, monkeypatch, capsys):
+    """A refusal partway through must not take the ids with it.
+
+    `ensure_policies` fills the caller's dict as it goes for exactly
+    this: returning a value is no use to a caller that never receives
+    it, and a policy created and never named is a policy nobody can put
+    in a config file.
+    """
+    from mplabel import cli, ebay
+
+    cfg = _setup_cfg(tmp_path)
+    _setup_ready(monkeypatch, ebay)
+    monkeypatch.setattr(ebay, "ensure_location",
+                        lambda *a, **k: ("home", "already there"))
+
+    def _half(cfg_, dry_run=False, service=None, out=None):
+        out["fulfillment"] = ("6250457000", "created")
+        raise ebay.EbayError("eBay refused to create the payment policy")
+
+    monkeypatch.setattr(ebay, "ensure_policies", _half)
+    code = cli.cmd_ebay(cfg, argparse.Namespace(
+        ebaycmd="setup", dry_run=False, opt_in=False, shipping_service=None))
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "6250457000" in out, out
+
+
+def test_setup_does_not_claim_a_shipping_service_it_never_applied(
+        tmp_path, monkeypatch, capsys):
+    """`ensure_policies` will not rewrite a policy that already exists.
+
+    So on every run after the first the chosen service is one nothing
+    used - and a bare `shipping: USPSParcel` line read as a statement
+    about the policy above it, which shipped by something else.
+    """
+    from mplabel import cli, ebay
+
+    cfg = _setup_cfg(tmp_path)
+    _setup_ready(monkeypatch, ebay)
+    monkeypatch.setattr(ebay, "ensure_location",
+                        lambda *a, **k: ("home", "already there"))
+
+    def _existing(cfg_, dry_run=False, service=None, out=None):
+        out.update({k: (f"62504{i}", "already there (mplabel ground)")
+                    for i, k in enumerate(ebay.POLICY_KINDS)})
+        return out
+
+    monkeypatch.setattr(ebay, "ensure_policies", _existing)
+    code = cli.cmd_ebay(cfg, argparse.Namespace(
+        ebaycmd="setup", dry_run=False, opt_in=False, shipping_service=None))
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "USPSParcel" in out
+    assert "nothing was changed" in out, out
+
+
+def test_the_setup_config_block_is_padded_to_its_longest_key(tmp_path,
+                                                              monkeypatch,
+                                                              capsys):
+    """It exists to be copied into /etc/mplabel.conf.
+
+    The width was hand-counted against `ebay_merchant_location` and the
+    longest key is `ebay_fulfillment_policy`, so the `=` signs did not
+    line up on the one block whose whole job is to be pasted.
+    """
+    from mplabel import cli, ebay
+
+    cfg = _setup_cfg(tmp_path)
+    _setup_ready(monkeypatch, ebay)
+    monkeypatch.setattr(ebay, "ensure_location",
+                        lambda *a, **k: ("home", "created"))
+
+    def _made(cfg_, dry_run=False, service=None, out=None):
+        out.update({"fulfillment": ("6250457000", "created"),
+                    "payment": ("6250458000", "created"),
+                    "return": ("6250459000", "created")})
+        return out
+
+    monkeypatch.setattr(ebay, "ensure_policies", _made)
+    assert cli.cmd_ebay(cfg, argparse.Namespace(
+        ebaycmd="setup", dry_run=False, opt_in=False,
+        shipping_service=None)) == 0
+    block = [ln for ln in capsys.readouterr().out.splitlines()
+             if ln.startswith("ebay_") and " = " in ln]
+    assert len(block) == 4, block
+    assert len({ln.index(" = ") for ln in block}) == 1, block
+
+
+def test_ensure_policies_fills_the_dict_it_is_given(monkeypatch):
+    """The seam the reporting rests on, pinned directly.
+
+    Without it a refusal on the second policy discards the first one's
+    id, which is minted by eBay and recoverable only by asking again.
+    """
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "call",
+                        lambda cfg, method, path, body=None, **k: (
+                            200, {"fulfillmentPolicies": [
+                                {"fulfillmentPolicyId": "6001",
+                                 "name": "hers"}]}))
+    mine = {}
+    got = ebay.ensure_policies({"ebay_marketplace": "EBAY_US"}, out=mine)
+    assert got is mine
+    assert mine["fulfillment"][0] == "6001"

@@ -830,6 +830,28 @@ preference and **says so** - asking beats assuming, stopping is worse
 than both, and naming which happened is what makes the next refusal
 legible.
 
+**The step that can refuse goes before the steps that create.** `ebay
+setup` made the three business policies and *then* asked where parcels
+are posted from - so on an account with no `ebay_location_postcode` it
+created three real policies on eBay, raised, and reported none of them.
+Their ids are minted by eBay and `setup` is the only place they are ever
+printed, so the account grew three policies nobody could name. Two
+halves to the fix, and the second is the general one: the location is
+settled first, **and** whatever has actually happened is printed on the
+way out of a failure as well as a success. `ensure_policies` fills a
+dict the caller owns for exactly that reason - returning a value is no
+use to a caller that never receives it. Same family as the dry run that
+committed and the fsync that failed on a label which printed: the work
+happened and the bookkeeping said otherwise.
+
+**A line that names a thing it did not apply.** `setup` printed
+`shipping: USPSParcel` beside a fulfillment policy shipping by
+`USPSPriority`, because it will not rewrite a policy that already exists
+- so on every run after the first the chosen service is one nothing
+used. It says which now. The sibling of the caveat that goes on being
+said: nothing broke, the sentence simply stopped being true on the
+second run.
+
 **A diagnostic that discards the diagnosis is worse than none.**
 `describe_errors` read `message or longMessage`, which looks like a
 sensible preference and threw away the useful half. A real sandbox

@@ -982,15 +982,23 @@ def fulfillment_body(cfg, service):
     return body
 
 
-def ensure_policies(cfg, dry_run=False, service=None):
+def ensure_policies(cfg, dry_run=False, service=None, out=None):
     """The three business policies, created only where none exists.
 
     Returns {kind: (policy_id, what_happened)}. Never edits one that is
     already there: a policy is how she actually ships and returns, and
     a tool that rewrites it because its own defaults differ is a tool
     that changes her terms without being asked.
+
+    `out` is the caller's dict, filled in as each policy is settled, so
+    that a refusal partway through does not take the ids of the ones
+    already created with it. That happened on a real account: the
+    address check ran *after* this, all three policies were created,
+    `ensure_location` raised, and the command said nothing about the
+    three real policies now sitting on her account. Returning a value
+    is no use to a caller that never receives it.
     """
-    out = {}
+    out = {} if out is None else out
     for kind, path in POLICY_KINDS.items():
         found = existing_policies(cfg, kind)
         if found:
