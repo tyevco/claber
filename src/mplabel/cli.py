@@ -2701,6 +2701,19 @@ def cmd_ebay_push(cfg, conn, args):
     listing = find_listing(conn, args.listing)
     row = dict(listing)
 
+    # A sold thing is gone, and an offer for it is a listing she would
+    # have to take down - or worse, one somebody buys. Nothing looked at
+    # the state before, so `push <a sold listing>` was accepted in
+    # silence. Only `sold` is refused: `acquired` and `draft` are both
+    # things she owns that nobody can buy yet, which is precisely what
+    # a new eBay listing is for.
+    if (row.get("state") or "").strip().lower() == "sold":
+        print(f"refusing: listing {row['id']} is already sold.\n"
+              f"  {row.get('title') or ''}\n"
+              f"An offer for it would be a listing to take down, or one "
+              f"somebody buys.", file=sys.stderr)
+        return 2
+
     try:
         sku = ebay_mod.sku_for(row.get("inventory_code"))
         photos = listings_mod.photos_for(conn, row["id"])
@@ -2732,7 +2745,9 @@ def cmd_ebay_push(cfg, conn, args):
         # `--publish`, so swallowing a failure here would publish
         # without knowing what eBay requires, which is the one thing
         # asking for them early exists to prevent.
-        needed = ebay_mod.required_aspects(cfg, category) if category else []
+        aspects_seen = {}
+        needed = (ebay_mod.required_aspects(cfg, category, seen=aspects_seen)
+                  if category else [])
     except ebay_mod.EbayConfigError as exc:
         print(f"ebay: {exc}", file=sys.stderr)
         return 78
@@ -2756,8 +2771,15 @@ def cmd_ebay_push(cfg, conn, args):
         print(f"             {url}")
     if suggestions:
         print("  eBay suggests:")
+        # The star means "this is the one being sent", so it belongs to
+        # a category that will actually be used: the one she named, or
+        # on a dry run the first suggestion the request is built from.
+        # Marking the first one in a run that is about to refuse said
+        # the opposite of what the refusal then says.
+        will_use = args.category or (category if args.dry_run else None)
         for guess in suggestions:
-            mark = "*" if str(guess["id"]) == str(category) else " "
+            mark = ("*" if will_use and str(guess["id"]) == str(will_use)
+                    else " ")
             print(f"           {mark} {guess['id']}  {guess['path']}")
         if args.category and not any(str(g["id"]) == str(args.category)
                                      for g in suggestions):
@@ -2776,6 +2798,36 @@ def cmd_ebay_push(cfg, conn, args):
         print(f"  required aspects for {category}: " + ", ".join(needed))
         if missing:
             print(f"             missing: " + ", ".join(missing))
+    elif category:
+        # Said out loud, because "none required" and "we could not read
+        # the list" look identical as silence - and the second means a
+        # publish fails at eBay naming one aspect per round trip, which
+        # is the thing asking early exists to prevent.
+        total = aspects_seen.get("total")
+        if total:
+            print(f"  required aspects for {category}: none of the "
+                  f"{total} eBay listed")
+        else:
+            print(f"  required aspects for {category}: eBay's answer "
+                  f"carried no aspects at all,\n             which is "
+                  f"either true or a shape this could not read")
+
+    if not args.category and not args.dry_run:
+        # The step that can refuse goes before the steps that create -
+        # the same rule `ebay setup` was fixed to follow. eBay's own
+        # first suggestion was plainly wrong on three of twelve real
+        # titles, and an offer created on a guess is a listing nobody
+        # searching for the thing will ever see. Publishing happens in
+        # eBay's UI by design, and that route never asks again.
+        print("\nrefusing to create an offer on a suggested category. "
+              "Name one:\n"
+              f"  mplabel ebay push {args.listing} --category "
+              f"{(suggestions[0]['id'] if suggestions else 'N')}"
+              + "".join(f" --aspect {a!r}=..." for a in needed)
+              + "\nNothing was sent. The suggestions above are eBay's "
+                "guess from the title;\n`--dry-run` prints the whole "
+                "request without this refusal.", file=sys.stderr)
+        return 2
 
     if args.dry_run:
         print("\n--- inventory item ---")

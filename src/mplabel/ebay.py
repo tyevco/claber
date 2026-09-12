@@ -583,6 +583,24 @@ def check(cfg):
         add(label, value or "(unset)",
             None if value else "needed to publish, not to draft",
             blocking=False)
+
+    # The fifth publish-time key, and the one that was missing from this
+    # report while being the only one publish actually stops on: eBay
+    # requires an image to publish and fetches it from here itself, so
+    # every `--publish` refuses without it. Checked for the scheme too,
+    # because eBay refuses a non-https `imageUrls` naming the field
+    # rather than the scheme.
+    base = (cfg.get("ebay_photo_base") or "").strip()
+    if not base:
+        add("photo base", "(unset)",
+            "needed to publish - eBay fetches the images from it",
+            blocking=False)
+    elif not base.startswith("https://"):
+        add("photo base", base,
+            "must be https - eBay refuses a plain-http imageUrls",
+            blocking=False)
+    else:
+        add("photo base", base)
     return rows
 
 
@@ -1138,12 +1156,69 @@ def suggest_categories(cfg, title, limit=3):
     return out
 
 
-def required_aspects(cfg, category_id):
+# What an aspect calls itself. Specific on purpose: a bare `name` would
+# match an aspect *value* (`aspectValues: [{"localizedValue": ...}]`) and
+# every other named object in the payload.
+ASPECT_NAME_KEYS = ("localizedAspectName", "aspectName")
+
+
+def _aspect_rows(payload):
+    """Every aspect in the answer, walked rather than indexed.
+
+    `payload["aspects"]` is the documented shape and indexing it was the
+    one place in this module that trusted a key name - against this
+    repo's own rule, and `_service_rows` next door already follows it.
+    It matters because the failure is silent in the worst direction: a
+    list we cannot find returns *no required aspects*, which reads
+    exactly like a category that has none, and a publish then fails at
+    eBay naming one aspect per round trip - the precise thing asking
+    early exists to prevent.
+
+    Three of twelve real categories came back empty, which is either
+    eBay meaning it or this missing a shape. Walking removes one of
+    those two possibilities; `required_aspects` reports the count so the
+    other stays visible.
+    """
+    rows, seen = [], set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            name = next((node.get(k) for k in ASPECT_NAME_KEYS
+                         if isinstance(node.get(k), str) and node.get(k)),
+                        None)
+            if name:
+                constraint = node.get("aspectConstraint")
+                constraint = constraint if isinstance(constraint, dict) else {}
+                # Either nesting: eBay documents it under the constraint,
+                # and a flag hoisted to the aspect itself is the obvious
+                # way for that to move.
+                required = bool(constraint.get("aspectRequired")
+                                or node.get("aspectRequired"))
+                if name not in seen:
+                    seen.add(name)
+                    rows.append({"name": name, "required": required})
+                return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return rows
+
+
+def required_aspects(cfg, category_id, seen=None):
     """The item specifics eBay will refuse a publish without.
 
     Asked before publishing rather than discovered from the refusal,
     because the refusal names them one at a time and each round trip is
     another failed publish.
+
+    `seen` is the caller's dict, filled with how many aspects were found
+    in total - the same shape `ensure_policies` uses, and here because
+    an empty answer has two causes worth telling apart: eBay saying this
+    category requires nothing, and this failing to read the list at all.
     """
     tree = category_tree_id(cfg)
     status, payload = call(
@@ -1153,12 +1228,10 @@ def required_aspects(cfg, category_id):
     if status != 200:
         raise EbayError(f"eBay refused the aspects for {category_id} "
                         f"({status}): " + describe_errors(payload))
-    out = []
-    for aspect in payload.get("aspects") or []:
-        constraint = aspect.get("aspectConstraint") or {}
-        if constraint.get("aspectRequired"):
-            out.append(aspect.get("localizedAspectName"))
-    return [a for a in out if a]
+    rows = _aspect_rows(payload)
+    if seen is not None:
+        seen["total"] = len(rows)
+    return [r["name"] for r in rows if r["required"]]
 
 
 # ----------------------------------------------------------- the push

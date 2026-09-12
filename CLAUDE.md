@@ -130,7 +130,7 @@ run against a real database.
 
 | Database only | |
 |---|---|
-| `ebay push <listing> [--category N] [--aspect K=V] [--publish] [--dry-run]` | one listing as an eBay inventory item and an **unpublished** offer. `--publish` is refused when `ebay_environment` is production |
+| `ebay push <listing> [--category N] [--aspect K=V] [--publish] [--dry-run]` | one listing as an eBay inventory item and an **unpublished** offer. `--category` is **required** to create one - eBay's suggestion is a guess and was wrong on 3 of 12 real titles; `--dry-run` needs none. Refuses a `sold` listing, and refuses `--publish` when `ebay_environment` is production |
 | `list` / `stats` / `ship <ref>` | outstanding orders, analytics, mark shipped |
 | `bin new\|ls\|show\|rename\|put\|rm` | the places things live. `new` mints the code and `--print` puts its tag on the shelf; `put` takes the 4-char inventory code off the item's own label |
 | `cancel <ref>` | the buyer pulled out; not a sale, and the parcel code is freed |
@@ -871,6 +871,53 @@ And `--publish` is refused outright on production. That is a property
 rather than a prompt, and it is what makes the path testable at all: a
 design where publish cannot be called means that code runs against her
 real account the first time anybody tries it.
+
+**An offer is not created on a guess.** `category` fell back to
+`suggestions[0]`, so twelve real offers went onto the sandbox account
+carrying eBay's first guess - and that guess was plainly wrong on three
+of the twelve. `--publish` refused a suggested category, which looks
+like enough and is not: **publishing happens in eBay's own UI by
+design**, and that route never asks again, so the guess would have gone
+live unchallenged. `push` now refuses to create the offer at all
+without `--category`, before it sends anything, and hands back the
+command that would work with the required aspects already in it.
+`--dry-run` is exempt: it sends nothing, so it has nothing to refuse,
+and it is where the suggestions and the request can be read together in
+order to choose. The star beside a suggestion means "this is the one
+being sent", so it is drawn against a category that will actually be
+used - starring the first one in a run about to refuse said the
+opposite of the refusal printed under it.
+
+**A sold listing could be pushed, and nothing looked.** `push` read no
+state at all, so `ebay push <something sold>` was accepted in silence -
+an offer for a thing that is gone, which is a listing to take down or
+one somebody buys. Only `sold` is refused: `acquired` and `draft` are
+both things she owns that nobody can buy yet, which is exactly what a
+new eBay listing is for.
+
+**`payload["aspects"]` was the one key name this module trusted.**
+Everything else here is walked - `_service_rows`, the category
+suggestions, and `savedpage`'s rule that the structure is the only
+thing worth trusting when the key names are a guess. Indexing that one
+fails silently in the worst direction: a list we cannot find returns *no
+required aspects*, which reads exactly like a category that has none,
+and the publish then fails at eBay naming one aspect per round trip -
+the precise thing asking early exists to prevent. Three of twelve real
+categories came back empty, which is either eBay meaning it or a shape
+this missed; `_aspect_rows` walks now, tolerating the flag hoisted out
+of `aspectConstraint` and the list under another key, while refusing to
+mistake an aspect *value* for an aspect. And because walking cannot
+prove the negative, `required_aspects` fills a caller's dict with how
+many it found, so `push` can say "none of the 24 eBay listed" where it
+used to print nothing - the same reason `ensure_policies` takes an
+`out`.
+
+**`ebay check` reported four publish-time keys and not the fifth.** The
+location and the three policies were in it; `ebay_photo_base` was not,
+and it is the only one publish actually stops on - eBay requires an
+image and fetches it from that host itself. It also checks the scheme,
+because eBay's refusal for a plain-http `imageUrls` names the field
+rather than the scheme.
 
 **A cosmetic call must not be able to fail a command.** `ebay push`
 asked for the category suggestions unconditionally, and a sandbox **500
