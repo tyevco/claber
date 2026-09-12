@@ -83,6 +83,40 @@ hundred, so this fires often; the cut falls at a word boundary where
 there is one. The desk shows the full title and eBay shows the cut, and
 nothing else would say they differ.
 
+### Business Policies is a programme, and the account has to join it
+
+**Correction to an earlier note here: the opt-in *can* be done from this
+repo.** `POST /sell/account/v1/program/opt_in` exists, so `ebay setup`
+checks first and can do it.
+
+An account that has not joined `SELLING_POLICY_MANAGEMENT` cannot have
+business policies at all, and eBay's refusal for that is **not** a
+sentence about programmes. A real sandbox account answered the policy
+list with:
+
+```
+20403: Invalid .
+```
+
+- its own message template with an empty field name, which reads as a
+malformed request and sends you to look at the query string. `setup`
+therefore asks `get_opted_in_programs` **first**, because that question
+has a legible answer.
+
+```bash
+mplabel ebay setup            # says which programmes the account is in
+mplabel ebay setup --opt-in   # joins, then stops
+mplabel ebay setup            # again, once eBay has processed it
+```
+
+`--opt-in` is a flag rather than automatic for the same reason
+`--publish` is gated: joining changes how *every* listing on the account
+is managed, and that is not a side effect of a command someone ran to
+find out what was wrong. eBay also says it can take **up to 24 hours**,
+so a successful call is a request rather than a state change - `setup`
+says so and stops, instead of going on to create policies that would be
+refused for the next day.
+
 ### `ebay setup` needs a re-auth
 
 It creates the policies, so it needs the `sell.account` **write** scope.
