@@ -827,7 +827,12 @@ def poll_once(cfg, conn, do_print):
     imap = imaplib.IMAP4_SSL(host, port)
     try:
         imap.login(user, pw)
-        imap.select(cfg["imap_folder"])
+        # Quoted, because imaplib does not do it and a folder with a
+        # space in its name goes out as two arguments - `BAD Could not
+        # parse command`, and no label prints until someone renames a
+        # Gmail label. The poll loop selects read-write, so it cannot
+        # share `open_folder`, which is a read-only survey.
+        imap.select(backfill_mod.quote_mailbox(cfg["imap_folder"]))
         ids = candidate_ids(imap, cfg, host)
         log.info("%d candidate(s) in the last %s day(s)",
                  len(ids), cfg.get("lookback_days") or 7)

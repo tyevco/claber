@@ -109,6 +109,47 @@ def survey_folder(imap, cfg):
     return _all_mail_folder(imap) or configured
 
 
+def quote_mailbox(name):
+    """A mailbox name as IMAP wants it, quoted when it has to be.
+
+    **imaplib does not do this for you.** `select` passes the name
+    straight into the command line, so `EXAMINE [Gmail]/All Mail` goes
+    out as two arguments and Gmail answers `BAD Could not parse
+    command`. That shipped the moment the survey started preferring the
+    archive, because every mailbox this had ever selected - `INBOX`, a
+    label she typed - happened to be one word.
+
+    Quoted only when it needs to be, so the names that already worked
+    go out byte-identical."""
+    if name.startswith('"') and name.endswith('"'):
+        return name
+    if re.search(r'[\s(){%*"\\]', name):
+        return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return name
+
+
+def open_folder(imap, preferred, fallback="INBOX"):
+    """Select `preferred`, falling back rather than raising.
+
+    A survey must not die because the archive could not be opened - the
+    configured folder is still worth walking, and saying which one was
+    used is the whole point of naming it. Returns the folder actually
+    selected."""
+    for name in (preferred, fallback):
+        if not name:
+            continue
+        try:
+            typ, _data = imap.select(quote_mailbox(name), readonly=True)
+        except imaplib.IMAP4.error as exc:
+            log.debug("could not open %s: %s", name, exc)
+            continue
+        if typ == "OK":
+            return name
+        log.debug("could not open %s: %s", name, typ)
+    raise imaplib.IMAP4.error(
+        f"could not open {preferred!r} or {fallback!r}")
+
+
 def _search_all(imap, folder, since=None):
     """Every message from a sender we parse, read or unread.
 
@@ -119,7 +160,7 @@ def _search_all(imap, folder, since=None):
     arguments and a server rejects the whole search otherwise."""
     from . import cli
 
-    imap.select(folder, readonly=True)
+    open_folder(imap, folder)
     doms = " OR ".join(cli.MAIL_DOMAINS)
     queries = [
         f'(X-GM-RAW "from:({doms})")',
