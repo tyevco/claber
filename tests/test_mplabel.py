@@ -11988,3 +11988,90 @@ def test_the_survey_says_trash_is_on_a_clock(monkeypatch, capsys):
     # The archive's own line must not carry the warning.
     archive = [ln for ln in out.splitlines() if "All Mail" in ln][0]
     assert "purges" not in archive
+def test_ground_advantage_is_filed_under_the_old_code():
+    """The single most useful thing the real service list said.
+
+    USPS renamed the service in 2023; eBay updated the *description* and
+    kept the legacy code `USPSParcel`. So `USPSGroundAdvantage` - the
+    name of the thing - matches nothing at all, which is exactly what
+    the first attempt sent and what "Please select a valid shipping
+    service" meant.
+    """
+    from mplabel import ebay
+
+    # Shaped like the real reply: Priority is offered too, and used to
+    # win because the preference list had never met a real account.
+    offered = ebay._service_rows({"shippingServices": [
+        {"shippingServiceId": "USPSPriority",
+         "description": "USPS Priority Mail"},
+        {"shippingServiceId": "USPSParcel",
+         "description": "USPS Ground Advantage"},
+    ]})
+    assert ebay.choose_shipping_service(offered)["code"] == "USPSParcel"
+
+
+def test_a_renamed_service_is_found_by_what_it_is_called():
+    """A code that has been renamed keeps its old spelling, so the
+    description is the half that tracks reality. This is what would have
+    found Ground Advantage without anyone having to learn it is filed
+    under `USPSParcel`."""
+    from mplabel import ebay
+
+    offered = ebay._service_rows({"shippingServices": [
+        {"shippingServiceId": "SomeCodeNobodyGuessed",
+         "description": "USPS Ground Advantage"},
+    ]})
+    chosen = ebay.choose_shipping_service(offered)
+    assert chosen["code"] == "SomeCodeNobodyGuessed"
+
+
+def test_an_absent_selling_flow_flag_does_not_drop_a_service():
+    """The real reply carried the flag on nothing at all.
+
+    Every one of the eighty-odd services came back without it, so
+    dropping the unflagged would have emptied the list and `setup` would
+    have refused with "eBay offered no domestic shipping service" on an
+    account offering eighty.
+    """
+    from mplabel import ebay
+
+    rows = ebay._service_rows({"shippingServices": [
+        {"shippingServiceId": "USPSParcel", "description": "USPS Ground Advantage"},
+    ]})
+    assert rows[0]["usable"] is True
+    assert ebay.choose_shipping_service(rows) is not None
+
+
+def test_the_ship_from_address_is_hers_and_is_not_guessed():
+    """`25802: Input error` names no field, and only the country was sent.
+
+    A warehouse location needs the postcode, or the city and state. But
+    the reason this refuses rather than defaulting is not the API: eBay
+    shows buyers a delivery estimate computed from this address, so a
+    placeholder is a wrong promise on every listing.
+    """
+    from mplabel import ebay
+
+    with pytest.raises(ebay.EbayConfigError) as caught:
+        ebay.location_address({"ebay_location_country": "US"})
+    assert "ebay_location_postcode" in str(caught.value)
+
+    assert ebay.location_address({"ebay_location_postcode": " 46176 "}) == {
+        "postalCode": "46176", "country": "US"}
+    assert ebay.location_address({
+        "ebay_location_city": "Shelbyville",
+        "ebay_location_state": "IN"}) == {
+        "city": "Shelbyville", "stateOrProvince": "IN", "country": "US"}
+
+
+def test_a_dry_run_refuses_a_missing_address_rather_than_promising_one(
+        monkeypatch):
+    """A dry run that reports a creation which would fail is not a dry
+    run of anything. The address is checked before the answer, so
+    `--dry-run` says what `setup` would say."""
+    from mplabel import ebay
+
+    monkeypatch.setattr(ebay, "call", lambda *a, **k: (404, {}))
+    with pytest.raises(ebay.EbayConfigError):
+        ebay.ensure_location({"ebay_merchant_location": "home"},
+                             dry_run=True)

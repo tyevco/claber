@@ -797,6 +797,29 @@ suggested category: the question "what would I like" and the question
 "what will you accept" have to stay separate, or the second is never
 asked.
 
+**`USPSParcel` is USPS Ground Advantage, and that is why matching on
+the code alone is not enough.** USPS renamed the service in 2023; eBay
+updated the *description* and kept the legacy code, so the name of the
+thing matches nothing and the old spelling is the live one. The
+preference list puts `USPSParcel` first - it is what a small parcel
+actually goes by, and `USPSPriority` was winning before the list met a
+real account - and falls back to matching the **description**, which is
+the half that tracks what a service is called.
+
+The real account offered eighty-odd services carrying
+`validForSellingFlow` on **none** of them, so "absent means usable" is
+load bearing rather than defensive: dropping the unflagged would have
+emptied the list and refused on an account offering eighty.
+
+**The ship-from address is hers and is not guessable.** A warehouse
+location needs the postcode, or the city and state; only the country is
+`25802: Input error`, naming no field. But `setup` refuses rather than
+defaulting for a reason that is not the API's: **eBay shows buyers a
+delivery estimate computed from that address**, so a placeholder is a
+wrong promise on every listing. `ebay_location_postcode` and friends,
+and the check happens before `--dry-run` answers - a dry run that
+reports a creation which would fail is not a dry run of anything.
+
 The response is **walked, not indexed** - `savedpage`'s rule, for the
 same reason: its documented shape was read from a page that would not
 load, so the key names are a guess and the structure is the only thing
