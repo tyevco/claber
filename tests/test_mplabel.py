@@ -12248,3 +12248,28 @@ def test_ensure_policies_fills_the_dict_it_is_given(monkeypatch):
     got = ebay.ensure_policies({"ebay_marketplace": "EBAY_US"}, out=mine)
     assert got is mine
     assert mine["fulfillment"][0] == "6001"
+
+
+def test_a_cut_title_does_not_end_in_an_en_dash():
+    """Her titles separate clauses with U+2013, not a hyphen.
+
+    The trailing-junk set was written in ASCII and the real titles are
+    not, so the first real push to eBay produced "...Limited Collector
+    Plate #445 -" ending in a dangling en dash - which reads as a
+    corrupted listing rather than a long one, and reading as a long one
+    is the entire reason the cut falls at a word boundary.
+
+    From a real sandbox push of twelve listings; four of the twelve
+    carry an en dash and this is the one where the cut landed on it.
+    """
+    from mplabel import ebay
+
+    cut = ebay.ebay_title(
+        "1988 Ben Richmond “Kelley Island Mansion” Limited "
+        "Collector Plate #445 – Richmond Gallery Ohio")
+    assert len(cut) <= ebay.TITLE_LIMIT
+    assert cut.endswith("#445"), cut
+    # Every dash eBay might be handed one of, not just the one seen.
+    for dash in "-‐‑‒–—―−":
+        padded = "Milk glass vase " * 4 + f"and a compote {dash} x"
+        assert not ebay.ebay_title(padded).rstrip().endswith(dash)
