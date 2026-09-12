@@ -11460,6 +11460,25 @@ class _QuietIMAP:
     def list(self):
         return "OK", self.mailboxes
 
+    def select(self, mailbox, readonly=False):
+        """Refuse an unquoted name with a space in it, like a real one.
+
+        This stub used to accept anything, and the tests around it
+        monkeypatched `_search_all` away entirely - so nothing ever fed
+        a chosen folder to a `select`, and `[Gmail]/All Mail` went out
+        unquoted to a real Gmail and came back `BAD Could not parse
+        command`. A stub that accepts what a server rejects is a
+        fixture the code will never meet."""
+        import imaplib
+
+        name = mailbox.decode() if isinstance(mailbox, bytes) else str(mailbox)
+        quoted = name.startswith('"') and name.endswith('"')
+        if " " in name and not quoted:
+            raise imaplib.IMAP4.error(
+                "EXAMINE command error: BAD [b'Could not parse command']")
+        self.selected = name[1:-1] if quoted else name
+        return "OK", [b"1"]
+
     def close(self):
         pass
 
@@ -11679,3 +11698,73 @@ def test_the_survey_names_the_folder_it_walked(monkeypatch, capsys):
     assert "not INBOX" in out
     # And the family that was crowding the list is recognised now.
     assert "goodwill_refund" in out
+
+
+def test_the_archive_is_selected_with_its_name_quoted():
+    """imaplib does not quote a mailbox name - `select` drops it into
+    the command line as-is - so `EXAMINE [Gmail]/All Mail` arrives as
+    two arguments and Gmail answers `BAD Could not parse command`.
+
+    This reached the Pi. Every mailbox this code had ever selected was
+    one word - `INBOX`, a label she typed - so the bug only existed
+    once the survey started preferring the archive, and the tests
+    around it monkeypatched `_search_all` away, which is where the
+    select lives."""
+    from mplabel import backfill
+
+    imap = _QuietIMAP()
+    assert backfill.open_folder(imap, "[Gmail]/All Mail") == "[Gmail]/All Mail"
+    assert imap.selected == "[Gmail]/All Mail"
+
+
+def test_a_name_that_never_needed_quoting_goes_out_unchanged():
+    """The folders that already worked must go out byte-identical, or
+    fixing this breaks the path it was not broken on."""
+    from mplabel import backfill
+
+    for name in ("INBOX", "Marketplace"):
+        assert backfill.quote_mailbox(name) == name
+
+
+def test_the_survey_falls_back_when_the_archive_will_not_open():
+    """A survey must not die because the archive could not be opened.
+    The configured folder is still worth walking - and a traceback out
+    of `mplabel scan` is what this looked like on the Pi."""
+    from mplabel import backfill
+
+    class Refuses(_QuietIMAP):
+        def select(self, mailbox, readonly=False):
+            import imaplib
+
+            name = mailbox.decode() if isinstance(mailbox, bytes) else str(mailbox)
+            if "All Mail" in name:
+                raise imaplib.IMAP4.error("EXAMINE command error: BAD")
+            return super().select(mailbox, readonly=readonly)
+
+    assert backfill.open_folder(Refuses(), "[Gmail]/All Mail") == "INBOX"
+
+
+def test_the_search_really_selects_the_folder_it_was_given():
+    """The end-to-end shape the monkeypatched tests could not see: a
+    folder is chosen, quoted, and actually opened before anything is
+    searched."""
+    from mplabel import backfill
+
+    class Searcher(_QuietIMAP):
+        def search(self, charset, query):
+            return "OK", [b"1 2 3"]
+
+    imap = Searcher()
+    folder = backfill.survey_folder(imap, {"imap_folder": "INBOX"})
+    assert backfill._search_all(imap, folder) == [b"1", b"2", b"3"]
+    assert imap.selected == "[Gmail]/All Mail"
+
+
+def test_the_poll_loop_quotes_its_folder_too():
+    """Same failure, and the consequence there is that no label prints
+    until someone renames a Gmail label."""
+    from mplabel import backfill, cli
+
+    source = inspect.getsource(cli.poll_once)
+    assert "quote_mailbox(cfg[\"imap_folder\"])" in source
+    assert backfill.quote_mailbox("My Label") == '"My Label"'

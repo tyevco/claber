@@ -1624,6 +1624,27 @@ all: every UI test passes with the session in any state. This came from
 the phone, twice - "the viewfinder is black" and then "the camera
 stopped responding".
 
+**imaplib does not quote a mailbox name, and every folder this had
+ever opened was one word.** `select` drops the name straight into the
+command line, so `EXAMINE [Gmail]/All Mail` goes out as two arguments
+and Gmail answers `BAD Could not parse command`. `INBOX` and a label she
+typed had no space in them, so the bug did not exist until the survey
+started preferring the archive - and then `mplabel scan` was a traceback
+on the Pi. `backfill.quote_mailbox` quotes only when it has to, so the
+names that already worked go out byte-identical, and `poll_once` uses it
+too: the same failure there means no label prints until someone renames
+a Gmail label.
+
+Two things about how it got through. The tests around the folder choice
+**monkeypatched `_search_all` away**, which is exactly where the select
+lives - so nothing ever handed a chosen folder to one. And `_QuietIMAP`
+accepted anything it was given, where the real server refuses: a stub
+that accepts what a server rejects is the same mistake as the `db`
+fixture that hand-rolled a trimmed `sales` table. It raises on an
+unquoted name with a space now. `open_folder` also falls back to the
+configured folder rather than raising, because a survey must not die on
+the archive.
+
 **The whole mailbox is not the inbox, and a survey of the wrong folder
 looks exactly like a survey.** `backfill`'s first line says it walks the
 whole mailbox once; it selected `imap_folder`, which defaults to INBOX.
