@@ -1,4 +1,4 @@
-"""
+r"""
 backfill.py - walk the whole mailbox once and reconstruct her history
 from every Facebook Marketplace and ShopGoodwill email she has received.
 
@@ -122,7 +122,7 @@ def _all_mail_folder(imap):
 
 
 def _trash_folder(imap):
-    """Where deleted mail waits to be purged.
+    r"""Where deleted mail waits to be purged.
 
     Gmail's `\All` mailbox deliberately excludes Trash, and she deletes
     ShopGoodwill mail often - so the archive alone still misses
@@ -153,7 +153,7 @@ def survey_folder(imap, cfg):
 
 
 def survey_folders(imap, cfg):
-    """Every mailbox worth walking, in order, deduplicated.
+    r"""Every mailbox worth walking, in order, deduplicated.
 
     **Trash is on this list, and that is the point.** She deletes
     ShopGoodwill mail often, and a deleted receipt does not undo the
