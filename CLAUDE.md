@@ -10,6 +10,12 @@ emails, records each sale in SQLite, converts the letter-size label PDF
 to exactly 4x6in, prints it on a USB thermal printer, and mirrors
 everything into a Google Sheet with sell-through analytics.
 
+She sells on eBay as well, and an eBay sale mails "Your shipping label
+is ready" with the label attached. That is the same *shape* of event as a
+Marketplace one, so it goes down the same path and comes out of the same
+printer - and almost nothing else about it is the same, which is where
+the traps are.
+
 The same mailbox is read for the other direction. ShopGoodwill auction
 mail - "You Were Awarded The Winning Bid", "Online Payment Received" -
 is where a lot of her stock comes from, and it is the only sourcing
@@ -97,7 +103,7 @@ run against a real database.
 |---|---|
 | `check` | poll once, record, do **not** print |
 | `run [--loop]` | poll and print; `--loop` is what systemd runs |
-| `scan [--limit N]` | survey Facebook and ShopGoodwill subjects, change nothing. Feeds open work #2 |
+| `scan [--limit N]` | survey Facebook, ShopGoodwill **and eBay** subjects, change nothing. Wider than what `backfill` imports, deliberately - it is the only way to check that eBay mail really arrives from where the label path assumes. Feeds open work #2 |
 | `backfill [--limit N] [--restart]` | classify old mail into `mail_events`, and import old auction orders |
 | `goodwill <eml> [--write]` | read one saved ShopGoodwill email and say what it found. Reports by default; `--write` records it |
 
@@ -255,9 +261,12 @@ src/mplabel/
                              place for
 
 tests/test_mplabel.py     the whole Python suite, one file
-tests/fixtures/           synthetic stand-ins; make_label.py regenerates the PDF.
-                          goodwill_won.eml / goodwill_payment.eml are
-                          rebuilt by hand from real mail, invented names
+tests/fixtures/           synthetic stand-ins; make_label.py regenerates both
+                          label PDFs - Facebook's and eBay's, which differ in
+                          the quarter turn and in whether the ink fills the
+                          label. goodwill_won.eml / goodwill_payment.eml and
+                          ebay_label_email.eml are rebuilt by hand from real
+                          mail, invented names
 tests/make_ios_fixtures.py  captures real server payloads for the Swift tests
 tools/desk-preview.py     a seeded throwaway server, so the desk can be
                           looked at. Same argument as ios/screenshots.sh
@@ -378,6 +387,15 @@ which is a period, a guess and a selling point at once, and an integer
 column would force a precision the object does not have. Nothing
 computes on it. It is the newest column, so it is also the one that
 proves the migration loop still runs.
+
+**The channel goes on `sales`, and the default is a fact rather than a
+placeholder.** `sales.channel` is `facebook` or `ebay`. It is on `sales`
+and not on `listings` because all four analytics views are `FROM
+listings` and a row there is a thing on a shelf rather than a posting -
+cross-posting one object to both channels is the normal case, so the
+channel belongs to the sale. The migration defaults existing rows to
+`facebook`, which is true of every one of them: before the eBay label
+email there was no other way into that table.
 
 **Adding a column needs a migration.** `CREATE TABLE IF NOT EXISTS` will
 not touch a database that already holds real sales, so `connect_db` carries
@@ -570,7 +588,10 @@ hardware or a real Facebook account.
 | eBay account-deletion compliance | **ASSUMED and not built.** Subscribing or opting out is required before the first *production* call, and opting out needs storing no eBay data - which we will. Sandbox needs none of it, which is why sandbox is first. |
 | eBay push: inventory item and unpublished offer | **Verified on twelve real listings.** Every `PUT` inventory item and every offer was accepted first time, so `MP-<CODE>` is an acceptable SKU, `inventory_item_body` and `offer_body` are the shapes eBay wants, and the 80-character cut fires on real titles (four of the twelve). It also found the cut ending in a dangling **en dash** - the strip set was ASCII and her titles are not. What is **not** exercised is publish: all twelve carry `photos 0`, and eBay requires an image to publish, so **the channel is blocked on photographs** rather than on anything in this repo. |
 | eBay's category suggestion is often wrong | **Verified, and it is why `--publish` refuses one.** On twelve real titles eBay's *first* suggestion was plainly wrong on at least three: **Women's Belts** for "Michael Kors Studded Ankle Boots", **Heels** for "Zara Mesh Heeled Sandals", **Other Outdoor Décor** for a religious plaque on a wood slice. The right category was in the list of three each time, second or third. So "suggest, then require confirming" is measured rather than cautious. Note three of the twelve came back with **no required aspects at all** (High Chairs, Collector Plates, Desks & Tables) - plausible, and unconfirmed: if that is the walker missing a shape rather than eBay meaning it, a publish degrades to eBay's one-aspect-per-round-trip refusal. |
-| eBay order JSON and label geometry | **ASSUMED.** Nothing has been pulled or attached. In particular an eBay 4x6 is a different page from Facebook's and `extract_label_fields` is verified against exactly one real label. |
+| **An eBay label PDF** | **Verified on a real one, end to end in software.** Her eBay label was put through the existing pipeline unmodified and came out right: cropped to exactly 4.00x6.00in, upright, every barcode complete, and `extract_label_fields` returned the correct tracking number, weight, service and recipient - the recipient being the buyer rather than her own return address, which is the one that posts a parcel to a stranger when it is wrong. Checked by rasterising the output and looking at it, not by trusting the arithmetic. **Not** printed on the G4 from the mail path; the equivalent page has printed through `mplabel send`. |
+| **An eBay label email** | **ASSUMED, and it is the whole gap in this feature.** No eBay `.eml` has ever been read - only the PDF that was attached to one, and the subject as she reported it ("Your shipping label is ready"). So three things are inference: that her label mail comes from a domain under **`ebay.com`**; that the subject is stable enough for `"shipping label"` to be the rule; and everything about the body, which is why nothing parses one. The failure mode if the domain is wrong is the bad kind - nothing prints and nothing says why - so `mplabel scan` was widened to survey eBay senders, and that survey is what settles it. One saved `.eml` closes all three. |
+| The eBay order number | **Verified, from the one real label email - on its attachment's own filename**, `ebay-label-17-15142-59571.pdf`. So the filename is the reliable source for it and the body the speculative one, the opposite way round from Facebook, where 0 of 18 real labels carried a parseable id and the attachment name was the only one there was. `NN-NNNNN-NNNNN` is the shape. |
+| eBay order JSON and SKU rules | **ASSUMED.** Nothing has been pulled or pushed. The label geometry is no longer on this row - see above; what remains assumed is what the Sell APIs return. |
 | The release workflow | **UNRUN.** Every piece of it is a command that works on a Mac, and none of it has been executed once - not the runner label, not cloud signing, not the upload. The first tag is the experiment. What is checked in software: `version.sh` against good and bad tags, both workflows' shell blocks parse, and `check-archive.sh` refuses XcodeGen's placeholder version numbers. What cannot be: whether the API key's role is sufficient, whether `macos-26` has an iOS 26 SDK today, and whether App Store Connect accepts a three-part build number of this shape. |
 
 When the user reports real-world results, move rows up this table and
@@ -585,6 +606,74 @@ cropped to ink-plus-2pt margin, which is fine through CUPS but 824 dots
 wide at 203dpi — wider than the 812-dot print head. The overflow rows
 eject a second, near-blank label. `label._snap()` centres the ink in a
 nominal-size window instead. `test_output_is_exactly_4x6` guards this.
+
+**An eBay label rotates the other way, and there is no error when it is
+wrong.** A Marketplace label draws its text bottom-to-top, so `to_4x6`
+answers **90**; a real eBay one draws it top-to-bottom and the answer is
+**270**. The pipeline read it off the page correctly the first time it
+met one - the quarter turn has always come from the text matrix rather
+than a constant - but nothing *proved* that until there were two
+conventions to tell apart, which is why `ebay_label_sample.pdf` exists
+beside `label_sample.pdf`. A label rotated the wrong way is not refused
+anywhere; it prints, and nobody can read it.
+
+**An eBay label does not fill its own label.** A Marketplace label's ink
+is exactly the nominal 432x288pt, so `label._snap` has never had anything
+to do on one. eBay's is **408x273 at (96,454)** - smaller, and off
+centre - so the crop window genuinely moves, and it has to extend *past*
+the ink rather than tightening onto it or the label comes out scaled
+differently from every other one. Two fixtures, because one of them could
+not have caught this.
+
+**Nothing parses a price out of an eBay email, and that is the feature.**
+The body has several dollar amounts in it - item, postage, order total -
+and no eBay `.eml` has ever been read, so picking one would write a
+number into `price` that is indistinguishable from a parsed one the
+moment it lands, and from there into revenue, into sell-through and into
+the Sheet. Same rule as `estimate_postage` and `landed_cost`: no basis,
+no figure. `price` stays null and the order screen is where she types it.
+
+The cost is worth stating plainly rather than discovering: an eBay sale
+arrives with no item title, no price and **no ship-by date**, so it never
+links to its listing through `link_sales` (which matches on normalised
+title) and `notify.due_parcels` can never fire for it (`ship_by IS NOT
+NULL`). What it does have is everything the parcel needs - the label, the
+tracking, the recipient and a parcel code - which is what the printer is
+for. One real `.eml` turns the rest on.
+
+**`$0.00` and "nobody knows" are different answers.** `mplabel list` and
+`pending` both formatted price as `${r['price'] or 0:.2f}`, which was
+harmless while every row came from a Marketplace email carrying a price.
+An eBay row has none, and a parcel listed at `$   0.00` reads as a sale
+that made nothing rather than one nobody has priced yet - the same class
+of lie as an estimate that passes for a fact. `_money_or_unknown` prints
+`?`.
+
+**eBay is searched by subject, not by sender.** Facebook and ShopGoodwill
+are fetched on sight, because nearly everything in those two mailboxes
+means something here. eBay is the third sender and the first one this
+repo has **no classifier for**: it mails about offers, watched items,
+marketing and her own purchases, and none of that is recognised. Fetched
+by sender, every one of those would come down by RFC822 on every poll,
+fail every classifier, be put back unrecorded and be fetched again an
+hour later, for ever - the same forever-loop `goodwill.import_order` was
+fixed for, except here there is nothing that *could* record them. So
+`cli.imap_ebay_labels` asks for `FROM "ebay.com" SUBJECT "shipping
+label"` and nothing else. The search is a way to fetch less; the gate is
+still `is_label_email` on the message.
+
+`mplabel scan` is the deliberate exception - `backfill.SURVEY_DOMAINS`
+includes eBay, because a survey's job is to say what is *there*,
+including the mail nothing can act on. That is also the only check on the
+`ebay.com` inference the whole path rests on.
+
+**The two channels get different subject rules.** Facebook keeps
+`"label" or "shipping"` anywhere in the subject, which has been in
+production for months. eBay needs the two words **together**: it mails
+about parcels coming *to* her as well as going out, and "Your order has
+shipped" would sail through the loose rule and reach a printer with no
+attachment and no order behind it. Tightening Facebook's rule to match is
+a separate decision with real labels behind it; do not do it in passing.
 
 **A label that is not a Marketplace one has to be *found* before it can
 be cropped.** `to_4x6` used to take the whole page's ink and snap it to
@@ -686,7 +775,9 @@ want working when nothing else is. `cmd_file` takes no `conn` at all.
 only reach the DB if the listing email or a saved-page/DYI import carried
 one. If `v_aging` shows blank prices, the percentages are lying.
 
-**One label file per email, and never named after the listing.** On real mail `listing_id` and `order_id` parse as **NULL** - 0 of 18 - so the archive name fell back to a timestamp at second resolution, and a batch of labels put three pairs in the same second. Each pair shared one file, so three sales pointed at another buyer's label and one of those printed. The name now prefers the id in Facebook's own attachment name (`label_<id>.pdf`) and always carries a digest of the Message-ID, so it is unique per email and searchable by the id on the PDF.
+**One label file per email, and never named after the listing.** On real mail `listing_id` and `order_id` parse as **NULL** - 0 of 18 - so the archive name fell back to a timestamp at second resolution, and a batch of labels put three pairs in the same second. Each pair shared one file, so three sales pointed at another buyer's label and one of those printed. The name now prefers the id in the sender's own attachment name (`label_<id>.pdf`, or eBay's `ebay-label-<order number>.pdf`) and always carries a digest of the Message-ID, so it is unique per email and searchable by the id on the PDF.
+
+That preference used to be guarded by `from_name.isalnum()`, which threw away every filename with punctuation in it and fell straight back to the timestamp - and **every** eBay attachment name carries hyphens, so on that channel the collision-prone path would have been the only one. It strips what a filename must not contain now and keeps what makes it searchable. Note the eBay order number is read off that filename *before* `already_seen`, not after: catching a resend that carries a fresh Message-ID is half of what that check is for, and on eBay mail the filename is the only place the order number has actually been seen.
 
 **The unit of a sale is the order, not the listing.** `already_seen` keys on message_id and order_id; `sales.listing_id` is a plain index, not UNIQUE. A buyer cancels, someone else buys the same item, and Facebook sends a second label email with the same listing_id - which the old unique index and the old listing_id check both silently rejected. `mplabel cancel` closes the dead order without counting it as revenue.
 
@@ -2369,8 +2460,32 @@ What is left is a laptop, a real database and the tunnel. Everything so
 far is a seeded server on the machine the code was written on.
 ### The other selling channel
 
-eBay, and the reasoning that shaped it is in `docs/ebay.md`. **Phase 0 -
-the plumbing - is built**: `ebay.py` with a urllib client, the OAuth
+**The label half is built, and it came first because it was already
+happening.** She has been getting eBay shipping-label emails all along -
+"Your shipping label is ready", with the label attached - and nothing
+here was reading them, so those parcels were being printed by hand. They
+now go down the same path as a Marketplace label: same poll, same crop,
+same printer, same parcel code, a row in `sales` with `channel = 'ebay'`.
+
+What made that cheap is that the PDF needed nothing at all. A real eBay
+label went through the existing pipeline unmodified and came out exactly
+4x6, upright, with every barcode complete and the buyer's address read
+correctly off it. Two geometric differences are now pinned as fixtures
+rather than luck - the opposite quarter turn, and ink that does not fill
+the label - and both are in *Things that will bite you*.
+
+**What is missing is one saved `.eml`**, and it is the only thing missing.
+Nothing about the envelope has ever been seen: the sending domain is
+inferred as `ebay.com`, the subject rule is her report of it, and the
+body is unread, so no item title, no price and no ship-by date reach the
+database. The consequences are specific and worth knowing before they
+are noticed: an eBay sale never links to its listing, and never earns a
+"parcel is due" notification. `mplabel scan` surveys eBay senders now, so
+the domain question at least has somewhere to be answered without
+guessing.
+
+eBay's API side, and the reasoning that shaped it, is in `docs/ebay.md`.
+**Phase 0 - the plumbing - is built**: `ebay.py` with a urllib client, the OAuth
 auth-code and refresh flows, a 0600 token store under `<data>/ebay/`,
 and `ebay auth` / `ebay check`. Nothing touches the database and nothing
 has reached eBay; sandbox is first precisely so a bug cannot list
@@ -2386,6 +2501,9 @@ here because each was expensive to find:
   no upload at all - but images are required to *publish* an offer, not
   to create an unpublished one. What draft-only does **not** dodge is
   the business policies, which eBay validates at offer-creation time.
+- **The channel column now exists**, which `ebay pull --dry-run` said was
+  the next slice. It is written by the label path; the pull still writes
+  nothing.
 - **`message_id` cannot be NULL for an eBay sale.** Six call sites on
   the *print* path key on it - `ensure_code` returns early on a falsy
   one and mints no parcel code, `mark_printed`'s `WHERE message_id=?`

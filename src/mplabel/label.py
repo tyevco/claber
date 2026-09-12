@@ -641,5 +641,19 @@ def extract_label_fields(pdf_4x6):
         block = lines[max(0, end - 2):end + 1]
         block = [re.sub(r"\s+(RDC|SCF|NDC)\s*\d+\s*$", "", b) for b in block]
         out["ship_to"] = ", ".join(b for b in block if b)
+        # The first line of that block is the person the parcel is
+        # addressed to, and on eBay mail it is the only name anywhere:
+        # the email's body has never been read, so nothing fills `buyer`
+        # from it the way a Marketplace email does. Kept conservative
+        # because the block is three lines ending at the CITY ST ZIP and
+        # an address with a company line or a two-line street pushes the
+        # name out of it - so a leading line with a digit in it is a
+        # street, not a person, and no guess is made. It only ever fills
+        # a blank: `process_message` merges label fields with
+        # `setdefault`, so where the email said who the buyer was, the
+        # email still wins.
+        first = block[0] if block else ""
+        if len(block) > 1 and first and not any(c.isdigit() for c in first):
+            out["buyer"] = first.title() if first.isupper() else first
 
     return out

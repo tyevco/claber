@@ -246,7 +246,18 @@ CREATE TABLE IF NOT EXISTS sales (
     -- from other confirmed rows. Never inferred from the presence of a
     -- number: the two are indistinguishable once written down, and it is
     -- the estimate that must not be able to pass for a fact.
-    postage_source TEXT
+    postage_source TEXT,
+    -- Which selling channel the order came from: 'facebook' or 'ebay'.
+    -- Defaulted rather than nullable because every row that predates the
+    -- column really did come from a Marketplace label email - there was
+    -- no other way into this table - so 'facebook' is the truth about
+    -- them and not a placeholder for one.
+    --
+    -- It lives on `sales` and not on `listings` deliberately: all four
+    -- analytics views are FROM listings, and a row there is a thing on a
+    -- shelf rather than a posting. Cross-posting one object to both
+    -- channels is the normal case, so the channel belongs to the sale.
+    channel      TEXT DEFAULT 'facebook'
 );
 CREATE INDEX IF NOT EXISTS idx_status   ON sales(status);
 CREATE INDEX IF NOT EXISTS idx_tracking ON sales(tracking);
@@ -300,6 +311,11 @@ MIGRATIONS = [
     # something that never came through the mailbox.
     ("listings", "postage", "REAL"),
     ("listings", "postage_source", "TEXT"),
+    # Which channel a sale came from. The default is what makes this
+    # honest on an existing database: every row already in `sales` got
+    # there through a Marketplace label email, so backfilling them to
+    # 'facebook' states a fact rather than filling a hole.
+    ("sales", "channel", "TEXT DEFAULT 'facebook'"),
 ]
 
 
@@ -426,7 +442,7 @@ def upsert(conn, rec):
     fields = [k for k in rec if k in {
         "order_id", "listing_id", "message_id", "received_at", "buyer",
         "item", "price", "ship_by", "tracking", "ship_to", "weight",
-        "service", "raw_pdf", "label_pdf", "status", "notes"}]
+        "service", "raw_pdf", "label_pdf", "status", "notes", "channel"}]
     cols = ", ".join(fields)
     marks = ", ".join("?" * len(fields))
     conn.execute(f"INSERT OR IGNORE INTO sales ({cols}) VALUES ({marks})",
@@ -434,9 +450,14 @@ def upsert(conn, rec):
     conn.commit()
 
 
-# Every sender the poller cares about. Facebook mail is what she sold;
-# ShopGoodwill mail is what she bought, and it is the only sourcing
-# event that arrives as a document rather than as a receipt in a bag.
+# The senders whose mail is worth fetching on sight. Facebook mail is
+# what she sold; ShopGoodwill mail is what she bought, and it is the only
+# sourcing event that arrives as a document rather than as a receipt in a
+# bag. Both are mailboxes where almost everything means something here.
+#
+# eBay is **not** in this tuple, and that is the point of `imap_ebay_labels`:
+# it is the third sender and the first one that mails about things this
+# repo has no classifier for, so it is asked for by subject instead.
 MAIL_DOMAINS = tuple(mailparse.SENDER_DOMAINS) + tuple(goodwill_mod.SENDER_DOMAINS)
 
 
@@ -449,6 +470,36 @@ def imap_or_from(domains):
     through to the UNSEEN query, which is the one that hid eight
     labels."""
     terms = [f'(FROM "{d}")' for d in domains]
+    expr = terms[0]
+    for term in terms[1:]:
+        expr = f"(OR {expr} {term})"
+    return expr
+
+
+# What an eBay label email says in its subject. Verified only as far as
+# she reported it - "Your shipping label is ready" - which is enough for
+# a substring search and is also the rule `is_label_email` applies.
+EBAY_LABEL_SUBJECT = "shipping label"
+
+
+def imap_ebay_labels():
+    """The eBay half of the poll's search, narrowed by subject.
+
+    Deliberately not `FROM "ebay.com"` on its own, the way Facebook and
+    ShopGoodwill are searched. eBay mails about everything - offers,
+    watched items, marketing, and her own purchases - and *none* of it is
+    recognised by anything in this repo. A broad sender search would pull
+    all of it down by RFC822 on every poll, fail every classifier, get
+    put back unrecorded, and be fetched again an hour later, for ever.
+    That is the same forever-loop that made `goodwill.import_order`
+    record an event unconditionally - except here there is nothing that
+    could record them, so narrowing the question is the fix.
+
+    Only label mail has a printer behind it, so only label mail is asked
+    for. The real gate is still `is_label_email` on the message itself; a
+    search term is a way to fetch less, never a way to decide."""
+    terms = [f'(FROM "{d}" SUBJECT "{EBAY_LABEL_SUBJECT}")'
+             for d in mailparse.EBAY_SENDER_DOMAINS]
     expr = terms[0]
     for term in terms[1:]:
         expr = f"(OR {expr} {term})"
@@ -470,11 +521,22 @@ def candidate_ids(imap, cfg, host):
     siblings."""
     days = int(cfg.get("lookback_days") or 7)
     doms = " OR ".join(MAIL_DOMAINS)
+    # `subject:(shipping label)` rather than a quoted phrase: Gmail reads
+    # it as both words, which matches the subject she reported, and it
+    # keeps double quotes out of a string that is already inside an IMAP
+    # quoted argument. Being a shade loose costs a fetch; escaping it
+    # wrong costs the whole SEARCH, and a rejected SEARCH falls through
+    # to the last query here - which is the one that hid eight labels.
+    ebay = " OR ".join(f"from:{d}" for d in mailparse.EBAY_SENDER_DOMAINS)
     queries = []
     if "gmail" in host:
-        queries.append(f'(X-GM-RAW "from:({doms}) newer_than:{days}d")')
+        queries.append(
+            f'(X-GM-RAW "newer_than:{days}d '
+            f'(from:({doms}) OR (from:({ebay}) subject:(shipping label)))")')
     since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
-    queries.append(f'({imap_or_from(MAIL_DOMAINS)} SINCE {since})')
+    queries.append(
+        f'((OR {imap_or_from(MAIL_DOMAINS)} {imap_ebay_labels()}) '
+        f'SINCE {since})')
     queries.append('(UNSEEN FROM "facebook")')
 
     for q in queries:
@@ -712,13 +774,26 @@ def mark_printed(conn, message_id):
 
 def process_message(cfg, conn, msg, do_print):
     parsed = mailparse.parse(msg)
-    if already_seen(conn, parsed.get("message_id"), parsed.get("order_id")):
-        log.debug("skipping, already recorded")
-        return None
 
     fname, blob = mailparse.attachment(msg, ".pdf")
     if not blob:
         log.warning("no PDF attached to %s", parsed.get("subject"))
+        return None
+
+    # eBay names its attachment `ebay-label-<order number>.pdf`, and on
+    # the one real eBay label that has been seen that filename was the
+    # *only* place the order number appeared - the body has never been
+    # read. So it is read here, where the attachment is, rather than in
+    # `parse_ebay`, which cannot see one. Before `already_seen`, not
+    # after: the order number is half of what that check is for, and a
+    # resend carrying a fresh Message-ID is exactly the case it catches.
+    if parsed.get("channel") == "ebay" and not parsed.get("order_id"):
+        m = mailparse.EBAY_ORDER_RE.search(fname or "")
+        if m:
+            parsed["order_id"] = m.group(1)
+
+    if already_seen(conn, parsed.get("message_id"), parsed.get("order_id")):
+        log.debug("skipping, already recorded")
         return None
 
     # The name has to be unique per *email*, not per listing. It used to be
@@ -731,10 +806,18 @@ def process_message(cfg, conn, msg, do_print):
     # is the only id we get - the body's order_id/listing_id links parsed
     # as NULL on all 18 real labels. Prefer it over a timestamp, which is
     # both unsearchable and, at second resolution, collides inside a batch.
+    # Hyphens and underscores are kept rather than rejected. `isalnum()`
+    # threw away every filename with punctuation in it and fell through
+    # to a timestamp at second resolution - which is the collision that
+    # put three sales on one buyer's label - and every eBay attachment
+    # name carries hyphens, so on this channel that fallback would have
+    # been the only path. Strip what a filename must not contain; keep
+    # what makes it searchable.
     from_name = Path(fname or "").stem.replace("label_", "").strip()
+    from_name = re.sub(r"[^A-Za-z0-9_-]", "", from_name)
     ref = (parsed.get("order_id")
            or parsed.get("listing_id")
-           or (from_name if from_name.isalnum() else None)
+           or (from_name or None)
            or datetime.now().strftime("%Y%m%d%H%M%S"))
     unique = hashlib.sha1(
         (parsed.get("message_id") or uuid.uuid4().hex).encode("utf-8")
@@ -1905,10 +1988,23 @@ def sync_sheets(cfg, conn, dry_run=False):
     return counts
 
 
+def _money_or_unknown(value, width=7):
+    """`$   0.00` and "nobody knows" are different answers.
+
+    `or 0` collapsed them, which was harmless while every row came from a
+    Marketplace email carrying a price. An eBay label email does not: its
+    body has several dollar amounts in it and nothing here picks one, so
+    `price` is genuinely null and printing it as free would be the same
+    class of lie as an estimate that passes for a fact."""
+    if value is None:
+        return " " * (width - 1) + "?"
+    return f"{value:>{width}.2f}"
+
+
 def cmd_list(cfg, conn, args):
     rows = conn.execute(
         "SELECT listing_id, item, buyer, price, ship_by, tracking, status, "
-        "printed_at, code FROM sales WHERE status NOT IN "
+        "printed_at, code, channel FROM sales WHERE status NOT IN "
         f"({','.join('?' * len(CLOSED_STATUSES))}) ORDER BY ship_by",
         CLOSED_STATUSES
     ).fetchall()
@@ -1917,11 +2013,16 @@ def cmd_list(cfg, conn, args):
         return
     for r in rows:
         printed = "printed" if r["printed_at"] else "NOT PRINTED"
+        # Only the channel that is not the default is worth the width.
+        # Almost every parcel is a Marketplace one and saying so on every
+        # line would bury the one that is not.
+        where = "" if (r["channel"] or "facebook") == "facebook" \
+            else f" [{r['channel']}]"
         # The code first: it is what is written on the box in the hall.
         print(f"{r['code'] or '---':<5} {r['ship_by'] or '?':<12} "
-              f"${r['price'] or 0:>7.2f}  "
+              f"${_money_or_unknown(r['price'])}  "
               f"{(r['item'] or '?')[:38]:<40} {r['buyer'] or '?':<18} "
-              f"{printed}")
+              f"{printed}{where}")
 
 
 def find_sale(conn, ref):
@@ -2012,7 +2113,7 @@ def cmd_pending(cfg, conn, args):
 
     for r in rows:
         print(f"  {r['code'] or '---':<5} {(r['received_at'] or '?')[:10]}  "
-              f"${r['price'] or 0:>7.2f}  {(r['item'] or '?')[:44]}")
+              f"${_money_or_unknown(r['price'])}  {(r['item'] or '?')[:44]}")
     if args.dry_run:
         print(f"\n{len(rows)} label(s) would print. Drop --dry-run to send "
               f"them.")
@@ -2829,10 +2930,13 @@ def cmd_ebay_pull(cfg, conn, args):
 
     print(f"\nwould record {len(fresh)} sale(s); "
           f"{len(known)} already in the database.")
-    # Said out loud because the columns do not exist yet, and a dry run
-    # that quietly implies otherwise is the thing this command is for.
-    print("nothing written - `sales.channel` and the write path are the "
-          "next slice.")
+    # Said out loud because a dry run that quietly implies otherwise is
+    # the thing this command is for. `sales.channel` exists now - the
+    # label email path put it there - so what is left is the write path
+    # and nothing else.
+    print("nothing written - the write path is the next slice. "
+          "`sales.channel` exists now; an eBay label email already fills "
+          "it, so a pulled order has somewhere to land.")
     return 0
 
 

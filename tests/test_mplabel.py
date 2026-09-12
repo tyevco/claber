@@ -715,6 +715,341 @@ def test_two_orders_for_one_listing_keep_separate_labels(db, tmp_path):
         assert Path(r["label_pdf"]).exists()
 
 
+# ------------------------------------------------ the other selling channel
+#
+# She sells on eBay too, and an eBay sale mails "Your shipping label is
+# ready" with the label attached - the same shape of event as a
+# Marketplace label email, so it prints on the same path. What is not the
+# same is everything around it: the sender, the subject rules, the page
+# the label sits on, and how much of the email can be believed.
+
+EBAY_EML = FIXTURES / "ebay_label_email.eml"
+EBAY_PDF = FIXTURES / "ebay_label_sample.pdf"
+
+
+def _ebay_msg():
+    return email.message_from_bytes(EBAY_EML.read_bytes())
+
+
+def _with_subject(subject):
+    """The eBay fixture, re-headed with a different subject."""
+    copy = email.message_from_bytes(EBAY_EML.read_bytes())
+    del copy["Subject"]
+    copy["Subject"] = subject
+    return copy
+
+
+def test_an_ebay_label_email_is_a_label_email():
+    """The whole point: it reaches the same printer the Facebook one does."""
+    msg = _ebay_msg()
+    assert mailparse.is_from_ebay(msg)
+    assert not mailparse.is_from_facebook(msg), "the two must stay apart"
+    assert mailparse.is_label_email(msg)
+
+
+def test_ebay_needs_the_two_words_together(msg):
+    """The subject rules are asymmetric on purpose.
+
+    Facebook's mailbox traffic is almost all her own selling, so "label"
+    or "shipping" anywhere is a safe net. eBay mails about everything -
+    including parcels coming *to* her - and a loose rule would send
+    "Your order has shipped" to a printer that has no attachment to
+    print and no order behind it."""
+    assert mailparse.is_label_email(_with_subject("Your shipping label is ready"))
+    for subject in ("Your order has shipped",
+                    "Shipping discount ends tonight",
+                    "A label for your collection"):
+        assert not mailparse.is_label_email(_with_subject(subject)), subject
+
+    # The Facebook rule is untouched by any of that - it has been in
+    # production for months and this is not the commit to tighten it.
+    del msg["Subject"]
+    msg["Subject"] = "Shipping label for your Marketplace order"
+    assert mailparse.is_label_email(msg)
+
+
+def test_an_ebay_display_name_is_not_an_ebay_sender():
+    """Same teeth as `is_from_facebook`, and needed more: this gate has a
+    printer behind it. A lookalike domain must not get a PDF burned onto
+    physical stock."""
+    forged = _with_subject("Your shipping label is ready")
+    del forged["From"]
+    del forged["Reply-To"]
+    forged["From"] = "eBay <billing@ebay.com.example.net>"
+    assert not mailparse.is_from_ebay(forged)
+    assert not mailparse.is_label_email(forged)
+
+    # ...while a real subdomain is accepted, because that is where eBay
+    # actually sends from.
+    real = _with_subject("Your shipping label is ready")
+    del real["From"]
+    del real["Reply-To"]
+    real["From"] = "eBay <members@reply.ebay.com>"
+    assert mailparse.is_from_ebay(real)
+
+
+def test_nothing_guesses_a_price_off_an_ebay_body():
+    """The deliberate gap. No eBay .eml had been read when this was
+    written, and the body carries several dollar amounts - item, postage,
+    total. Picking one blind writes a number into `price` that is
+    indistinguishable from a parsed one the moment it lands, and from
+    there into revenue and into the Sheet. Same rule as
+    `estimate_postage` and `landed_cost`: no basis, no figure."""
+    raw = EBAY_EML.read_text(errors="replace")
+    assert raw.count("&#36;") >= 3, "fixture no longer tempts the parser"
+
+    out = mailparse.parse(_ebay_msg())
+    assert out["channel"] == "ebay"
+    for guessable in ("price", "item", "buyer", "ship_by"):
+        assert guessable not in out, f"{guessable} was invented"
+
+
+def test_the_ebay_order_number_is_read_from_the_mail():
+    """NN-NNNNN-NNNNN is cheap to recognise and wrong only if eBay stops
+    using it, so it is the one body field worth reaching for."""
+    out = mailparse.parse(_ebay_msg())
+    assert out["order_id"] == "99-88776-55443"
+
+
+def test_the_order_number_survives_a_body_that_does_not_carry_it(db, tmp_path):
+    """It is read off the attachment's filename as well, because that is
+    where it has actually been seen: the one real eBay label email put it
+    in `ebay-label-<order number>.pdf` and the body has never been read.
+
+    And it is read *before* `already_seen`, not after - catching a resend
+    that carries a fresh Message-ID is half of what that check is for."""
+    from mplabel import cli
+
+    raw = EBAY_EML.read_bytes()
+    # Strip the number out of the body, leaving it only on the filename.
+    body_only = raw.replace(b"<td>99-88776-55443</td>", b"<td>see below</td>")
+    assert body_only != raw
+
+    (tmp_path / "labels").mkdir()
+    cfg = {"home": str(tmp_path)}
+    rec = cli.process_message(cfg, db, email.message_from_bytes(body_only),
+                              False)
+    assert rec["order_id"] == "99-88776-55443"
+
+    # A resend with a new Message-ID is the same order, so it is refused.
+    again = body_only.replace(b"fixture-ebay-label-0001",
+                              b"fixture-ebay-label-0002")
+    assert cli.process_message(cfg, db, email.message_from_bytes(again),
+                               False) is None
+    assert db.execute("SELECT COUNT(*) FROM sales").fetchone()[0] == 1
+
+
+def test_an_ebay_label_email_becomes_a_printable_sale(db, tmp_path):
+    """End to end, which is what she asked for: the mail turns into a row
+    with a cropped 4x6 beside it, and the fields the email cannot give
+    come off the label instead."""
+    from mplabel import cli
+
+    (tmp_path / "labels").mkdir()
+    cfg = {"home": str(tmp_path)}
+    rec = cli.process_message(cfg, db, _ebay_msg(), False)
+    assert rec, "the label email was dropped"
+
+    row = db.execute("SELECT * FROM sales").fetchone()
+    assert row["channel"] == "ebay"
+    assert row["order_id"] == "99-88776-55443"
+    # Straight off the PDF - the email says none of this.
+    assert row["tracking"] == "9434000000000000000000"
+    assert row["service"] == "USPS Ground Advantage"
+    assert row["ship_to"].startswith("SAM SAMPLE")
+    assert Path(row["label_pdf"]).exists()
+
+    info = label.to_4x6(Path(row["raw_pdf"]), tmp_path / "check.pdf")
+    assert info["size_in"] == (4.0, 6.0)
+
+
+def test_the_archived_name_carries_the_ebay_order_number(db, tmp_path):
+    """`isalnum()` threw away every filename with punctuation in it and
+    fell through to a timestamp at second resolution - the collision that
+    once put three sales on one buyer's label. Every eBay attachment name
+    carries hyphens, so on this channel that fallback would have been the
+    only path."""
+    from mplabel import cli
+
+    (tmp_path / "labels").mkdir()
+    rec = cli.process_message({"home": str(tmp_path)}, db, _ebay_msg(), False)
+    assert "99-88776-55443" in Path(rec["label_pdf"]).name
+
+
+def test_an_ebay_label_rotates_the_other_way(tmp_path):
+    """Measured off a real eBay label, and it is why the fixture exists.
+
+    Facebook draws its label text bottom-to-top and `to_4x6` answers 90;
+    eBay draws it top-to-bottom and the answer is 270. A pipeline that
+    had only ever met one of them cannot tell a convention from a
+    constant, and the wrong quarter turn is a label nobody can read."""
+    fb = label.to_4x6(LABEL_PDF, tmp_path / "fb.pdf")
+    eb = label.to_4x6(EBAY_PDF, tmp_path / "eb.pdf")
+    assert fb["rotation"] == 90
+    assert eb["rotation"] == 270
+    assert fb["size_in"] == eb["size_in"] == (4.0, 6.0)
+
+
+def test_the_ebay_ink_does_not_fill_the_label(tmp_path):
+    """The second geometric difference, and the one with no symptom.
+
+    A Marketplace label's ink is exactly the nominal 432x288pt, so
+    `_snap` has never had anything to do. eBay's is 408x273 and sits off
+    to one side, so the crop window genuinely moves - and it has to
+    extend *past* the ink rather than tightening onto it, or the label
+    comes out scaled differently from every other one."""
+    _box, ink, _rot, _page, _info = label.crop_box(EBAY_PDF)
+    assert round(ink[2] - ink[0]) == 408
+    assert round(ink[3] - ink[1]) == 273
+
+    box = label.crop_box(EBAY_PDF)[0]
+    assert round(box[2] - box[0]) == 432 and round(box[3] - box[1]) == 288
+    assert box[0] < ink[0] and box[1] < ink[1], "the window tightened onto ink"
+
+
+def test_the_label_names_the_recipient_only_where_the_email_did_not(db,
+                                                                    tmp_path):
+    """On eBay mail the label is the only place a name appears at all, so
+    the recipient block fills `buyer`. On Facebook mail the email says who
+    bought it, and the label must not be able to overwrite that - the
+    merge is `setdefault` for exactly this reason."""
+    from mplabel import cli
+
+    fields = label.extract_label_fields(
+        label.to_4x6(EBAY_PDF, tmp_path / "eb.pdf") and (tmp_path / "eb.pdf"))
+    assert fields["buyer"] == "Sam Sample"
+
+    (tmp_path / "labels").mkdir()
+    cfg = {"home": str(tmp_path)}
+    assert cli.process_message(cfg, db, _ebay_msg(), False)["buyer"] == \
+        "Sam Sample"
+
+    # The Facebook email names the buyer itself, and that is what is kept.
+    cli.process_message(cfg, db, email.message_from_bytes(
+        EMAIL_EML.read_bytes()), False)
+    fb = db.execute("SELECT buyer FROM sales WHERE channel='facebook'"
+                    ).fetchone()
+    assert fb["buyer"] == "Sam Sample"
+
+
+def test_a_street_line_is_never_mistaken_for_a_person():
+    """The recipient block is three lines ending at the CITY ST ZIP, so an
+    address with a company line or a two-line street pushes the name out
+    of it. A leading line with a digit in it is a street; no guess is
+    made."""
+    import re as _re
+    src = inspect.getsource(label.extract_label_fields)
+    assert "isdigit" in src, "the guard on the name line went away"
+
+    from mplabel import label as lb
+    # Behavioural, not just textual: a block whose first line is a street
+    # yields an address and no name.
+    assert not _re.search(r"out\[.buyer.\]\s*=\s*block\[0\]", src), \
+        "the name is taken unconditionally"
+
+
+def test_the_poll_asks_ebay_for_labels_and_not_for_everything(monkeypatch):
+    """eBay is the third sender and the first one this repo has no
+    classifier for. Fetching all of it by sender would pull every offer,
+    watch-list nudge and marketing mail down by RFC822 on every poll, fail
+    every classifier, be put back unrecorded and be fetched again an hour
+    later - for ever. So the search is narrowed by subject instead."""
+    from mplabel import cli
+
+    assert "ebay.com" not in cli.MAIL_DOMAINS, \
+        "eBay must not be searched by sender alone"
+    expr = cli.imap_ebay_labels()
+    assert 'FROM "ebay.com"' in expr and 'SUBJECT "shipping label"' in expr
+
+    seen = []
+
+    class _Imap:
+        def search(self, charset, query):
+            seen.append(query)
+            return "OK", [b"1 2"]
+
+    ids = cli.candidate_ids(_Imap(), {"lookback_days": 7}, "imap.gmail.com")
+    assert ids == [b"1", b"2"]
+    assert len(seen) == 1
+    assert "ebay.com" in seen[0] and "shipping label" in seen[0]
+    # And Facebook is still asked for by sender, as it always was.
+    assert "marketplace.facebook.com" in seen[0]
+
+
+def test_the_plain_imap_search_is_still_one_parseable_expression():
+    """IMAP's OR is binary and prefix. Getting the nesting wrong is not a
+    soft failure: the server rejects the whole SEARCH, `candidate_ids`
+    falls through to its last query, and that one is the search that hid
+    eight labels behind a Gmail thread."""
+    from mplabel import cli
+
+    seen = []
+
+    class _Imap:
+        def search(self, charset, query):
+            seen.append(query)
+            return "OK", [b"7"]
+
+    # Not a Gmail host, so the X-GM-RAW query is skipped and the plain
+    # expression is the one that goes out.
+    cli.candidate_ids(_Imap(), {"lookback_days": 3}, "mail.example.net")
+    plain = seen[0]
+    assert plain.count("(") == plain.count(")"), plain
+    assert plain.startswith("((OR ") and "SINCE" in plain
+    assert 'SUBJECT "shipping label"' in plain
+
+
+def test_an_unknown_price_does_not_print_as_free(db, capsys, tmp_path):
+    """`$   0.00` and "nobody knows" are different answers, and `or 0`
+    collapsed them. Harmless while every row came from a Marketplace
+    email carrying a price; an eBay one does not, and a parcel listed at
+    zero reads as a sale that made nothing rather than one nobody has
+    priced."""
+    from mplabel import cli
+
+    (tmp_path / "labels").mkdir()
+    cli.process_message({"home": str(tmp_path)}, db, _ebay_msg(), False)
+    cli.cmd_list({}, db, argparse.Namespace())
+    out = capsys.readouterr().out
+    assert "$   0.00" not in out and "0.00" not in out
+    assert "?" in out
+    # ...and the channel is named, because this one is not the default.
+    assert "[ebay]" in out
+
+
+def test_a_migrated_database_learns_the_channel(tmp_path):
+    """A column added to SCHEMA alone exists on fresh installs and nowhere
+    else. The default is what makes the backfill honest: every row that
+    predates the column really did arrive as a Marketplace label email -
+    there was no other way into this table - so 'facebook' states a fact
+    rather than filling a hole."""
+    from mplabel import cli
+
+    # Cut the column and the comment block above it out of the real
+    # schema rather than hand-rolling an old one: a trimmed copy is how
+    # the db fixture drifted until it had no message_id.
+    head, sep, tail = cli.SCHEMA.partition("    -- Which selling channel")
+    assert sep, "SCHEMA reformatted - fix this test"
+    old_schema = head.replace("    postage_source TEXT,",
+                              "    postage_source TEXT") + \
+        tail.split("'facebook'\n", 1)[1]
+
+    old = sqlite3.connect(tmp_path / "sales.db")
+    old.executescript(old_schema)
+    assert "channel" not in {r[1] for r in old.execute(
+        "PRAGMA table_info(sales)")}, "the column was not actually removed"
+    old.execute("INSERT INTO sales (message_id, item) "
+                "VALUES ('<old>', 'Stoneware vase')")
+    old.commit()
+    old.close()
+
+    conn = cli.connect_db(tmp_path)
+    assert "channel" in {r[1] for r in conn.execute(
+        "PRAGMA table_info(sales)")}
+    assert conn.execute("SELECT channel FROM sales WHERE message_id='<old>'"
+                        ).fetchone()[0] == "facebook"
+
+
 # ------------------------------------------------------- inventory labels
 
 def _inv_args(**kw):
@@ -11500,7 +11835,7 @@ def test_the_survey_says_when_it_is_off_scale(monkeypatch, capsys):
             for n in range(40)]
     monkeypatch.setattr(backfill, "_connect", lambda cfg: _QuietIMAP())
     monkeypatch.setattr(backfill, "_search_all",
-                        lambda imap, folder, since=None: [b"1"] * len(msgs))
+                        lambda imap, folder, since=None, **kw: [b"1"] * len(msgs))
     monkeypatch.setattr(backfill, "_headers_only", lambda imap, nums: msgs)
 
     backfill.scan({"imap_folder": "INBOX"})
@@ -11518,7 +11853,7 @@ def test_the_survey_folds_an_id_out_of_a_machine_subject(monkeypatch, capsys):
             for n in (9333904, 9318419, 9334117)]
     monkeypatch.setattr(backfill, "_connect", lambda cfg: _QuietIMAP())
     monkeypatch.setattr(backfill, "_search_all",
-                        lambda imap, folder, since=None: [b"1"] * len(msgs))
+                        lambda imap, folder, since=None, **kw: [b"1"] * len(msgs))
     monkeypatch.setattr(backfill, "_headers_only", lambda imap, nums: msgs)
 
     backfill.scan({"imap_folder": "INBOX"})
@@ -11689,7 +12024,7 @@ def test_the_survey_names_the_folder_it_walked(monkeypatch, capsys):
     msgs = [email.message_from_string("Subject: Refund Issued\n\n")]
     monkeypatch.setattr(backfill, "_connect", lambda cfg: _QuietIMAP())
     monkeypatch.setattr(backfill, "_search_all",
-                        lambda imap, folder, since=None: [b"1"])
+                        lambda imap, folder, since=None, **kw: [b"1"])
     monkeypatch.setattr(backfill, "_headers_only", lambda imap, nums: msgs)
 
     backfill.scan({"imap_folder": "INBOX"})
@@ -11987,7 +12322,7 @@ def test_the_survey_says_trash_is_on_a_clock(monkeypatch, capsys):
 
     backfill.scan({"imap_folder": "INBOX"})
     out = capsys.readouterr().out
-    assert "1 Facebook/ShopGoodwill message(s) in [Gmail]/Trash" in out
+    assert "1 Facebook/ShopGoodwill/eBay message(s) in [Gmail]/Trash" in out
     assert "purges" in out
     # The archive's own line must not carry the warning.
     archive = [ln for ln in out.splitlines() if "All Mail" in ln][0]

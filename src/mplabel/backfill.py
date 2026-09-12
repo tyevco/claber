@@ -1,4 +1,4 @@
-"""
+r"""
 backfill.py - walk the whole mailbox once and reconstruct her history
 from every Facebook Marketplace and ShopGoodwill email she has received.
 
@@ -63,6 +63,20 @@ log = logging.getLogger("mplabel.backfill")
 # mailbox does not run for an hour or trip Gmail's throttling.
 BATCH = 200
 
+# What `scan` looks for, which is wider than what `run` imports. eBay is
+# in here and not in `cli.MAIL_DOMAINS` because the survey's job is to
+# say what is in the mailbox - including the mail nothing can act on -
+# while the import's job is to act, and fetching a sender with no
+# classifier behind it would count every message as unmatched and do it
+# again next run.
+#
+# It is also the only way to check the one inference the eBay label path
+# rests on: that her label mail comes from a domain under `ebay.com`. If
+# that is wrong, nothing prints and nothing says why.
+SURVEY_DOMAINS = (tuple(mailparse.SENDER_DOMAINS)
+                  + tuple(goodwill.SENDER_DOMAINS)
+                  + tuple(mailparse.EBAY_SENDER_DOMAINS))
+
 
 def _connect(cfg):
     imap = imaplib.IMAP4_SSL(cfg["imap_host"], int(cfg["imap_port"]))
@@ -108,7 +122,7 @@ def _all_mail_folder(imap):
 
 
 def _trash_folder(imap):
-    """Where deleted mail waits to be purged.
+    r"""Where deleted mail waits to be purged.
 
     Gmail's `\All` mailbox deliberately excludes Trash, and she deletes
     ShopGoodwill mail often - so the archive alone still misses
@@ -139,7 +153,7 @@ def survey_folder(imap, cfg):
 
 
 def survey_folders(imap, cfg):
-    """Every mailbox worth walking, in order, deduplicated.
+    r"""Every mailbox worth walking, in order, deduplicated.
 
     **Trash is on this list, and that is the point.** She deletes
     ShopGoodwill mail often, and a deleted receipt does not undo the
@@ -204,21 +218,28 @@ def open_folder(imap, preferred, fallback="INBOX"):
         f"could not open {preferred!r} or {fallback!r}")
 
 
-def _search_all(imap, folder, since=None):
+def _search_all(imap, folder, since=None, domains=None):
     """Every message from a sender we parse, read or unread.
 
     Both halves of the mailbox: Facebook for what she sold, ShopGoodwill
     for what she bought. Gmail's X-GM-RAW is far better at this than
     plain IMAP SEARCH, so use it when available - and note the plain
     fallback has to nest its ORs, because IMAP's OR takes exactly two
-    arguments and a server rejects the whole search otherwise."""
+    arguments and a server rejects the whole search otherwise.
+
+    `domains` widens that for the survey, which asks a different question
+    from the import. `scan` wants to know what is *there*, eBay included;
+    `run` wants the mail it can act on, and fetching a sender it has no
+    classifier for would pull hundreds of messages down by RFC822, count
+    every one as unmatched, and do it again on the next run."""
     from . import cli
 
     open_folder(imap, folder)
-    doms = " OR ".join(cli.MAIL_DOMAINS)
+    domains = tuple(domains or cli.MAIL_DOMAINS)
+    doms = " OR ".join(domains)
     queries = [
         f'(X-GM-RAW "from:({doms})")',
-        f'({cli.imap_or_from(cli.MAIL_DOMAINS)})',
+        f'({cli.imap_or_from(domains)})',
     ]
     for q in queries:
         try:
@@ -258,14 +279,20 @@ def scan(cfg, limit=2000):
         trash = _trash_folder(imap)
         msgs, found = [], []
         for folder in folders:
-            nums = _search_all(imap, folder)
+            # eBay as well, and only here. The whole eBay path rests on
+            # one inference - that her label mail comes from a domain
+            # under `ebay.com` - and if that is wrong the symptom is
+            # silent: nothing prints and nothing says why. A survey is
+            # the cheap place to find out, because it changes nothing.
+            nums = _search_all(imap, folder, domains=SURVEY_DOMAINS)
             found.append((folder, len(nums)))
             if nums:
                 msgs.extend(_headers_only(imap, nums[-limit:]))
         for folder, n in found:
             note = "  <- deleted; Gmail purges this after 30 days" \
                 if folder == trash and n else ""
-            print(f"{n} Facebook/ShopGoodwill message(s) in {folder}{note}")
+            print(f"{n} Facebook/ShopGoodwill/eBay message(s) "
+                  f"in {folder}{note}")
         if not msgs:
             print("\nNothing found. If her Facebook mail is filtered into a "
                   "label rather than the inbox, set imap_folder to that "
@@ -281,7 +308,8 @@ def scan(cfg, limit=2000):
     known, unknown = Counter(), Counter()
     for m in msgs:
         subj = mailparse._decode(m.get("Subject"))
-        kind = listings.classify(subj) or goodwill.classify(subj)
+        kind = (listings.classify(subj) or goodwill.classify(subj)
+                or mailparse.classify_ebay(subj))
         if kind:
             known[kind] += 1
         else:
@@ -319,6 +347,10 @@ def scan(cfg, limit=2000):
               "a pattern for them to EVENT_PATTERNS in listings.py - that is "
               "how the backfill learns them. An auction subject goes in "
               "SUBJECT_PATTERNS in goodwill.py instead.")
+        print("An eBay subject is a different question: the only one that "
+              "has a printer behind it is 'Your shipping label is ready', "
+              "and the rest are listed here so it is visible what eBay "
+              "actually sends rather than assumed.")
 
 
 def run(cfg, conn, limit=None, resume=True):
