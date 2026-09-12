@@ -81,10 +81,45 @@ KEY_PREFIX = "goodwill:"
 # denominator and make sell-through fall every time she wins an auction.
 ACQUIRED = "acquired"
 
+# Every ShopGoodwill subject seen in the real mailbox. The first five
+# came out of one `mplabel scan`, and the survey is why they are here
+# rather than guessed: the two this module was built for were 11 of the
+# messages, and the other ~60 were being reported as unrecognised.
+#
+# Order matters only in that `classify` returns the first match; these
+# do not overlap.
 SUBJECT_PATTERNS = [
-    ("goodwill_won",  r"you were awarded the winning bid"),
-    ("goodwill_paid", r"online payment received"),
+    ("goodwill_won",       r"you were awarded the winning bid"),
+    # Buy It Now, which is a second way she acquires things and was
+    # invisible until the survey. The win mail's own seller message
+    # mentions BIN sales, so this was always there to be found.
+    ("goodwill_bought",    r"buy now confirmation"),
+    ("goodwill_paid",      r"online payment received"),
+    # Money going back the other way. Nine of them in one survey, which
+    # is the finding: a refund makes a recorded cost basis wrong, and
+    # nothing here can act on one yet - see `import_order`.
+    ("goodwill_refund",    r"refund issued"),
+    ("goodwill_retracted", r"bid has been retracted"),
+    # Her own customer-service correspondence - "broken item", "missing
+    # part", "please cancel the order". Thirty-odd messages, which is
+    # what was drowning the survey. Classified so `scan` stays readable
+    # and recorded so the history is complete; nothing reads them.
+    ("goodwill_ticket",    r"ticket id\s*#"),
+    ("goodwill_reminder",  r"payment reminder"),
 ]
+
+# The kinds that mean a thing is now hers. Both are commitments rather
+# than money: BIN is bought-then-paid exactly as an auction is
+# won-then-paid, so `goodwill_paid` is still the only mail that fills a
+# cost.
+ACQUISITION_KINDS = frozenset({"goodwill_won", "goodwill_bought"})
+
+# The kinds that carry an order and its items. Everything else is
+# recorded as an event and touches no listing - deliberately, because
+# a ticket body can quote an item number and a refund body probably
+# names one, and either would otherwise mint inventory out of
+# correspondence.
+ORDER_KINDS = ACQUISITION_KINDS | {"goodwill_paid"}
 
 
 def is_from_goodwill(msg):
@@ -191,9 +226,15 @@ def _items_from_blocks(blocks):
 def parse(msg):
     """Everything a ShopGoodwill mail can tell us, or {} if it is not one.
 
-    The two kinds share a return shape so a caller does not have to
-    branch before it knows what it has: `kind` says which fields to
-    expect, and the money fields are simply absent on a win."""
+    Every kind shares a return shape so a caller does not have to branch
+    before it knows what it has: `kind` says which fields to expect, and
+    the money fields are simply absent on a win.
+
+    Only the order kinds are looked in for items. That is a guard, not
+    an optimisation: a return ticket's body quotes the item it is about,
+    and a refund's almost certainly names one, so running the item
+    extractor over them would mint inventory out of correspondence -
+    rows for things she is trying to send *back*."""
     kind = classify(mailparse._decode(msg.get("Subject")))
     if not kind:
         return {}
@@ -210,6 +251,18 @@ def parse(msg):
         received = None
     if received:
         out["received_at"] = received.isoformat()
+
+    if kind not in ORDER_KINDS:
+        # A refund, a retracted bid, a ticket update, a payment
+        # reminder. Recorded so the history is complete and so `scan`
+        # stops calling them unrecognised; read for nothing but the
+        # labels they might carry, because what these mean has never
+        # been seen - only their subject lines have.
+        fields = _labelled(blocks)
+        out["order_id"] = fields.get("order number")
+        out["total"] = _money(fields.get("refund amount")
+                              or fields.get("order total"))
+        return out
 
     if kind == "goodwill_won":
         # "...winning bid at ShopGoodwill.com for item #911100022 -
@@ -243,6 +296,21 @@ def parse(msg):
         return out
 
     fields = _labelled(blocks)
+    if kind == "goodwill_bought":
+        # ASSUMED. A Buy Now confirmation has never been read - two of
+        # them turned up in the survey and that is all that is known. It
+        # is treated as an acquisition because BIN is bought-then-paid
+        # the way an auction is won-then-paid, and it is parsed with the
+        # *payment* mail's label extractor on the guess that ShopGoodwill
+        # reuses its own template. If that guess is wrong there are no
+        # items, and `import_order` records the event and creates
+        # nothing rather than inventing a row. `mplabel goodwill <eml>`
+        # is how to settle it against a real one.
+        out["items"] = _items_from_blocks(blocks)
+        out["order_id"] = fields.get("order number")
+        out["seller"] = fields.get("goodwill name")
+        return out
+
     out["items"] = _items_from_blocks(blocks)
     out["order_id"] = fields.get("order number")
     out["seller"] = fields.get("goodwill name")
@@ -315,12 +383,17 @@ def import_order(conn, order):
     - so a re-run of `backfill` cannot double-count an order, and a cost
     she corrected by hand survives the next import. The mail arrives
     once; her correction is the later observation and the more likely to
-    be right."""
-    items = [i for i in order.get("items") or [] if i.get("item_id")]
-    if not items:
-        return None
+    be right.
 
+    **The event is recorded first and unconditionally.** This used to
+    return early when a mail carried no items, which was fine while the
+    only two kinds both did - and became a real problem the moment a
+    mailbox survey found sixty that do not. `backfill` marks a message
+    seen on a truthy return, so a ticket update was re-fetched on every
+    single run, for ever, and counted as unmatched each time."""
     kind = order.get("kind")
+    items = ([i for i in order.get("items") or [] if i.get("item_id")]
+             if kind in ORDER_KINDS else [])
     occurred = order.get("paid_on") or order.get("received_at")
     # What the mail said the money was: the order total once it is paid,
     # the hammer price while it is only won. Recorded on the event rather
@@ -335,6 +408,23 @@ def import_order(conn, order):
         listing_id=None,               # theirs, not hers - see BUYER_KINDS
         amount=amount,
         counterparty=order.get("seller"))
+
+    if not items:
+        # A refund, a retracted bid, a ticket, a reminder - or a Buy Now
+        # confirmation whose body did not look the way it was guessed to.
+        #
+        # A refund in particular *should* do something: it makes a
+        # recorded `paid` wrong, and nine of them turned up in one
+        # survey. It deliberately does not, because correcting a cost
+        # basis means knowing which order the money came back on and
+        # nothing here has ever read one of those bodies. Writing that
+        # from the subject line would be inventing the link, and the
+        # failure would be silent and in the direction that flatters the
+        # margins.
+        conn.commit()
+        return {"kind": kind, "order_id": order.get("order_id"),
+                "trip_id": None, "listing_ids": [],
+                "total": order.get("total")}
 
     trip_id = None
     if kind == "goodwill_paid":
