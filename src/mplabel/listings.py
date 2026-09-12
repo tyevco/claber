@@ -258,7 +258,9 @@ EVENT_PATTERNS = [
 # listing id and `apply_events` has nothing to reconcile them against.
 # `goodwill.import_order` writes the listing row itself, with a cost -
 # replaying the event on top could only undo that.
-BUYER_KINDS = {"purchase", "goodwill_won", "goodwill_paid"}
+BUYER_KINDS = {"purchase", "goodwill_won", "goodwill_bought",
+               "goodwill_paid", "goodwill_refund", "goodwill_retracted",
+               "goodwill_ticket", "goodwill_reminder"}
 
 
 # The sale subjects carry the item name, and for a local-pickup sale that

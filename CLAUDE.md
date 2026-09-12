@@ -552,9 +552,12 @@ hardware or a real Facebook account.
 | The desk portal, on her real data | **Verified: it is running against the real database.** Which immediately found what seeded data could not - the queue titles overlapped their prices, because her titles run past a hundred characters where the design was drawn against forty, and because a `<span>` ignores `text-overflow` however carefully it is set. The seed carries titles that long now. Still not checked on real data: the CSV import wizard, and Month-end against a full year. |
 | The desk portal | **Runs, and every screen has been looked at against seeded data in both themes.** Six screens at `/desk`, driven in headless Edge over CDP: the queue's confirm-and-print dialog, a bulk edit of three rows through `POST /api/inventory/bulk`, the search box keeping its caret, the CSV wizard through mapping and preview. That walk found five things the assertions did not - a figure that was really a `LIMIT`, a focus restore undone by a later render, a theme button that never changed its own label, an `era` column the endpoint had never sent, and a photo placeholder that lied about drafts with photographs. **Not** run against real data, and not on a real laptop over the tunnel - `tools/desk-preview.py` seeds a throwaway database and nothing here has met a real order. |
 | ShopGoodwill mail shapes | **Verified against 11 real messages** - every one parsed correctly. The two saved threads are Gmail print views holding 5 real wins and 6 real payment receipts, and `goodwill.parse` was run over all of them: every item number, title, price, order number, subtotal, tax, postage, order total, payment date and selling Goodwill came out right. Real shapes that turned out to matter and are now in the fixtures: **`<font color="#550055">` interleaved at arbitrary points** in 4 of the 5 wins - one opens mid-sentence just before the price and the seller line arrives with a closing tag stuck to its front; a **title ending in a full stop** before the template's `!` (`...Albums.!`); **double quotes inside titles** (`16.5X29.75" FRAME`, `"THE DAILY HERALD"`); and **postage of $0.01** as a free-postage sentinel, where the landed cost is still the order total. The fixtures had none of the font interleaving before this, so they were a tidier document than anything the parser will meet. |
+| The ShopGoodwill subject families | **Surveyed against the real mailbox.** `mplabel scan` reported roughly sixty unrecognised ShopGoodwill subjects against the eleven this module was built for, in five families, all now classified: **Buy Now Confirmation** (a second way she acquires things, and invisible until the survey - the win mail's own seller message mentions BIN sales, so it was always there to be found), **Refund Issued** (nine of them), **Bid Has Been Retracted** (five), **Ticket ID # N Updated - <her words>** (thirty-odd: her own return correspondence - "broken item", "missing part", "not jade", "counterfeit"), and **Payment Reminder**. What is **ASSUMED** is every one of their *bodies*: only the subject lines have been seen, so the win and payment mails are still the only two shapes anything reads. |
+| A refund makes a recorded cost basis wrong, and nothing acts on one | **Verified that they happen - nine in one survey - and deliberately unhandled.** `paid` is the landed cost of an order, and a refund means some of that money came back; the ticket subjects say why it happens so often (broken, missing, counterfeit, not as described). Correcting it means knowing which order the money returned on, and **no refund body has ever been read**. Guessing the link from a subject line would be silent and in the direction that flatters the margins, so the mail is classified and recorded in `mail_events` and touches no listing. This is the largest known gap in the auction half. |
+| A Buy Now confirmation's body | **ASSUMED.** Treated as an acquisition, because BIN is bought-then-paid exactly as an auction is won-then-paid - so the payment receipt is still the only mail that fills a cost - and parsed with the payment mail's label extractor on the guess that ShopGoodwill reuses its own template. If that guess is wrong there are no items and `import_order` records the event and creates nothing, which is the right failure for a shape nobody has read. |
 | A ShopGoodwill order holds one item | **6 of 6 real orders did**, which is evidence and not proof. The multi-item path is unit-tested against a constructed two-item receipt and is the one that refuses to apportion; what has never been seen is a real one, so whether the second item's block is laid out like the first is still **ASSUMED**. `mplabel goodwill <eml>` without `--write` is how to check one when it turns up. |
 | Win titles and payment titles are cased differently | **Verified.** The win mail says `Pair Of World Wildlife Fund Stamp Collection Albums.` and the payment receipt for the same class of item says `VINTAGE CHINESE RICE GRAIN PORCELAIN BLUE AND WHITE MINI TEAPOT JINGDEZHEN`. So the stored title depends on which mail arrived first - `upsert_listing` fills blanks and does not overwrite. Harmless for reconciliation, because `_norm_title` lower-cases both, but it is why an inventory list has some shouting rows in it. |
-| No auction mail carries a shipped/delivered notice | **ASSUMED, and not checkable from here.** Only the win and the payment receipt have been seen. If a dispatch mail exists it would give a real arrival date, which is the one thing the current pair cannot say. Note the Gmail connector available to a Claude session is **tyevco@gmail.com**, the developer account, which has no auction mail in it at all; the selling and sourcing mail goes to a different address, so `mplabel scan` on the Pi is the only thing that can settle this. |
+| No auction mail carries a shipped/delivered notice | **Still open, and the survey did not settle it.** No dispatch subject appeared - but `scan` printed only its top 25 and the twenty-odd ticket subjects, each unique, ate most of the list, so whole families were below the cut and a dispatch notice is exactly the kind of thing that would have been. Those families are classified now and the survey reports what it could not show, so **re-running `mplabel scan` is what settles this** and it is cheap. Note the Gmail connector available to a Claude session is **tyevco@gmail.com**, the developer account, which has no auction mail in it at all; the selling and sourcing mail goes to a different address, so the Pi is the only place that can run it. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 | eBay OAuth on a headless Pi | **ASSUMED.** The consent URL, the code exchange and the refresh are written and unit-tested against a replaced `_transport`; none has been sent to eBay. The refresh token's ~18-month lifetime is reported *only* on the initial exchange, so `exchange_code` records the absolute expiry there or it cannot be recovered - `ebay check` counts it down. |
 | eBay business-policy prerequisites | **ASSUMED, and they bite earlier than they read.** Opt-in plus fulfillment/payment/return policies and an inventory location look like publish-time requirements; eBay validates them when the **offer is created**. So they gate the first push even though nothing here ever publishes. |
@@ -1560,6 +1563,33 @@ all: every UI test passes with the session in any state. This came from
 the phone, twice - "the viewfinder is black" and then "the camera
 stopped responding".
 
+**A classified mail must be recorded even when it carries nothing.**
+`goodwill.import_order` returned early when a mail had no items, which
+was harmless while both known kinds carried an order and a real problem
+the moment a mailbox survey found sixty that do not. `backfill` marks a
+message seen on a truthy return, so every ticket update was re-fetched
+on every run, for ever, and counted as unmatched each time. The event is
+written first and unconditionally now, and only the order kinds go on to
+touch a listing.
+
+**Only the order kinds are read for items, and that is a guard.** A
+return ticket's body quotes the item it is about and a refund's almost
+certainly names one, so running the item extractor over them would mint
+inventory out of correspondence - rows for things she is trying to send
+*back*, with a cost on them. `ORDER_KINDS` is what `parse` branches on,
+before it looks at a single block.
+
+**A survey that prints its top 25 has to say what it could not show.**
+The real `scan` came back with twenty `Ticket ID # 9333904 Updated -
+<her own words>` lines, each its own subject, which filled the list and
+pushed whole families below the cut - so it read as a complete answer
+and was not, and the one thing it was being used to rule out (a dispatch
+mail) is exactly what would have been hidden. It now folds long digit
+runs out of a subject as well as quoted spans, and prints how many
+distinct subjects it did not show. Same lesson as the edge gauge that
+stopped at 32 dots while the loss was 40: **an instrument has to say
+when the reading is off its scale.**
+
 **A word computed from the states can stop meaning what it says.** The
 desk's header read `N still listed`, counted as everything not `sold` -
 which was exactly right while `active` and `sold` were the only states a
@@ -1956,6 +1986,17 @@ yet listed. What is **not** answered is whether the parser survives a
 real message: the fixtures are reconstructions of two real threads, every
 real order seen so far holds exactly one item, and `mplabel goodwill
 <eml>` without `--write` is how to check one before it writes anything.
+
+**A real `mplabel scan` then changed the shape of this.** The two mails
+this was built for are eleven messages; the mailbox holds roughly sixty
+more, in five families, and two of them matter. **Buy Now** is a second
+acquisition path nobody knew was there. **Refund Issued** - nine of them
+- is the largest known gap in this half: a refund makes a recorded
+`paid` wrong, the ticket subjects say it happens often (broken, missing,
+counterfeit, not as described), and it is deliberately unhandled because
+no refund body has ever been read. What is needed to finish it is one
+saved `Refund Issued` .eml, and the same for a `Buy Now Confirmation`
+and a `Bid Has Been Retracted`.
 
 That parser has since been run over **every** message in the two saved
 threads - 5 real wins and 6 real payment receipts - and all 11 came out
