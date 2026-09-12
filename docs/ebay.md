@@ -139,8 +139,36 @@ mistake.
 
 ```bash
 mplabel ebay setup --shipping-service list   # what this account can use
-mplabel ebay setup --shipping-service USPSPriority
+mplabel ebay setup --shipping-service USPSParcel
 ```
+
+**`USPSParcel` is USPS Ground Advantage.** USPS renamed the service in
+2023; eBay updated the *description* and kept the legacy code. So
+`USPSGroundAdvantage` - the name of the thing - matches nothing at all,
+which is what the first attempt sent. The preference list puts
+`USPSParcel` first because that is what a small parcel actually goes by,
+and falls back to matching the **description** when no code does, since
+the description is the half that tracks what a service is called.
+
+The real account offered eighty-odd services and put
+`validForSellingFlow` on **none** of them, so treating an absent flag as
+usable is load bearing: dropping the unflagged would have emptied the
+list and refused on an account offering eighty.
+
+### Where parcels are posted from
+
+The inventory location needs a real address - the postcode, or the city
+and state. Sending only the country is `25802: Input error`, which names
+no field.
+
+```ini
+ebay_location_postcode = 46176
+```
+
+`setup` refuses before the call rather than defaulting, and the reason
+is not the API: **eBay shows buyers a delivery estimate computed from
+this address**, so a placeholder would be a wrong promise on every
+listing rather than a tidy default.
 
 If the metadata call itself fails, `setup` falls back to the first
 preference and **says it did**. Asking is better than assuming, stopping

@@ -205,6 +205,15 @@ DEFAULTS = {
     # attached to a listing already pushed to eBay are served; see
     # `web.h_ebay_photo`.
     "ebay_photo_base": "",
+    # Where parcels are posted from. eBay shows buyers a delivery
+    # estimate computed from it, so it is hers and cannot be guessed - a
+    # placeholder would be a wrong promise on every listing. A warehouse
+    # location needs the postcode, or the city and state; sending only
+    # the country is `25802: Input error`, which names no field.
+    "ebay_location_postcode": "",
+    "ebay_location_city": "",
+    "ebay_location_state": "",
+    "ebay_location_country": "US",
 }
 
 SCHEMA = """

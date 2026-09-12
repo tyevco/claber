@@ -300,3 +300,16 @@ ebay_notification_endpoint =
 # is the allowlist, and it is the reason this is the narrowest public
 # hole that works rather than a photo directory on the internet.
 ebay_photo_base =
+
+# Where parcels are posted from, for the eBay inventory location an
+# offer has to name. eBay shows buyers a delivery estimate computed from
+# it, so it is a real address rather than a tidy default - a placeholder
+# here is a wrong promise on every listing.
+#
+# The postcode alone is enough; city and state together also work.
+# Sending only the country is `25802: Input error`, which names no field
+# at all, so `mplabel ebay setup` refuses before the call instead.
+ebay_location_postcode  =
+ebay_location_city      =
+ebay_location_state     =
+ebay_location_country   = US
