@@ -11330,3 +11330,165 @@ def test_a_long_title_is_cut_at_a_word_and_said_out_loud():
     # An unbroken run has no boundary to back off to, and returning
     # almost nothing would be worse than a hard cut.
     assert len(ebay.ebay_title("x" * 200)) == ebay.TITLE_LIMIT
+# --------------------------------------------------------------------------
+# What a real mailbox survey found.
+#
+# `mplabel scan` against her actual mail reported ~60 unrecognised
+# ShopGoodwill subjects against the 11 this module was built for. Five
+# families, and the two that matter are a second way she acquires things
+# and a kind of mail that makes a recorded cost basis wrong.
+
+@pytest.mark.parametrize("subject,kind", [
+    ("ShopGoodwill.com - You Were Awarded The Winning Bid!", "goodwill_won"),
+    ("ShopGoodwill.com - Online Payment Received", "goodwill_paid"),
+    # Buy It Now - a second acquisition path, invisible until the survey.
+    ("shopgoodwill.com - Buy Now Confirmation", "goodwill_bought"),
+    ("Refund Issued", "goodwill_refund"),
+    ("shopgoodwill.com - Bid Has Been Retracted", "goodwill_retracted"),
+    ("Ticket ID # 9333904 Updated - broken item", "goodwill_ticket"),
+    ("ShopGoodwill.com - Payment Reminder", "goodwill_reminder"),
+])
+def test_every_subject_the_survey_found_is_classified(subject, kind):
+    """Each of these was reported as unrecognised against a real mailbox.
+    A subject nothing classifies is a message `backfill` refetches for
+    ever and `scan` buries its real findings under."""
+    from mplabel import goodwill
+
+    assert goodwill.classify(subject) == kind
+
+
+def test_a_ticket_body_cannot_mint_inventory(db):
+    """The loudest family in the survey is her own return
+    correspondence - thirty-odd "Ticket ID # ... Updated - broken item".
+    Those bodies quote the item they are about, so running the item
+    extractor over one would create a listing for a thing she is trying
+    to send *back*, with a cost on it."""
+    from mplabel import goodwill
+
+    raw = GOODWILL_PAID.read_text(encoding="utf-8").replace(
+        "ShopGoodwill.com - Online Payment Received",
+        "Ticket ID # 9333904 Updated - broken item")
+    msg = email.message_from_string(raw)
+
+    order = goodwill.parse(msg)
+    assert order["kind"] == "goodwill_ticket"
+    assert not order.get("items"), "a ticket was read for items"
+
+    goodwill.import_mail(db, msg)
+    assert db.execute("SELECT COUNT(*) FROM listings").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM trips").fetchone()[0] == 0
+
+
+def test_a_classified_mail_is_recorded_even_when_it_carries_no_order(db):
+    """`backfill` marks a message seen on a truthy return, so returning
+    early on "no items" meant every ticket update was refetched on every
+    run, for ever, and counted as unmatched each time. Harmless while
+    both known kinds carried orders; sixty messages once they did not."""
+    from mplabel import goodwill
+
+    raw = GOODWILL_PAID.read_text(encoding="utf-8").replace(
+        "ShopGoodwill.com - Online Payment Received", "Refund Issued")
+    result = goodwill.import_mail(db, email.message_from_string(raw))
+    assert result is not None, "nothing to mark the message seen with"
+    assert result["listing_ids"] == []
+
+    row = db.execute("SELECT kind FROM mail_events").fetchone()
+    assert row["kind"] == "goodwill_refund"
+
+
+def test_a_refund_does_not_touch_a_recorded_cost(db, paid_mail):
+    """Nine refunds in one survey, and a refund genuinely does make
+    `paid` wrong. It is left alone on purpose: correcting a cost basis
+    means knowing which order the money came back on, and no refund body
+    has ever been read. Guessing that from a subject line would be
+    silent and in the direction that flatters the margins."""
+    from mplabel import goodwill
+
+    goodwill.import_mail(db, paid_mail)
+    before = db.execute("SELECT paid FROM listings").fetchone()["paid"]
+    assert before == 19.87
+
+    raw = GOODWILL_PAID.read_text(encoding="utf-8").replace(
+        "ShopGoodwill.com - Online Payment Received", "Refund Issued")
+    goodwill.import_mail(db, email.message_from_string(raw))
+
+    assert db.execute("SELECT paid FROM listings").fetchone()["paid"] == 19.87
+
+
+def test_a_buy_now_confirmation_is_an_acquisition_not_a_payment():
+    """BIN is bought-then-paid the way an auction is won-then-paid, so
+    the payment receipt is still the only mail that fills a cost. If the
+    body turns out not to match the guessed template there are no items
+    and nothing is created - which is the right failure for a shape
+    nobody has read."""
+    from mplabel import goodwill
+
+    assert "goodwill_bought" in goodwill.ACQUISITION_KINDS
+    assert "goodwill_paid" not in goodwill.ACQUISITION_KINDS
+    assert goodwill.ACQUISITION_KINDS < goodwill.ORDER_KINDS
+
+
+def test_a_buy_now_confirmation_creates_no_cost(db):
+    """The same rule as a win: a confirmation is a commitment, and only
+    the payment receipt says money moved."""
+    from mplabel import goodwill
+
+    raw = GOODWILL_PAID.read_text(encoding="utf-8").replace(
+        "ShopGoodwill.com - Online Payment Received",
+        "shopgoodwill.com - Buy Now Confirmation")
+    goodwill.import_mail(db, email.message_from_string(raw))
+
+    row = db.execute("SELECT listing_id, paid, state FROM listings").fetchone()
+    assert row["listing_id"] == "goodwill:911100037"
+    assert row["paid"] is None, "a confirmation reported money that has not moved"
+    assert row["state"] == goodwill.ACQUIRED
+
+
+class _QuietIMAP:
+    """Enough of an IMAP connection for `scan`'s finally block."""
+
+    def close(self):
+        pass
+
+    def logout(self):
+        pass
+
+
+def test_the_survey_says_when_it_is_off_scale(monkeypatch, capsys):
+    """It printed its top 25 unrecognised subjects and nothing else. A
+    real survey came back with twenty `Ticket ID # ... Updated - <her
+    own words>` lines, each its own subject, which ate most of the list
+    and pushed whole families below the cut - so it read as a complete
+    answer and was not. Same lesson as the edge gauge that stopped at 32
+    dots while the loss was 40: an instrument has to say when the
+    reading is off its scale."""
+    from mplabel import backfill
+
+    msgs = [email.message_from_string(f"Subject: Mystery number {n}\n\n")
+            for n in range(40)]
+    monkeypatch.setattr(backfill, "_connect", lambda cfg: _QuietIMAP())
+    monkeypatch.setattr(backfill, "_search_all",
+                        lambda imap, folder, since=None: [b"1"] * len(msgs))
+    monkeypatch.setattr(backfill, "_headers_only", lambda imap, nums: msgs)
+
+    backfill.scan({"imap_folder": "INBOX"})
+    out = capsys.readouterr().out
+    assert "and 15 more distinct subject(s) not shown" in out
+
+
+def test_the_survey_folds_an_id_out_of_a_machine_subject(monkeypatch, capsys):
+    """Quoting was the only variable part being collapsed, and none of
+    the subjects that actually crowded the list was quoted - they varied
+    by a ticket number."""
+    from mplabel import backfill
+
+    msgs = [email.message_from_string(f"Subject: Order {n} shipped\n\n")
+            for n in (9333904, 9318419, 9334117)]
+    monkeypatch.setattr(backfill, "_connect", lambda cfg: _QuietIMAP())
+    monkeypatch.setattr(backfill, "_search_all",
+                        lambda imap, folder, since=None: [b"1"] * len(msgs))
+    monkeypatch.setattr(backfill, "_headers_only", lambda imap, nums: msgs)
+
+    backfill.scan({"imap_folder": "INBOX"})
+    out = capsys.readouterr().out
+    assert "3  Order # shipped" in out, out

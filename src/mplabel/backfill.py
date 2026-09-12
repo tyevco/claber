@@ -121,6 +121,13 @@ def scan(cfg, limit=2000):
         else:
             # Collapse the variable part so the histogram stays readable.
             generic = re.sub(r"[\"'\u201c\u201d].*?[\"'\u201c\u201d]", '"..."', subj)
+            # Long digit runs are the other variable part, and the one
+            # that actually bit: a real survey came back with twenty
+            # `Ticket ID # 9333904 Updated - ...` lines, each its own
+            # subject, which ate most of the list and pushed whole
+            # families below the cut. Quoting was the only thing being
+            # collapsed and nothing here is quoted.
+            generic = re.sub(r"\d{4,}", "#", generic)
             generic = re.sub(r"\s+", " ", generic).strip()[:70]
             unknown[generic] += 1
 
@@ -131,8 +138,16 @@ def scan(cfg, limit=2000):
         print("  none")
 
     print("\n=== unrecognised subjects ===")
-    for subj, n in unknown.most_common(25):
+    shown = 25
+    for subj, n in unknown.most_common(shown):
         print(f"  {n:>5}  {subj}")
+    # A gauge has to say when it is off-scale. This printed its top 25
+    # and nothing else, so a survey whose first twenty lines were all
+    # one noisy family looked like a complete answer and was not.
+    if len(unknown) > shown:
+        print(f"  ... and {len(unknown) - shown} more distinct subject(s) "
+              f"not shown. Classify the noisy ones and run this again - "
+              f"they are what is hiding the rest.")
     if unknown:
         print("\nIf any of those are listing/sale/inquiry notifications, add "
               "a pattern for them to EVENT_PATTERNS in listings.py - that is "
@@ -149,7 +164,7 @@ def run(cfg, conn, limit=None, resume=True):
         seen = {r[0] for r in conn.execute("SELECT message_id FROM mail_events")}
 
     imap = _connect(cfg)
-    added = skipped = unmatched = bought = 0
+    added = skipped = unmatched = bought = noted = 0
     try:
         nums = _search_all(imap, cfg["imap_folder"])
         if limit:
@@ -175,8 +190,17 @@ def run(cfg, conn, limit=None, resume=True):
                 # `apply_events` to replay it into.
                 if goodwill.is_from_goodwill(msg):
                     try:
-                        if goodwill.import_mail(conn, msg):
-                            bought += 1
+                        result = goodwill.import_mail(conn, msg)
+                        if result:
+                            # A classified mail is recorded either way,
+                            # but only some of them are a purchase.
+                            # Counting a return ticket as an order would
+                            # report sixty acquisitions from a mailbox
+                            # that had eleven.
+                            if result["listing_ids"]:
+                                bought += 1
+                            else:
+                                noted += 1
                             if mid:
                                 seen.add(mid)
                         else:
@@ -239,7 +263,7 @@ def run(cfg, conn, limit=None, resume=True):
         "SELECT state, COUNT(*) FROM listings GROUP BY state").fetchall())
     log.info("added %d event(s), %d ShopGoodwill order(s), skipped %d "
              "already seen, %d unmatched subjects",
-             added, bought, skipped, unmatched)
+             added + noted, bought, skipped, unmatched)
     log.info("listings now: %s", stats or "none")
     if unmatched:
         log.info("run `scan` to see the unmatched subject lines")
