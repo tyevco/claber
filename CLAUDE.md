@@ -554,7 +554,7 @@ hardware or a real Facebook account.
 | The desk portal, on her real data | **Verified: it is running against the real database.** Which immediately found what seeded data could not - the queue titles overlapped their prices, because her titles run past a hundred characters where the design was drawn against forty, and because a `<span>` ignores `text-overflow` however carefully it is set. The seed carries titles that long now. Still not checked on real data: the CSV import wizard, and Month-end against a full year. |
 | The desk portal | **Runs, and every screen has been looked at against seeded data in both themes.** Six screens at `/desk`, driven in headless Edge over CDP: the queue's confirm-and-print dialog, a bulk edit of three rows through `POST /api/inventory/bulk`, the search box keeping its caret, the CSV wizard through mapping and preview. That walk found five things the assertions did not - a figure that was really a `LIMIT`, a focus restore undone by a later render, a theme button that never changed its own label, an `era` column the endpoint had never sent, and a photo placeholder that lied about drafts with photographs. **Not** run against real data, and not on a real laptop over the tunnel - `tools/desk-preview.py` seeds a throwaway database and nothing here has met a real order. |
 | ShopGoodwill mail shapes | **Verified against 11 real messages** - every one parsed correctly. The two saved threads are Gmail print views holding 5 real wins and 6 real payment receipts, and `goodwill.parse` was run over all of them: every item number, title, price, order number, subtotal, tax, postage, order total, payment date and selling Goodwill came out right. Real shapes that turned out to matter and are now in the fixtures: **`<font color="#550055">` interleaved at arbitrary points** in 4 of the 5 wins - one opens mid-sentence just before the price and the seller line arrives with a closing tag stuck to its front; a **title ending in a full stop** before the template's `!` (`...Albums.!`); **double quotes inside titles** (`16.5X29.75" FRAME`, `"THE DAILY HERALD"`); and **postage of $0.01** as a free-postage sentinel, where the landed cost is still the order total. The fixtures had none of the font interleaving before this, so they were a tidier document than anything the parser will meet. |
-| **She deletes this mail** | **Verified, and now measured.** `backfill` says it reconstructs her history; a deleted receipt is not there to reconstruct from, and Gmail's `\All` mailbox excludes Trash - so preferring the archive still missed whatever she had cleared out. `survey_folders` walks Trash as well now, and `scan` prints the thirty-day purge deadline beside that count, because it is a rescue window rather than a second archive. **The first whole-mailbox `backfill` says how much that is worth: 104 messages in `\All` and 202 in the Bin - two thirds of everything was in Trash**, so walking only the archive would have found a third of what there was to find, and reported success. **The consequence upstream is the one that matters: the poller is the only durable capture there is.** Mail deleted before it is polled leaves no gap to detect - just a purchase with no cost basis and no row. What is still unmeasured is how *fast* she deletes, which is what decides whether anything is being lost today - and a Bin that holds two thirds of the corpus says the answer is not "rarely". |
+| **She deletes this mail** | **Reported, and it reframes the auction half.** `backfill` says it reconstructs her history; a deleted receipt is not there to reconstruct from, and Gmail's `\All` mailbox excludes Trash - so preferring the archive still missed whatever she had cleared out. `survey_folders` walks Trash as well now, and `scan` prints the thirty-day purge deadline beside that count, because it is a rescue window rather than a second archive. **The consequence upstream is the one that matters: the poller is the only durable capture there is.** Mail deleted before it is polled leaves no gap to detect - just a purchase with no cost basis and no row. How *fast* she deletes is still unmeasured, and it is what decides whether anything is being lost today. |
 | **The auction mail is not in the inbox** | **Verified, and it is the finding of the second survey.** A re-run of `mplabel scan` classified every subject - and the recognised list carried **no `goodwill_won` and no `goodwill_paid` at all**, out of 99 messages: 47 return tickets, 22 shipping labels, 9 refunds, 8 sales, 5 retracted bids, 4 purchases, 2 Buy Now confirmations, 1 inquiry, 1 payment reminder. The wins and payment receipts exist - eleven of them are the saved threads - so they had been archived out of INBOX. `backfill` walked one folder, so against that account it would have imported **zero acquisitions and zero costs** and reported success. It walks the `\All` special-use mailbox now, found by its flag rather than its name. |
 | The ShopGoodwill subject families | **Surveyed against the real mailbox, and the second run was clean** - every subject classified, nothing unrecognised. `mplabel scan` reported roughly sixty unrecognised ShopGoodwill subjects against the eleven this module was built for, in five families, all now classified: **Buy Now Confirmation** (a second way she acquires things, and invisible until the survey - the win mail's own seller message mentions BIN sales, so it was always there to be found), **Refund Issued** (nine of them), **Bid Has Been Retracted** (five), **Ticket ID # N Updated - <her words>** (thirty-odd: her own return correspondence - "broken item", "missing part", "not jade", "counterfeit"), and **Payment Reminder**. What is **ASSUMED** is every one of their *bodies*: only the subject lines have been seen, so the win and payment mails are still the only two shapes anything reads. |
 | Returns are a large part of how she buys | **Verified, and it reframes the refund gap.** 47 of the 99 messages in one inbox are her own return tickets - "broken item", "missing diamond", "not jade", "two of the bowls are counterfeit", "please cancel the order" - beside 9 refunds. Returning things is not an edge case in this business; it is roughly half the correspondence. So a refund's effect on `paid` is a first-class piece of the cost basis rather than a tidy-up. |
@@ -798,6 +798,29 @@ suggested category: the question "what would I like" and the question
 "what will you accept" have to stay separate, or the second is never
 asked.
 
+**`USPSParcel` is USPS Ground Advantage, and that is why matching on
+the code alone is not enough.** USPS renamed the service in 2023; eBay
+updated the *description* and kept the legacy code, so the name of the
+thing matches nothing and the old spelling is the live one. The
+preference list puts `USPSParcel` first - it is what a small parcel
+actually goes by, and `USPSPriority` was winning before the list met a
+real account - and falls back to matching the **description**, which is
+the half that tracks what a service is called.
+
+The real account offered eighty-odd services carrying
+`validForSellingFlow` on **none** of them, so "absent means usable" is
+load bearing rather than defensive: dropping the unflagged would have
+emptied the list and refused on an account offering eighty.
+
+**The ship-from address is hers and is not guessable.** A warehouse
+location needs the postcode, or the city and state; only the country is
+`25802: Input error`, naming no field. But `setup` refuses rather than
+defaulting for a reason that is not the API's: **eBay shows buyers a
+delivery estimate computed from that address**, so a placeholder is a
+wrong promise on every listing. `ebay_location_postcode` and friends,
+and the check happens before `--dry-run` answers - a dry run that
+reports a creation which would fail is not a dry run of anything.
+
 The response is **walked, not indexed** - `savedpage`'s rule, for the
 same reason: its documented shape was read from a page that would not
 load, so the key names are a guess and the structure is the only thing
@@ -807,6 +830,28 @@ And when the list cannot be fetched at all it falls back to the first
 preference and **says so** - asking beats assuming, stopping is worse
 than both, and naming which happened is what makes the next refusal
 legible.
+
+**The step that can refuse goes before the steps that create.** `ebay
+setup` made the three business policies and *then* asked where parcels
+are posted from - so on an account with no `ebay_location_postcode` it
+created three real policies on eBay, raised, and reported none of them.
+Their ids are minted by eBay and `setup` is the only place they are ever
+printed, so the account grew three policies nobody could name. Two
+halves to the fix, and the second is the general one: the location is
+settled first, **and** whatever has actually happened is printed on the
+way out of a failure as well as a success. `ensure_policies` fills a
+dict the caller owns for exactly that reason - returning a value is no
+use to a caller that never receives it. Same family as the dry run that
+committed and the fsync that failed on a label which printed: the work
+happened and the bookkeeping said otherwise.
+
+**A line that names a thing it did not apply.** `setup` printed
+`shipping: USPSParcel` beside a fulfillment policy shipping by
+`USPSPriority`, because it will not rewrite a policy that already exists
+- so on every run after the first the chosen service is one nothing
+used. It says which now. The sibling of the caveat that goes on being
+said: nothing broke, the sentence simply stopped being true on the
+second run.
 
 **A diagnostic that discards the diagnosis is worse than none.**
 `describe_errors` read `message or longMessage`, which looks like a

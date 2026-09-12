@@ -982,15 +982,23 @@ def fulfillment_body(cfg, service):
     return body
 
 
-def ensure_policies(cfg, dry_run=False, service=None):
+def ensure_policies(cfg, dry_run=False, service=None, out=None):
     """The three business policies, created only where none exists.
 
     Returns {kind: (policy_id, what_happened)}. Never edits one that is
     already there: a policy is how she actually ships and returns, and
     a tool that rewrites it because its own defaults differ is a tool
     that changes her terms without being asked.
+
+    `out` is the caller's dict, filled in as each policy is settled, so
+    that a refusal partway through does not take the ids of the ones
+    already created with it. That happened on a real account: the
+    address check ran *after* this, all three policies were created,
+    `ensure_location` raised, and the command said nothing about the
+    three real policies now sitting on her account. Returning a value
+    is no use to a caller that never receives it.
     """
-    out = {}
+    out = {} if out is None else out
     for kind, path in POLICY_KINDS.items():
         found = existing_policies(cfg, kind)
         if found:
@@ -1015,6 +1023,35 @@ def ensure_policies(cfg, dry_run=False, service=None):
     return out
 
 
+def location_address(cfg):
+    """Where parcels are posted from. Hers, so it cannot be invented.
+
+    A warehouse location needs **postcode and country**, or **city,
+    state and country** - and sending only the country is `25802: Input
+    error`, which says nothing about which field. That is the whole
+    reason this is its own function with its own refusal.
+
+    It is not cosmetic either: eBay shows buyers a delivery estimate
+    computed from it, so a placeholder would be a wrong promise on every
+    listing rather than a tidy default.
+    """
+    country = (cfg.get("ebay_location_country") or "US").strip().upper()
+    postcode = (cfg.get("ebay_location_postcode") or "").strip()
+    city = (cfg.get("ebay_location_city") or "").strip()
+    state = (cfg.get("ebay_location_state") or "").strip()
+
+    if postcode:
+        return {"postalCode": postcode, "country": country}
+    if city and state:
+        return {"city": city, "stateOrProvince": state, "country": country}
+    raise EbayConfigError(
+        "eBay needs to know where parcels are posted from, and it is not "
+        "a thing this\ncan guess: buyers are shown a delivery estimate "
+        "computed from it.\n\nSet `ebay_location_postcode`, or "
+        "`ebay_location_city` and `ebay_location_state`,\nin "
+        "/etc/mplabel.conf.")
+
+
 def ensure_location(cfg, key=None, dry_run=False):
     """The inventory location an offer has to name.
 
@@ -1026,13 +1063,16 @@ def ensure_location(cfg, key=None, dry_run=False):
     status, _payload = call(cfg, "GET", f"{LOCATION_PATH}/{key}")
     if status == 200:
         return key, "already there"
+    # Asked for before the dry run answers, so `--dry-run` refuses on a
+    # missing address rather than reporting a creation that would fail.
+    address = location_address(cfg)
     if dry_run:
-        return key, "would create"
+        return key, f"would create at {address}"
     body = {
-        "location": {"address": {"country": "US"}},
+        "location": {"address": address},
         "name": key,
-        # MARKETPLACE_SHIP_FROM, not STORE: nothing here is a shopfront
-        # and a store location asks for opening hours.
+        # WAREHOUSE, not STORE: nothing here is a shopfront, and a store
+        # location needs a full street address and opening hours.
         "locationTypes": ["WAREHOUSE"],
         "merchantLocationStatus": "ENABLED",
     }
@@ -1367,16 +1407,31 @@ SHIPPING_SERVICES_PATH = "/sell/metadata/v1/shipping/marketplace/{}/get_shipping
 # outright with "Please select a valid shipping service". Hardcoding one
 # is the same class of guess as hardcoding a category.
 PREFERRED_SHIPPING = (
-    "USPSGroundAdvantage",
-    "USPSFirstClass",
-    "USPSPriority",
+    # `USPSParcel` is eBay's code for **USPS Ground Advantage**, and that
+    # is the single most useful thing the real service list said. USPS
+    # renamed the service in 2023; eBay updated the *description* and
+    # kept the legacy code. So `USPSGroundAdvantage` - the name of the
+    # thing - matches nothing at all, which is what the first attempt
+    # sent and what "Please select a valid shipping service" meant.
+    #
+    # It is first because it is what a small parcel actually goes by.
+    # `USPSPriority` was winning before this list was checked against a
+    # real account, and Priority Mail is a more expensive service nobody
+    # asked for.
     "USPSParcel",
+    "USPSPriority",
     # Generic, and the reason the list has a tail: these have been valid
     # across marketplaces and eBay redesigns for years, so one of them
     # is a better answer than a refusal.
     "ShippingMethodStandard",
     "Other",
 )
+
+# Looked for in the *description* when no preferred code matched, because
+# the code and the name of the service can disagree - see above. eBay
+# renames a service by editing the description and leaving the code, so
+# the description is the half that tracks what the service is called.
+PREFERRED_DESCRIPTIONS = ("ground advantage", "standard shipping")
 
 
 def _service_rows(payload):
@@ -1449,6 +1504,14 @@ def choose_shipping_service(services, preferred=PREFERRED_SHIPPING):
     for code in preferred:
         if code in offered:
             return offered[code]
+    # Then by what the service is *called*. A code that has been renamed
+    # keeps its old spelling, so the description is the half that tracks
+    # reality - and this is what would have found Ground Advantage
+    # without anyone having to learn it is filed under `USPSParcel`.
+    for want in PREFERRED_DESCRIPTIONS:
+        for row in offered.values():
+            if want in (row.get("description") or "").lower():
+                return row
     # Nothing preferred; take the first domestic one eBay will accept
     # rather than refusing outright. Said out loud by the caller.
     return next(iter(offered.values()), None)
