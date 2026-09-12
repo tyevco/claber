@@ -11700,6 +11700,126 @@ def test_the_survey_names_the_folder_it_walked(monkeypatch, capsys):
     assert "goodwill_refund" in out
 
 
+def test_the_shipping_service_is_asked_for_not_written_down():
+    """`USPSGroundAdvantage` is a real service a real account refused.
+
+    eBay's vocabulary is per-marketplace and it moves - Ground Advantage
+    replaced First Class Package in 2023 - so the question "what would I
+    like" and the question "what will you accept" have to stay separate,
+    or the second one is never asked. Same shape as refusing to publish
+    on a suggested category.
+    """
+    from mplabel import ebay
+
+    offered = ebay._service_rows({"shippingServices": [
+        {"shippingServiceId": "USPSGroundAdvantage",
+         "validForSellingFlow": False},
+        {"shippingServiceId": "USPSPriority", "shippingCarrierCode": "USPS",
+         "description": "USPS Priority Mail", "validForSellingFlow": True},
+    ]})
+    chosen = ebay.choose_shipping_service(offered)
+    # The preferred one is offered and *refused*, so it is not chosen.
+    assert chosen["code"] == "USPSPriority"
+
+    body = ebay.fulfillment_body({"ebay_marketplace": "EBAY_US"}, chosen)
+    service = body["shippingOptions"][0]["shippingServices"][0]
+    assert service["shippingServiceCode"] == "USPSPriority"
+    assert service["shippingCarrierCode"] == "USPS"
+
+
+def test_an_international_service_is_never_the_domestic_one():
+    """A domestic shipping option carrying an international service is
+    a policy eBay refuses, and the refusal names the field rather than
+    the mistake."""
+    from mplabel import ebay
+
+    offered = ebay._service_rows({"shippingServices": [
+        {"shippingServiceId": "IntlPriority", "internationalService": True,
+         "validForSellingFlow": True},
+    ]})
+    assert ebay.choose_shipping_service(offered) is None
+    with pytest.raises(ebay.EbayError) as caught:
+        ebay.fulfillment_body({}, None)
+    assert "no usable domestic shipping service" in str(caught.value)
+
+
+def test_the_service_list_is_walked_not_indexed():
+    """The response shape was read from documentation that would not
+    load, so the key names are a guess and the shape is the only thing
+    worth trusting - the rule `savedpage` and the DYI importer follow.
+
+    An unknown `validForSellingFlow` is usable rather than dropped:
+    guessing a service away is a setup that refuses for no stated
+    reason."""
+    from mplabel import ebay
+
+    # A plausible alternative shaping, nested differently and using
+    # different key names throughout.
+    rows = ebay._service_rows({"marketplace": {"services": {"domestic": [
+        {"serviceCode": "ShippingMethodStandard",
+         "shippingCarrier": "USPS"},
+    ]}}})
+    assert [r["code"] for r in rows] == ["ShippingMethodStandard"]
+    assert rows[0]["carrier"] == "USPS"
+    assert rows[0]["usable"] is True
+
+
+def test_setup_falls_back_rather_than_stopping_when_eBay_will_not_list(
+        tmp_path, monkeypatch, capsys):
+    """Asking is better than assuming and stopping is worse than both.
+
+    Saying which of the two happened is what makes a later refusal
+    legible - otherwise "please select a valid shipping service" arrives
+    with no way to tell whether the list was consulted.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    ebay.save_tokens(cfg, {"environment": "sandbox", "access_token": "a",
+                           "refresh_token": "r", "scopes": list(ebay.SCOPES)})
+    monkeypatch.setattr(ebay, "opted_in_programs",
+                        lambda cfg_: [ebay.POLICY_PROGRAM])
+    monkeypatch.setattr(ebay, "shipping_services",
+                        lambda cfg_: (_ for _ in ()).throw(
+                            ebay.EbayError("403 nope")))
+    used = {}
+    monkeypatch.setattr(ebay, "ensure_policies",
+                        lambda cfg_, dry_run=False, service=None:
+                        used.update(service or {}) or
+                        {k: ("id", "created") for k in ebay.POLICY_KINDS})
+    monkeypatch.setattr(ebay, "ensure_location",
+                        lambda *a, **k: ("home", "created"))
+
+    code = cli.cmd_ebay(cfg, argparse.Namespace(
+        ebaycmd="setup", dry_run=False, opt_in=False, shipping_service=None))
+    assert code == 0
+    assert used["code"] == ebay.PREFERRED_SHIPPING[0]
+    assert "could not read the shipping services" in capsys.readouterr().err
+
+
+def test_setup_refuses_a_shipping_service_ebay_does_not_offer(tmp_path,
+                                                               monkeypatch,
+                                                               capsys):
+    """Better here than as eBay's own refusal, which names the XPATH of
+    the field rather than the fact that the code does not exist."""
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    ebay.save_tokens(cfg, {"environment": "sandbox", "access_token": "a",
+                           "refresh_token": "r", "scopes": list(ebay.SCOPES)})
+    monkeypatch.setattr(ebay, "opted_in_programs",
+                        lambda cfg_: [ebay.POLICY_PROGRAM])
+    monkeypatch.setattr(ebay, "shipping_services", lambda cfg_: [
+        {"code": "USPSPriority", "usable": True, "international": False}])
+
+    code = cli.cmd_ebay(cfg, argparse.Namespace(
+        ebaycmd="setup", dry_run=False, opt_in=False,
+        shipping_service="USPSGroundAdvantage"))
+    assert code == 78
+    err = capsys.readouterr().err
+    assert "does not offer" in err and "--shipping-service list" in err
 def test_the_archive_is_selected_with_its_name_quoted():
     """imaplib does not quote a mailbox name - `select` drops it into
     the command line as-is - so `EXAMINE [Gmail]/All Mail` arrives as

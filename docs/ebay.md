@@ -117,6 +117,36 @@ so a successful call is a request rather than a state change - `setup`
 says so and stops, instead of going on to create policies that would be
 refused for the next day.
 
+### The shipping service is asked for, not written down
+
+eBay's shipping vocabulary is **per-marketplace and it moves**.
+`USPSGroundAdvantage` replaced First Class Package in 2023, is a real
+service, and a real sandbox account refused it outright:
+
+```
+20403: Please select a valid shipping service.
+       (XPATH=DomesticItemShippingService[0].shippingService)
+```
+
+So `setup` reads
+`/sell/metadata/v1/shipping/marketplace/<id>/get_shipping_services` and
+picks the best service **that marketplace actually offers**, in a
+preference order. Two things it drops: anything eBay flags as not valid
+for the selling flow (it lists them and will not take them on a policy),
+and anything international - a domestic option carrying an international
+service is refused, and that refusal names the field rather than the
+mistake.
+
+```bash
+mplabel ebay setup --shipping-service list   # what this account can use
+mplabel ebay setup --shipping-service USPSPriority
+```
+
+If the metadata call itself fails, `setup` falls back to the first
+preference and **says it did**. Asking is better than assuming, stopping
+is worse than both, and saying which happened is what makes a later
+refusal legible.
+
 ### `ebay setup` needs a re-auth
 
 It creates the policies, so it needs the `sell.account` **write** scope.
