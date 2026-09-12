@@ -2295,6 +2295,43 @@ def cmd_ebay(cfg, args):
             print("\nnothing to fix")
         return 0
 
+    if args.ebaycmd == "setup":
+        try:
+            tokens = ebay_mod.load_tokens(cfg)
+            if not ebay_mod.has_scope(tokens, ebay_mod.ACCOUNT_SCOPE):
+                # Said here rather than letting eBay answer 403, which
+                # reads as the account lacking a permission rather than
+                # the token lacking a scope. `refresh_access` replays
+                # the granted scopes deliberately, so this cannot fix
+                # itself - it needs consent again.
+                print("ebay: this token was granted before `sell.account` "
+                      "was asked for, so it\ncannot create a policy. Run "
+                      "`mplabel ebay auth` again to re-consent.",
+                      file=sys.stderr)
+                return 78
+            policies = ebay_mod.ensure_policies(cfg, dry_run=args.dry_run)
+            key, what = ebay_mod.ensure_location(cfg, dry_run=args.dry_run)
+        except ebay_mod.EbayConfigError as exc:
+            print(f"ebay: {exc}", file=sys.stderr)
+            return 78
+        except ebay_mod.EbayError as exc:
+            print(f"ebay: {exc}", file=sys.stderr)
+            return 1
+
+        print(f"{'location':22}: {key}  ({what})")
+        for kind, (pid, said) in sorted(policies.items()):
+            print(f"{kind + ' policy':22}: {pid or '-'}  ({said})")
+        if args.dry_run:
+            print("\nnothing created. Drop --dry-run to apply.")
+            return 0
+        print("\nPut these in /etc/mplabel.conf, or an offer will be "
+              "refused:\n")
+        print(f"ebay_merchant_location  = {key}")
+        for kind in ("fulfillment", "payment", "return"):
+            print(f"ebay_{kind}_policy{'':{max(0, 9 - len(kind))}} = "
+                  f"{policies[kind][0] or ''}")
+        return 0
+
     if args.ebaycmd == "skus":
         try:
             skus = ebay_mod.existing_skus(cfg)
@@ -2349,6 +2386,209 @@ def cmd_ebay(cfg, args):
         print(f"the refresh token lasts {days} days. `ebay check` counts "
               f"it down; there is no second warning from eBay.")
     return 0
+
+
+def find_listing(conn, needle):
+    """One listing by id, inventory code or title. Refuses on ambiguity."""
+    needle = (needle or "").strip()
+    if not needle:
+        raise SystemExit("which listing?")
+    if needle.isdigit():
+        row = conn.execute("SELECT * FROM listings WHERE id=?",
+                           (int(needle),)).fetchone()
+        if row:
+            return row
+    row = conn.execute("SELECT * FROM listings WHERE inventory_code=?",
+                       (needle.upper(),)).fetchone()
+    if row:
+        return row
+    rows = conn.execute(
+        "SELECT * FROM listings WHERE title LIKE ? ORDER BY id",
+        (f"%{needle}%",)).fetchall()
+    if len(rows) == 1:
+        return rows[0]
+    if not rows:
+        raise SystemExit(f"no listing matches {needle!r}")
+    # Refused rather than guessed: pushing the wrong object to eBay puts
+    # someone else's thing on sale under this one's price.
+    raise SystemExit(
+        f"{len(rows)} listings match {needle!r} - name one by id:\n"
+        + "\n".join(f"  {r['id']}  {r['title']}" for r in rows[:10]))
+
+
+def cmd_ebay_push(cfg, conn, args):
+    """One listing to eBay: an inventory item, an offer, and maybe live.
+
+    The order of operations here is not arbitrary and not tidiness. eBay
+    fetches `imageUrls` from our tunnel itself, and `/ebay/photo/<sha>`
+    serves a digest **only** when it is attached to a listing with a row
+    in `ebay_offers` - so that row has to exist *before* the publish
+    call, or the allowlist 404s eBay's own fetch and the publish fails
+    naming the image field. The row is a precondition, not a record of
+    what happened.
+    """
+    from . import ebay as ebay_mod
+    from . import listings as listings_mod
+
+    # Publishing is refused on production by policy, and the refusal is
+    # here rather than in `publish_offer` so that a future caller cannot
+    # reach the mechanism without meeting the policy. Going live is a
+    # decision made in eBay's own UI, where the whole listing is visible.
+    if args.publish and ebay_mod.environment(cfg) == "production":
+        print("refusing: ebay_environment is production.\n"
+              "Publishing is a decision made in eBay's own UI, where you "
+              "can see the whole\nlisting. Drop --publish; the offer is "
+              "created and waiting in your drafts.", file=sys.stderr)
+        return 2
+
+    aspects = {}
+    for pair in args.aspect or []:
+        name, _, value = pair.partition("=")
+        if not name or not value:
+            raise SystemExit(f"--aspect wants NAME=VALUE, got {pair!r}")
+        aspects[name.strip()] = value.strip()
+
+    # Lazily minted, so a listing that has never had a label has no code
+    # and therefore no SKU.
+    ensure_inventory_codes(conn)
+    listing = find_listing(conn, args.listing)
+    row = dict(listing)
+
+    try:
+        sku = ebay_mod.sku_for(row.get("inventory_code"))
+        photos = listings_mod.photos_for(conn, row["id"])
+        digests = [p["sha256"] for p in photos if p.get("sha256")]
+        image_urls = [ebay_mod.photo_url(cfg, d) for d in digests] \
+            if digests else []
+
+        suggestions = ebay_mod.suggest_categories(cfg, row.get("title"))
+        category = args.category or (suggestions[0]["id"]
+                                     if suggestions else None)
+        needed = ebay_mod.required_aspects(cfg, category) if category else []
+    except ebay_mod.EbayConfigError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 78
+    except ebay_mod.EbayError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"{row['title']}")
+    sent_title = ebay_mod.ebay_title(row.get("title"))
+    if sent_title != (row.get("title") or "").strip():
+        # Said out loud because the desk shows her full title and eBay
+        # would show 80 characters of it, with nothing anywhere saying
+        # they differ.
+        print(f"  title      cut to {len(sent_title)} chars for eBay:")
+        print(f"             {sent_title}")
+    print(f"  sku        {sku}")
+    print(f"  price      "
+          + ("?" if row.get("price") is None else f"{row['price']:.2f}"))
+    print(f"  photos     {len(image_urls)}")
+    for url in image_urls:
+        print(f"             {url}")
+    if suggestions:
+        print("  eBay suggests:")
+        for i, guess in enumerate(suggestions):
+            mark = "*" if str(guess["id"]) == str(category) else " "
+            print(f"           {mark} {guess['id']}  {guess['path']}")
+    missing = [a for a in needed if a not in aspects]
+    if needed:
+        print(f"  required aspects for {category}: " + ", ".join(needed))
+        if missing:
+            print(f"             missing: " + ", ".join(missing))
+
+    if args.dry_run:
+        print("\n--- inventory item ---")
+        print(json.dumps(
+            ebay_mod.inventory_item_body(row, image_urls, aspects), indent=2))
+        if category:
+            print("--- offer ---")
+            print(json.dumps(
+                ebay_mod.offer_body(cfg, sku, row, category), indent=2))
+        print("\nnothing sent.")
+        return 0
+
+    if args.publish:
+        if not args.category:
+            # The suggestion is a guess from a title, and a wrong
+            # category is a listing nobody searching for the thing will
+            # ever see - a silent failure. Confirm it or do not publish.
+            print("\nrefusing to publish on a suggested category. Name one "
+                  "with --category;\nthe suggestions above are eBay's guess "
+                  "from the title.", file=sys.stderr)
+            return 2
+        if missing:
+            print("\nrefusing to publish without: " + ", ".join(missing)
+                  + "\neBay would refuse it too, one aspect per round trip.",
+                  file=sys.stderr)
+            return 2
+        if not image_urls:
+            print("\nrefusing to publish with no photographs: eBay requires "
+                  "at least one,\nand it fetches them from "
+                  f"{cfg.get('ebay_photo_base') or '(ebay_photo_base unset)'}.",
+                  file=sys.stderr)
+            return 2
+
+    try:
+        ebay_mod.put_inventory_item(
+            cfg, sku, ebay_mod.inventory_item_body(row, image_urls, aspects))
+        print(f"\ninventory item {sku} sent")
+
+        offer_id, what = ebay_mod.create_or_update_offer(
+            cfg, sku, ebay_mod.offer_body(cfg, sku, row, category))
+        print(f"offer {offer_id} {what} (unpublished)")
+
+        # Written before the publish call, deliberately: this row is
+        # what makes the photographs fetchable. See the docstring.
+        record_ebay_offer(conn, row["id"], sku, offer_id, state="draft")
+
+        if not args.publish:
+            print("\nnot published. Review it in eBay's UI, or re-run with "
+                  "--category and --publish on sandbox.")
+            return 0
+
+        # Only now, with the allowlist row in place, can eBay fetch the
+        # images - so this is the first moment the check means anything.
+        for url in image_urls:
+            ok, why = ebay_mod.photo_reachable(cfg, url)
+            if not ok:
+                print(f"\nrefusing to publish: {url}\n  {why}\n"
+                      "eBay fetches these itself and its refusal names the "
+                      "field, not the reason.", file=sys.stderr)
+                return 1
+        print(f"photos reachable ({len(image_urls)})")
+
+        item = ebay_mod.publish_offer(cfg, offer_id)
+        record_ebay_offer(conn, row["id"], sku, offer_id,
+                          state="published", ebay_item=item)
+        print(f"published: item {item}")
+    except ebay_mod.EbayConfigError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 78
+    except ebay_mod.EbayError as exc:
+        print(f"ebay: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def record_ebay_offer(conn, listing_row_id, sku, offer_id, state,
+                      ebay_item=None):
+    """Where this listing is on eBay. One row per listing, overwritten.
+
+    `ebay_item` is only set once something is published, and an update
+    must not blank it: a republish of an already-live listing passes
+    None for it while the listing id is still true.
+    """
+    conn.execute(
+        "INSERT INTO ebay_offers (listing_id, sku, offer_id, state, "
+        "pushed_at, ebay_item) VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(listing_id) DO UPDATE SET "
+        "sku=excluded.sku, offer_id=excluded.offer_id, "
+        "state=excluded.state, pushed_at=excluded.pushed_at, "
+        "ebay_item=COALESCE(excluded.ebay_item, ebay_offers.ebay_item)",
+        (listing_row_id, sku, offer_id, state,
+         datetime.now().isoformat(timespec="seconds"), ebay_item))
+    conn.commit()
 
 
 def cmd_ebay_pull(cfg, conn, args):
@@ -3030,6 +3270,26 @@ def _main():
                     help="every SKU already on the eBay account. Read-only, "
                          "and worth one call before the first push: eBay's "
                          "SKU uniqueness is permanent")
+    e = esub.add_parser("setup",
+                        help="create the three business policies and the "
+                             "inventory location an offer has to name. "
+                             "Needs the sell.account scope")
+    e.add_argument("--dry-run", action="store_true",
+                   help="say what it would create and create nothing")
+    e = esub.add_parser("push",
+                        help="one listing as an eBay inventory item and an "
+                             "unpublished offer")
+    e.add_argument("listing", help="listing id, inventory code, or title")
+    e.add_argument("--category", help="eBay category id. Required to "
+                                      "publish; a draft takes the suggestion")
+    e.add_argument("--aspect", action="append", metavar="NAME=VALUE",
+                   help="an item specific, repeatable. eBay refuses a "
+                        "publish without the required ones")
+    e.add_argument("--publish", action="store_true",
+                   help="make it a live listing. Sandbox only - refused "
+                        "when ebay_environment is production")
+    e.add_argument("--dry-run", action="store_true",
+                   help="print the exact JSON and send nothing")
     e = esub.add_parser("pull",
                         help="eBay orders as sales rows. --dry-run is "
                              "currently the only mode: it prints what it "
@@ -3119,7 +3379,8 @@ def _main():
         from . import printd as printd_mod
         printd_mod.serve(cfg, bind=args.bind, port=args.port)
         return
-    if args.cmd == "ebay" and args.ebaycmd in ("auth", "check", "skus"):
+    if args.cmd == "ebay" and args.ebaycmd in ("auth", "check", "skus",
+                                               "setup"):
         # Same reasoning as probe and selftest: checking a credential
         # must not need the database. The subcommands that read or write
         # listings fall through to the block below.
@@ -3190,8 +3451,10 @@ def _main():
     elif args.cmd == "reconcile":
         cmd_reconcile(cfg, conn, args)
     elif args.cmd == "ebay":
-        # `auth` and `check` were handled above connect_db; `pull` needs
-        # the database, to say which orders are already recorded.
+        # `auth`, `check`, `skus` and `setup` were handled above
+        # connect_db; these two need the database.
+        if args.ebaycmd == "push":
+            return cmd_ebay_push(cfg, conn, args)
         return cmd_ebay_pull(cfg, conn, args)
     elif args.cmd == "notify":
         return cmd_notify(cfg, conn, args)
