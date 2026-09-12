@@ -11294,7 +11294,11 @@ def test_ebay_check_passes_on_an_install_that_cannot_publish_yet(tmp_path,
 
     rows = ebay.check(cfg)
     unset = [r for r in rows if r[2] and not r[3]]
-    assert len(unset) == 4, "the policies should be notes, not faults"
+    # Five now: the location, the three policies and the photo base -
+    # which is the one publish actually stops on, and was missing from
+    # this report while the other four were in it.
+    assert len(unset) == 5, "the publish-time keys are notes, not faults"
+    assert "photo base" in [label for label, _v, _p, _b in unset]
     assert not [r for r in rows if r[2] and r[3]], \
         "nothing about this install is actually broken"
     assert cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="check")) == 0
@@ -11463,7 +11467,8 @@ def test_ebay_push_will_not_publish_on_a_suggested_category(db, tmp_path,
     monkeypatch.setattr(ebay, "suggest_categories", lambda cfg_, title,
                         limit=3: [{"id": "20081", "name": "Vases",
                                    "path": "Antiques > Vases"}])
-    monkeypatch.setattr(ebay, "required_aspects", lambda cfg_, cid: [])
+    monkeypatch.setattr(ebay, "required_aspects",
+                        lambda cfg_, cid, seen=None: [])
 
     assert cli.cmd_ebay_push(cfg, db, _push_args(publish=True)) == 2
     assert "suggested category" in capsys.readouterr().err
@@ -11481,7 +11486,8 @@ def test_ebay_push_will_not_publish_without_the_required_aspects(db, tmp_path,
     _pushable(db, tmp_path)
     monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [])
     monkeypatch.setattr(ebay, "required_aspects",
-                        lambda cfg_, cid: ["Type", "Brand"])
+                        lambda cfg_, cid, seen=None:
+                        ["Type", "Brand"])
 
     code = cli.cmd_ebay_push(
         db and cfg, db, _push_args(publish=True, category="20081",
@@ -12697,3 +12703,212 @@ def test_push_says_when_the_named_category_is_not_a_suggestion(
         listing="1", category="13905", aspect=[], publish=False,
         dry_run=False)) == 0
     assert "13905 is not one of these" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Four things a real sandbox session left open, closed together.
+# --------------------------------------------------------------------------
+
+
+def test_push_refuses_to_create_an_offer_on_a_suggested_category(
+        db, tmp_path, capsys, monkeypatch):
+    """The step that can refuse goes before the steps that create.
+
+    eBay's own first suggestion was plainly wrong on three of twelve
+    real titles - belts for ankle boots, heels for sandals - and twelve
+    offers were nevertheless created carrying it, because `category`
+    fell back to `suggestions[0]`. Publishing happens in eBay's UI by
+    design and that route never asks again, so the guess would have gone
+    live unchallenged.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [
+        {"id": "20081", "name": "Vases", "path": "Antiques > Vases"}])
+    monkeypatch.setattr(ebay, "required_aspects",
+                        lambda *a, **k: ["Brand"])
+    sent = []
+    monkeypatch.setattr(ebay, "put_inventory_item",
+                        lambda *a, **k: sent.append("item"))
+    monkeypatch.setattr(ebay, "create_or_update_offer",
+                        lambda *a, **k: sent.append("offer"))
+
+    code = cli.cmd_ebay_push(db and cfg, db, argparse.Namespace(
+        listing="1", category=None, aspect=[], publish=False, dry_run=False))
+    assert code == 2
+    assert sent == [], "nothing may be created on a guess"
+    captured = capsys.readouterr()
+    # The refusal hands back the command that would work, aspects and all.
+    assert "--category 20081" in captured.err
+    assert "--aspect 'Brand'" in captured.err
+    assert db.execute("SELECT COUNT(*) FROM ebay_offers").fetchone()[0] == 0
+    # And the suggestion is not starred: the star means "being sent",
+    # and this run sends nothing - saying otherwise contradicts the
+    # refusal printed under it.
+    assert "* 20081" not in captured.out, captured.out
+
+
+def test_a_dry_run_still_works_without_a_category(db, tmp_path, capsys,
+                                                   monkeypatch):
+    """It sends nothing, so it has nothing to refuse.
+
+    Refusing there too would leave no way to see the suggestions and the
+    request together, which is exactly what a person needs in order to
+    choose the category the refusal is asking for.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r",
+               ebay_photo_base="https://pi.example.com")
+    _pushable(db, tmp_path)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [
+        {"id": "20081", "name": "Vases", "path": "Antiques > Vases"}])
+    monkeypatch.setattr(ebay, "required_aspects", lambda *a, **k: [])
+
+    assert cli.cmd_ebay_push(db and cfg, db, argparse.Namespace(
+        listing="1", category=None, aspect=[], publish=False,
+        dry_run=True)) == 0
+    out = capsys.readouterr().out
+    assert "--- offer ---" in out and "nothing sent" in out
+
+
+def test_push_refuses_a_listing_that_is_already_sold(db, tmp_path, capsys,
+                                                      monkeypatch):
+    """Nothing looked at the state, so this was accepted in silence.
+
+    An offer for a sold thing is a listing she has to take down - or one
+    somebody buys. `acquired` and `draft` stay pushable: those are
+    things she owns that nobody can buy yet, which is what a new eBay
+    listing is for.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    db.execute("UPDATE listings SET state='sold'")
+    db.commit()
+    called = []
+    monkeypatch.setattr(ebay, "suggest_categories",
+                        lambda *a, **k: called.append("suggest") or [])
+
+    code = cli.cmd_ebay_push(db and cfg, db, argparse.Namespace(
+        listing="1", category="20081", aspect=[], publish=False,
+        dry_run=False))
+    assert code == 2
+    assert called == [], "refused before it asks eBay anything"
+    assert "already sold" in capsys.readouterr().err
+
+    for state in ("acquired", "draft", "active"):
+        db.execute("UPDATE listings SET state=?", (state,))
+        db.commit()
+        monkeypatch.setattr(ebay, "required_aspects", lambda *a, **k: [])
+        monkeypatch.setattr(ebay, "put_inventory_item", lambda *a, **k: None)
+        monkeypatch.setattr(ebay, "create_or_update_offer",
+                            lambda *a, **k: ("o1", "created"))
+        assert cli.cmd_ebay_push(db and cfg, db, argparse.Namespace(
+            listing="1", category="20081", aspect=[], publish=False,
+            dry_run=False)) == 0, state
+
+
+def test_the_aspect_list_is_walked_not_indexed():
+    """`payload["aspects"]` was the one key name this module trusted.
+
+    Against this repo's own rule, and the failure is silent in the worst
+    direction: a list we cannot find returns *no required aspects*,
+    which reads exactly like a category that has none - and the publish
+    then fails at eBay naming one aspect per round trip, the precise
+    thing asking early exists to prevent. Three of twelve real
+    categories came back empty.
+    """
+    from mplabel import ebay
+
+    documented = {"aspects": [
+        {"localizedAspectName": "Brand",
+         "aspectConstraint": {"aspectRequired": True},
+         "aspectValues": [{"localizedValue": "Nike"}]},
+        {"localizedAspectName": "Colour",
+         "aspectConstraint": {"aspectRequired": False}}]}
+    rows = ebay._aspect_rows(documented)
+    assert [r["name"] for r in rows] == ["Brand", "Colour"]
+    assert [r["required"] for r in rows] == [True, False]
+
+    # One level deeper, under another key, with the flag hoisted out of
+    # the constraint - the two obvious ways for the shape to move.
+    moved = {"category": {"categoryAspects": [
+        {"aspectName": "Type", "aspectRequired": True}]}}
+    assert ebay._aspect_rows(moved) == [{"name": "Type", "required": True}]
+
+    # An aspect *value* is not an aspect, however named.
+    assert ebay._aspect_rows(
+        {"aspectValues": [{"localizedValue": "Brass"}]}) == []
+
+
+def test_an_empty_aspect_list_says_which_kind_of_empty(db, tmp_path, capsys,
+                                                        monkeypatch):
+    """"None required" and "we could not read it" are different answers.
+
+    Both printed nothing, and only one of them means the publish is
+    safe to attempt.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [])
+
+    def _aspects(cfg_, cid, seen=None):
+        if seen is not None:
+            seen["total"] = 24
+        return []
+
+    monkeypatch.setattr(ebay, "required_aspects", _aspects)
+    monkeypatch.setattr(ebay, "put_inventory_item", lambda *a, **k: None)
+    monkeypatch.setattr(ebay, "create_or_update_offer",
+                        lambda *a, **k: ("o1", "created"))
+    args = argparse.Namespace(listing="1", category="2986", aspect=[],
+                              publish=False, dry_run=False)
+    assert cli.cmd_ebay_push(db and cfg, db, args) == 0
+    assert "none of the 24 eBay listed" in capsys.readouterr().out
+
+    # Nothing found at all is the other answer, and reads differently.
+    monkeypatch.setattr(ebay, "required_aspects",
+                        lambda cfg_, cid, seen=None: [])
+    assert cli.cmd_ebay_push(db and cfg, db, args) == 0
+    assert "no aspects at all" in capsys.readouterr().out
+
+
+def test_ebay_check_reports_the_photo_base(tmp_path):
+    """The fifth publish-time key, and the only one publish stops on.
+
+    eBay requires an image to publish and fetches it from this host
+    itself, so every `--publish` refuses without it - and `check` listed
+    the location and the three policies while saying nothing about this.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    ebay.save_tokens(cfg, {"environment": "sandbox", "access_token": "a",
+                           "refresh_token": "r", "scopes": list(ebay.SCOPES)})
+
+    def _row(conf):
+        rows = ebay.check(dict(cfg, **conf))
+        return next(r for r in rows if r[0] == "photo base")
+
+    label, value, problem, blocking = _row({})
+    assert value == "(unset)" and problem and not blocking
+
+    # http is refused here rather than by eBay, whose complaint names
+    # the field instead of the scheme.
+    _l, _v, problem, blocking = _row({"ebay_photo_base": "http://pi.example"})
+    assert "https" in problem and not blocking
+
+    _l, value, problem, _b = _row(
+        {"ebay_photo_base": "https://pi.example.ts.net"})
+    assert value == "https://pi.example.ts.net" and problem is None
