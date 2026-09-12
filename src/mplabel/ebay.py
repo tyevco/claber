@@ -900,22 +900,14 @@ POLICY_KINDS = {
 # these describe how she already ships, and anything cleverer is a
 # decision eBay's own UI is better at presenting.
 DEFAULT_POLICIES = {
+    # No shipping service here on purpose - see `fulfillment_body`. The
+    # code eBay will accept is per-marketplace and moves, so it is asked
+    # for rather than written down.
     "fulfillment": {
         "name": "mplabel ground",
         "marketplaceId": "EBAY_US",
         "categoryTypes": [{"name": "ALL_EXCLUDING_MOTORS_VEHICLES"}],
         "handlingTime": {"unit": "DAY", "value": 3},
-        "shippingOptions": [{
-            "optionType": "DOMESTIC",
-            "costType": "FLAT_RATE",
-            "shippingServices": [{
-                "sortOrder": 1,
-                "shippingCarrierCode": "USPS",
-                "shippingServiceCode": "USPSGroundAdvantage",
-                "freeShipping": True,
-                "buyerResponsibleForShipping": False,
-            }],
-        }],
     },
     "payment": {
         "name": "mplabel managed",
@@ -961,7 +953,36 @@ def existing_policies(cfg, kind):
     return []
 
 
-def ensure_policies(cfg, dry_run=False):
+def fulfillment_body(cfg, service):
+    """The fulfillment policy, around a service eBay said it accepts.
+
+    `service` comes from `choose_shipping_service`, which picks from
+    what the marketplace actually offers. Passing a code we merely like
+    is how the first real attempt at this failed: "Please select a valid
+    shipping service", on `USPSGroundAdvantage`, which is a real service
+    and simply not one that account would take.
+    """
+    if not service or not service.get("code"):
+        raise EbayError(
+            "no usable domestic shipping service to build a policy "
+            "around - eBay offered none this marketplace accepts.")
+    body = dict(DEFAULT_POLICIES["fulfillment"],
+                marketplaceId=cfg.get("ebay_marketplace") or "EBAY_US")
+    body["shippingOptions"] = [{
+        "optionType": "DOMESTIC",
+        "costType": "FLAT_RATE",
+        "shippingServices": [{
+            "sortOrder": 1,
+            "shippingCarrierCode": service.get("carrier") or "USPS",
+            "shippingServiceCode": service["code"],
+            "freeShipping": True,
+            "buyerResponsibleForShipping": False,
+        }],
+    }]
+    return body
+
+
+def ensure_policies(cfg, dry_run=False, service=None):
     """The three business policies, created only where none exists.
 
     Returns {kind: (policy_id, what_happened)}. Never edits one that is
@@ -980,8 +1001,11 @@ def ensure_policies(cfg, dry_run=False):
         if dry_run:
             out[kind] = (None, f"would create {DEFAULT_POLICIES[kind]['name']!r}")
             continue
-        body = dict(DEFAULT_POLICIES[kind],
-                    marketplaceId=cfg.get("ebay_marketplace") or "EBAY_US")
+        if kind == "fulfillment":
+            body = fulfillment_body(cfg, service)
+        else:
+            body = dict(DEFAULT_POLICIES[kind],
+                        marketplaceId=cfg.get("ebay_marketplace") or "EBAY_US")
         status, payload = call(cfg, "POST", path, body)
         if status not in (200, 201):
             raise EbayError(f"eBay refused to create the {kind} policy "
@@ -1330,3 +1354,101 @@ def opt_in_to_program(cfg, program=POLICY_PROGRAM):
         raise EbayError(f"eBay refused the opt-in ({status}): "
                         + describe_errors(payload))
     return program
+
+
+# ------------------------------------------------- what eBay will ship
+
+SHIPPING_SERVICES_PATH = "/sell/metadata/v1/shipping/marketplace/{}/get_shipping_services"
+
+# What we would *like*, best first. Not what we send: the first of these
+# that the marketplace actually offers is what gets used, because eBay's
+# service vocabulary is per-marketplace and it moves - `USPSGroundAdvantage`
+# replaced First Class Package in 2023, and a sandbox account refused it
+# outright with "Please select a valid shipping service". Hardcoding one
+# is the same class of guess as hardcoding a category.
+PREFERRED_SHIPPING = (
+    "USPSGroundAdvantage",
+    "USPSFirstClass",
+    "USPSPriority",
+    "USPSParcel",
+    # Generic, and the reason the list has a tail: these have been valid
+    # across marketplaces and eBay redesigns for years, so one of them
+    # is a better answer than a refusal.
+    "ShippingMethodStandard",
+    "Other",
+)
+
+
+def _service_rows(payload):
+    """Every shipping service in the reply, however it is shaped.
+
+    Walked rather than indexed, for the reason `savedpage` and the DYI
+    importer are: this response has been read from documentation that
+    would not load, so the exact key names are a guess and the shape is
+    the only thing worth trusting. A parser that follows a fixed path
+    into an undocumented payload fails silently the day it changes.
+    """
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            code = next((node.get(k) for k in
+                         ("shippingServiceId", "shippingServiceCode",
+                          "serviceCode", "shippingService")
+                         if isinstance(node.get(k), str)), None)
+            if code:
+                # `validForSellingFlow` false means eBay lists it but
+                # will not accept it on a policy - which is exactly the
+                # refusal we are trying to avoid. Absent means unknown,
+                # and unknown is treated as usable rather than dropped.
+                usable = True
+                for key in ("validForSellingFlow", "availableForSellingFlow"):
+                    if key in node:
+                        usable = bool(node[key])
+                        break
+                found.append({
+                    "code": code,
+                    "carrier": node.get("shippingCarrierCode")
+                    or node.get("shippingCarrier"),
+                    "description": node.get("description"),
+                    "international": bool(node.get("internationalService")),
+                    "usable": usable,
+                })
+                return
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+    return found
+
+
+def shipping_services(cfg):
+    """Which shipping services this marketplace will actually accept."""
+    marketplace = cfg.get("ebay_marketplace") or "EBAY_US"
+    status, payload = call(
+        cfg, "GET", SHIPPING_SERVICES_PATH.format(marketplace))
+    if status != 200:
+        raise EbayError(f"eBay refused the shipping service list ({status}): "
+                        + describe_errors(payload))
+    return _service_rows(payload)
+
+
+def choose_shipping_service(services, preferred=PREFERRED_SHIPPING):
+    """The best domestic service eBay will take, or None.
+
+    Preference order over what is *offered*, never a fixed answer. eBay
+    renames services and the sandbox lags production, so the question
+    "what would I like" and the question "what will you accept" have to
+    stay separate or the second one is never asked.
+    """
+    offered = {s["code"]: s for s in services
+               if s.get("usable") and not s.get("international")}
+    for code in preferred:
+        if code in offered:
+            return offered[code]
+    # Nothing preferred; take the first domestic one eBay will accept
+    # rather than refusing outright. Said out loud by the caller.
+    return next(iter(offered.values()), None)

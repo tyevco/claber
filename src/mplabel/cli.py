@@ -2332,12 +2332,62 @@ def cmd_ebay(cfg, args):
                     return 78
                 ebay_mod.opt_in_to_program(cfg)
                 print(f"asked eBay to join {ebay_mod.POLICY_PROGRAM}.\n"
-                      f"This can take up to 24 hours to take effect. Run "
-                      f"`mplabel ebay setup` again\nonce it has, to create "
-                      f"the policies.")
+                      f"eBay documents up to 24 hours, but it has been "
+                      f"immediate in practice - run\n`mplabel ebay setup` "
+                      f"again now and see.")
                 return 0
 
-            policies = ebay_mod.ensure_policies(cfg, dry_run=args.dry_run)
+            # Which service, asked rather than assumed. eBay's vocabulary
+            # is per-marketplace and it moves: the first real attempt at
+            # this sent `USPSGroundAdvantage`, which is a real service
+            # and not one that account would take.
+            wanted = (args.shipping_service or "").strip()
+            try:
+                offered = ebay_mod.shipping_services(cfg)
+            except ebay_mod.EbayError as exc:
+                # Not fatal. Falling back to the preference list is worse
+                # than asking and better than stopping, and saying which
+                # happened is what makes a later refusal legible.
+                print(f"could not read the shipping services ({exc}).\n"
+                      f"Falling back to {ebay_mod.PREFERRED_SHIPPING[0]}, "
+                      f"which eBay may refuse.", file=sys.stderr)
+                offered = [{"code": ebay_mod.PREFERRED_SHIPPING[0],
+                            "carrier": "USPS", "usable": True,
+                            "international": False}]
+
+            if wanted.lower() == "list":
+                for row in sorted(offered, key=lambda r: r["code"]):
+                    if row.get("international"):
+                        continue
+                    mark = " " if row.get("usable") else "x"
+                    print(f" {mark} {row['code']:<28} "
+                          f"{row.get('description') or ''}")
+                print("\n'x' means eBay lists it but will not accept it on "
+                      "a policy.\nNothing created.")
+                return 0
+
+            if wanted:
+                service = next((r for r in offered if r["code"] == wanted),
+                               None)
+                if service is None:
+                    print(f"eBay does not offer {wanted!r} on "
+                          f"{cfg.get('ebay_marketplace') or 'EBAY_US'}.\n"
+                          f"`mplabel ebay setup --shipping-service list` "
+                          f"shows what it does.", file=sys.stderr)
+                    return 78
+            else:
+                service = ebay_mod.choose_shipping_service(offered)
+                if service is None:
+                    print("eBay offered no domestic shipping service this "
+                          "account can use.\n`--shipping-service list` "
+                          "shows what it said.", file=sys.stderr)
+                    return 78
+            print(f"{'shipping':22}: {service['code']}"
+                  + (f"  ({service.get('description')})"
+                     if service.get("description") else ""))
+
+            policies = ebay_mod.ensure_policies(cfg, dry_run=args.dry_run,
+                                                service=service)
             key, what = ebay_mod.ensure_location(cfg, dry_run=args.dry_run)
         except ebay_mod.EbayConfigError as exc:
             print(f"ebay: {exc}", file=sys.stderr)
@@ -3309,6 +3359,11 @@ def _main():
                         "account-level change affecting every listing, so "
                         "it is never done without this flag - and eBay can "
                         "take 24 hours to process it")
+    e.add_argument("--shipping-service", metavar="CODE",
+                   help="the shipping service the fulfillment policy uses. "
+                        "Without it, the best one eBay says this "
+                        "marketplace accepts. `--shipping-service list` "
+                        "prints them all and creates nothing")
     e = esub.add_parser("push",
                         help="one listing as an eBay inventory item and an "
                              "unpublished offer")

@@ -116,7 +116,7 @@ run against a real database.
 | `ebay check` | config, tokens, and how long the refresh token has left. Changes nothing, sends nothing, exits **78** if anything needs attention. No DB |
 | `ebay pull [--since D] [--limit N] --dry-run` | eBay orders as `sales` rows. `--dry-run` is the **only** mode: it prints what it would record and writes nothing, and refuses with exit **2** without the flag |
 | `ebay skus` | every SKU already on the eBay account. Read only, and worth one call before the first push - eBay's SKU uniqueness is permanent. No DB |
-| `ebay setup [--dry-run] [--opt-in]` | create the three business policies and the inventory location an offer has to name. Checks the `SELLING_POLICY_MANAGEMENT` programme **first**, because eBay's refusal for an account that never joined is `20403: Invalid .`. Needs the `sell.account` **write** scope, so a token minted before that existed has to re-consent. Will not rewrite a policy that is already there. No DB |
+| `ebay setup [--dry-run] [--opt-in] [--shipping-service CODE\|list]` | create the three business policies and the inventory location an offer has to name. Checks the `SELLING_POLICY_MANAGEMENT` programme **first**, because eBay's refusal for an account that never joined is `20403: Invalid .`. Needs the `sell.account` **write** scope, so a token minted before that existed has to re-consent. Will not rewrite a policy that is already there. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -783,6 +783,28 @@ is one - a mid-word cut reads as a corrupted listing rather than a long
 one - and `push` prints what it actually sent, because the desk shows
 her full title and eBay shows 80 characters of it with nothing else
 anywhere saying they differ.
+
+**eBay's shipping vocabulary is per-marketplace and it moves, so it is
+asked for rather than written down.** `USPSGroundAdvantage` replaced
+First Class Package in 2023, is a real service, and a real sandbox
+account refused it: `20403: Please select a valid shipping service
+(XPATH=DomesticItemShippingService[0].shippingService)`. `ebay setup`
+reads the Metadata API's service list and picks the best one *that
+marketplace offers*, dropping anything flagged not valid for the selling
+flow and anything international. Same shape as refusing to publish on a
+suggested category: the question "what would I like" and the question
+"what will you accept" have to stay separate, or the second is never
+asked.
+
+The response is **walked, not indexed** - `savedpage`'s rule, for the
+same reason: its documented shape was read from a page that would not
+load, so the key names are a guess and the structure is the only thing
+worth trusting. An absent `validForSellingFlow` counts as usable, since
+guessing a service away is a setup that refuses for no stated reason.
+And when the list cannot be fetched at all it falls back to the first
+preference and **says so** - asking beats assuming, stopping is worse
+than both, and naming which happened is what makes the next refusal
+legible.
 
 **A diagnostic that discards the diagnosis is worse than none.**
 `describe_errors` read `message or longMessage`, which looks like a
