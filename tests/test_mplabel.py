@@ -11840,7 +11840,123 @@ def test_the_survey_says_when_it_is_off_scale(monkeypatch, capsys):
 
     backfill.scan({"imap_folder": "INBOX"})
     out = capsys.readouterr().out
-    assert "and 15 more distinct subject(s) not shown" in out
+    assert "and 28 more distinct subject(s)" in out
+    # And it says how much traffic is behind what it could not show, not
+    # just how many lines: 25 subjects hiding one message each and 25
+    # hiding forty are different readings.
+    assert "28 message(s) in total" in out
+
+
+def test_the_survey_says_who_sent_each_unrecognised_subject(monkeypatch,
+                                                            capsys):
+    """A subject on its own stopped being enough at three senders.
+
+    A real scan came back with thirty-one `... has been listed`
+    notifications and no way to say whether they were Facebook's
+    `listed` event - a pattern that has sat in EVENT_PATTERNS and never
+    matched anything - or eBay's. The two read almost identically and
+    want opposite handling, so where the pattern goes depends on an
+    answer the report did not carry."""
+    from mplabel import backfill
+
+    msgs = [
+        email.message_from_string(
+            "From: eBay <ebay@ebay.com>\n"
+            "Subject: \U0001f3f7 Vintage teapot has been listed\n\n"),
+        email.message_from_string(
+            "From: Facebook <noreply@marketplace.facebook.com>\n"
+            "Subject: Something nobody has a pattern for\n\n"),
+        email.message_from_string(
+            "From: ShopGoodwill <no-reply@shopgoodwill.com>\n"
+            "Subject: Some auction wording nobody has seen\n\n"),
+    ]
+    monkeypatch.setattr(backfill, "_connect", lambda cfg: _QuietIMAP())
+    monkeypatch.setattr(backfill, "_search_all",
+                        lambda imap, folder, since=None, **kw: [b"1"] * 3)
+    monkeypatch.setattr(backfill, "_headers_only", lambda imap, nums: msgs)
+
+    backfill.scan({"imap_folder": "INBOX"})
+    out = capsys.readouterr().out
+    assert "-- ebay --" in out
+    assert "-- facebook --" in out
+    assert "-- shopgoodwill --" in out
+    # Each line sits under the sender that actually sent it.
+    ebay_block = out.split("-- ebay --")[1]
+    assert "has been listed" in ebay_block.split("--")[0]
+
+
+def test_the_survey_asks_only_the_classifier_that_owns_the_sender():
+    """The three are separate on purpose - one classifier answering
+    "sold" to a ShopGoodwill subject puts one of her own purchases into
+    the sell-through numerator. Until the survey fetched FROM it had to
+    try all three and take the first answer, which is that merge one
+    layer out."""
+    from mplabel import backfill
+
+    # eBay's rule is "shipping label" in the subject. Asked about a
+    # Facebook message, it must not be the one that answers.
+    fb = "Shipping label for your Marketplace order"
+    assert backfill.classify_for("ebay", fb) == "ebay_shipping_label"
+    assert backfill.classify_for("facebook", fb) == "shipping_label"
+    # A ShopGoodwill subject is never offered to Facebook's patterns.
+    won = "ShopGoodwill.com - You Were Awarded The Winning Bid!"
+    assert backfill.classify_for("shopgoodwill", won) == "goodwill_won"
+    assert backfill.classify_for("facebook", won) is None
+    # An unknown sender still tries all three: a wrong guess there is a
+    # line in a report rather than a row in a table.
+    assert backfill.classify_for("?", won) == "goodwill_won"
+
+
+def test_the_survey_names_the_sender_by_domain():
+    """The same predicates the importers gate on, not a fourth reading
+    of the From header - a survey that disagrees with the poller about
+    who sent something is worse than one that cannot tell."""
+    from mplabel import backfill
+
+    def msg(frm):
+        return email.message_from_string(f"From: X <{frm}>\nSubject: s\n\n")
+
+    assert backfill.sender_of(msg("noreply@marketplace.facebook.com")) == \
+        "facebook"
+    assert backfill.sender_of(msg("no-reply@txemail.shopgoodwill.com")) == \
+        "shopgoodwill"
+    assert backfill.sender_of(msg("members@reply.ebay.com")) == "ebay"
+    # A lookalike is not a sender, here as everywhere else.
+    assert backfill.sender_of(msg("x@ebay.com.example.net")) == "?"
+
+
+def test_the_survey_folds_a_truncated_title_out_of_a_subject():
+    """The third variable part, and the one eBay uses for nearly
+    everything: it cuts the item name and ends it with an ellipsis. So
+    `Vintage...`, `Vintage #...`, `Antique...` and `Andrea by Sadek...`
+    are four lines of a histogram describing one notification - a real
+    scan spent eight of its twenty-five rows on that single family and
+    reported fifty-four other subjects it could not show."""
+    from mplabel import backfill
+
+    listed = [
+        "\U0001f3f7\ufe0f Vintage... has been listed",
+        "\U0001f3f7\ufe0f Vintage #... has been listed",
+        "\U0001f3f7\ufe0f Antique... has been listed",
+        "\U0001f3f7\ufe0f Andrea by Sadek... has been listed",
+    ]
+    folded = {backfill.generic_subject(s) for s in listed}
+    assert len(folded) == 1, folded
+    # The emoji survives - it is half of what identifies the family.
+    assert folded.pop().startswith("\U0001f3f7")
+
+    # A label before a colon keeps its own words, or the list stops
+    # being worth reading: these are three different notifications.
+    apart = {backfill.generic_subject(s) for s in (
+        "\U0001f4e9 You have a new offer: $14.50 for Vintage Chalkware Ma...",
+        "\U0001f69a Order update: Rare Collectible Antique ...",
+        "\U0001f4e6ORDER DELIVERED: Rare Collectible Ant...",
+    )}
+    assert len(apart) == 3, apart
+
+    # And a subject with no truncation in it is left alone.
+    plain = "Shipping label for your Marketplace order"
+    assert backfill.generic_subject(plain) == plain
 
 
 def test_the_survey_folds_an_id_out_of_a_machine_subject(monkeypatch, capsys):
