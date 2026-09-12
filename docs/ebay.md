@@ -16,6 +16,8 @@ The plumbing, and a survey of the orders.
 mplabel ebay auth            # prints the consent URL, then takes the code
 mplabel ebay check           # config and tokens; changes nothing
 mplabel ebay skus            # SKUs already on the account; read-only
+mplabel ebay setup           # the three policies and the location
+mplabel ebay push <listing>  # an inventory item and an unpublished offer
 mplabel ebay pull --dry-run  # the orders it would record; writes nothing
 ```
 
@@ -42,6 +44,65 @@ this repo has fallen into before in another form:
   reported the day after it was due.
 - **`message_id` is `ebay:<orderId>`, never NULL.** Six call sites on
   the print path key on it and all six fail silently on a falsy one.
+
+## Publishing, and why it works on sandbox only
+
+`ebay push <listing>` creates the inventory item and an **unpublished**
+offer. `--publish` makes it live, and is **refused when
+`ebay_environment = production`** - going live stays a decision made in
+eBay's own UI where the whole listing is visible.
+
+That gate is a property rather than a prompt, and it exists so the
+publish path can be *exercised* at all: a design where publish cannot be
+called means that code runs against her real account the first time
+anybody tries it.
+
+Even on sandbox, publishing refuses four things. Each is a failure eBay
+would report worse than we can:
+
+- **A suggested category.** `push` prints eBay's guesses from the title
+  and will not publish until `--category` names one. A wrong category is
+  a listing nobody searching for the thing will ever see.
+- **Missing required aspects.** eBay refuses one per round trip, so they
+  are read from the Taxonomy API first and named together.
+- **No photographs.** eBay requires at least one, and fetches it itself.
+- **A photograph it cannot fetch.** Checked locally before the publish
+  call, because eBay's refusal for an unreachable image names the *field*
+  rather than the reason - and on this deployment the likeliest reason is
+  that the tunnel is down.
+
+**The order of operations matters and is not tidiness.** The
+`ebay_offers` row is written *before* the publish call, because
+`/ebay/photo/<sha256>` serves a digest only when it is attached to a
+listing with such a row. Written afterwards, the allowlist would 404
+eBay's own image fetch and the publish would fail naming the image
+field. The row is a precondition.
+
+**Titles are cut to 80 characters and `push` says so.** Hers run past a
+hundred, so this fires often; the cut falls at a word boundary where
+there is one. The desk shows the full title and eBay shows the cut, and
+nothing else would say they differ.
+
+### `ebay setup` needs a re-auth
+
+It creates the policies, so it needs the `sell.account` **write** scope.
+`refresh_access` replays the scopes that were actually granted -
+deliberately, so widening `SCOPES` never silently widens a token you
+already consented to - which means a token minted before this existed
+cannot be refreshed into working. `setup` says so and exits 78 rather
+than letting eBay answer 403, which reads as the account lacking a
+permission rather than the token lacking a scope.
+
+```bash
+mplabel ebay auth            # again, to grant sell.account
+mplabel ebay setup --dry-run # what it would create
+mplabel ebay setup           # then paste the ids it prints into the config
+```
+
+It will **not** rewrite a policy that already exists. A policy is how
+she actually ships and returns; a tool that overwrites one because its
+own defaults differ is a tool that changed her terms without being
+asked.
 
 ## The one public route, and what it will not serve
 

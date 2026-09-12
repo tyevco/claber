@@ -76,17 +76,26 @@ HOSTS = {
 }
 
 # What we ask consent for, and nothing beyond it. `sell.inventory` covers
-# inventory items and offers; `sell.account.readonly` is how `check`
-# confirms the business policies and the inventory location exist without
-# taking permission to change them; `sell.fulfillment.readonly` is orders.
+# inventory items, offers and the location; `sell.account` is the
+# business policies, and it is a *write* scope because `ebay setup`
+# creates them; `sell.fulfillment.readonly` is orders, read-only because
+# nothing here changes an order on eBay's side.
 #
 # Note these are always the api.ebay.com URIs even in sandbox - the scope
 # strings are identifiers, not endpoints, and rewriting them to the
 # sandbox host is a rejection that looks like a permissions problem.
+ACCOUNT_SCOPE = "https://api.ebay.com/oauth/api_scope/sell.account"
+
 SCOPES = (
     "https://api.ebay.com/oauth/api_scope",
     "https://api.ebay.com/oauth/api_scope/sell.inventory",
-    "https://api.ebay.com/oauth/api_scope/sell.account.readonly",
+    # Write, because `ebay setup` creates the business policies. The
+    # readonly one was enough while `check` only read them back, and a
+    # token minted before this line keeps the old set - `refresh_access`
+    # replays the *stored* scopes, deliberately, so widening this does
+    # not silently widen a token she already granted. `setup` says so
+    # rather than letting eBay answer 403.
+    ACCOUNT_SCOPE,
     "https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly",
 )
 
@@ -858,3 +867,406 @@ def photo_url(cfg, digest):
             f"imageUrls, and the refusal names the field rather than "
             f"the scheme.")
     return f"{base}{PHOTO_PATH}{digest}"
+
+
+# ------------------------------------------------------ the prerequisites
+
+# eBay validates these when the **offer is created**, not when it is
+# published - which reads backwards and is the trap `docs/ebay.md`
+# records. So they gate the very first push, even though nothing here
+# publishes on the production account.
+POLICY_KINDS = {
+    "fulfillment": "/sell/account/v1/fulfillment_policy",
+    "payment": "/sell/account/v1/payment_policy",
+    "return": "/sell/account/v1/return_policy",
+}
+
+# What `setup` creates when the account has none. Deliberately plain:
+# these describe how she already ships, and anything cleverer is a
+# decision eBay's own UI is better at presenting.
+DEFAULT_POLICIES = {
+    "fulfillment": {
+        "name": "mplabel ground",
+        "marketplaceId": "EBAY_US",
+        "categoryTypes": [{"name": "ALL_EXCLUDING_MOTORS_VEHICLES"}],
+        "handlingTime": {"unit": "DAY", "value": 3},
+        "shippingOptions": [{
+            "optionType": "DOMESTIC",
+            "costType": "FLAT_RATE",
+            "shippingServices": [{
+                "sortOrder": 1,
+                "shippingCarrierCode": "USPS",
+                "shippingServiceCode": "USPSGroundAdvantage",
+                "freeShipping": True,
+                "buyerResponsibleForShipping": False,
+            }],
+        }],
+    },
+    "payment": {
+        "name": "mplabel managed",
+        "marketplaceId": "EBAY_US",
+        "categoryTypes": [{"name": "ALL_EXCLUDING_MOTORS_VEHICLES"}],
+    },
+    "return": {
+        "name": "mplabel 30 day",
+        "marketplaceId": "EBAY_US",
+        "categoryTypes": [{"name": "ALL_EXCLUDING_MOTORS_VEHICLES"}],
+        "returnsAccepted": True,
+        "returnPeriod": {"unit": "DAY", "value": 30},
+        "returnShippingCostPayer": "BUYER",
+    },
+}
+
+LOCATION_PATH = "/sell/inventory/v1/location"
+
+
+def has_scope(tokens, scope):
+    """Whether the *stored* token carries a scope.
+
+    Asked rather than assumed because `refresh_access` replays what was
+    granted, not what `SCOPES` currently says - so widening the constant
+    does not widen a token, and the difference has to be visible.
+    """
+    return scope in (tokens.get("scopes") or [])
+
+
+def existing_policies(cfg, kind):
+    """Every policy of one kind already on the account."""
+    path = POLICY_KINDS[kind]
+    marketplace = cfg.get("ebay_marketplace") or "EBAY_US"
+    status, payload = call(
+        cfg, "GET", f"{path}?marketplace_id={marketplace}")
+    if status != 200:
+        raise EbayError(f"eBay refused the {kind} policy list ({status}): "
+                        + describe_errors(payload))
+    # eBay names the array after the kind: fulfillmentPolicies, etc.
+    for key, value in payload.items():
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def ensure_policies(cfg, dry_run=False):
+    """The three business policies, created only where none exists.
+
+    Returns {kind: (policy_id, what_happened)}. Never edits one that is
+    already there: a policy is how she actually ships and returns, and
+    a tool that rewrites it because its own defaults differ is a tool
+    that changes her terms without being asked.
+    """
+    out = {}
+    for kind, path in POLICY_KINDS.items():
+        found = existing_policies(cfg, kind)
+        if found:
+            first = found[0]
+            out[kind] = (first.get(f"{kind}PolicyId") or first.get("policyId"),
+                         f"already there ({first.get('name')})")
+            continue
+        if dry_run:
+            out[kind] = (None, f"would create {DEFAULT_POLICIES[kind]['name']!r}")
+            continue
+        body = dict(DEFAULT_POLICIES[kind],
+                    marketplaceId=cfg.get("ebay_marketplace") or "EBAY_US")
+        status, payload = call(cfg, "POST", path, body)
+        if status not in (200, 201):
+            raise EbayError(f"eBay refused to create the {kind} policy "
+                            f"({status}): " + describe_errors(payload))
+        out[kind] = (payload.get(f"{kind}PolicyId") or payload.get("policyId"),
+                     "created")
+    return out
+
+
+def ensure_location(cfg, key=None, dry_run=False):
+    """The inventory location an offer has to name.
+
+    `merchantLocationKey` is ours to choose and permanent per account.
+    Creating one that exists answers 409, which is a success here - the
+    location being there is the whole requirement.
+    """
+    key = key or (cfg.get("ebay_merchant_location") or "home").strip()
+    status, _payload = call(cfg, "GET", f"{LOCATION_PATH}/{key}")
+    if status == 200:
+        return key, "already there"
+    if dry_run:
+        return key, "would create"
+    body = {
+        "location": {"address": {"country": "US"}},
+        "name": key,
+        # MARKETPLACE_SHIP_FROM, not STORE: nothing here is a shopfront
+        # and a store location asks for opening hours.
+        "locationTypes": ["WAREHOUSE"],
+        "merchantLocationStatus": "ENABLED",
+    }
+    status, payload = call(cfg, "POST", f"{LOCATION_PATH}/{key}", body)
+    if status in (200, 201, 204):
+        return key, "created"
+    if status == 409:
+        return key, "already there"
+    raise EbayError(f"eBay refused to create the location ({status}): "
+                    + describe_errors(payload))
+
+
+# ------------------------------------------------------------- taxonomy
+
+# The US tree. `getDefaultCategoryTreeId` answers this per marketplace;
+# it is 0 for EBAY_US and has been for years, so this asks only when the
+# marketplace is something else.
+DEFAULT_TREES = {"EBAY_US": "0"}
+
+
+def category_tree_id(cfg):
+    marketplace = cfg.get("ebay_marketplace") or "EBAY_US"
+    known = DEFAULT_TREES.get(marketplace)
+    if known:
+        return known
+    status, payload = call(
+        cfg, "GET", "/commerce/taxonomy/v1/get_default_category_tree_id"
+                    f"?marketplace_id={marketplace}")
+    if status != 200:
+        raise EbayError(f"eBay refused the category tree id ({status}): "
+                        + describe_errors(payload))
+    return payload.get("categoryTreeId")
+
+
+def suggest_categories(cfg, title, limit=3):
+    """eBay's guesses at where a title belongs, best first.
+
+    A guess, and named one. A wrong category is a listing nobody
+    searching for the thing will ever see, which is a silent failure of
+    exactly the kind this project keeps finding - so `push` prints these
+    and refuses to publish until one is confirmed.
+    """
+    tree = category_tree_id(cfg)
+    status, payload = call(
+        cfg, "GET",
+        f"/commerce/taxonomy/v1/category_tree/{tree}/get_category_suggestions"
+        f"?q={urllib.parse.quote(title or '')}")
+    if status != 200:
+        raise EbayError(f"eBay refused the category suggestion ({status}): "
+                        + describe_errors(payload))
+    out = []
+    for row in (payload.get("categorySuggestions") or [])[:limit]:
+        category = row.get("category") or {}
+        ancestors = [a.get("categoryName")
+                     for a in reversed(row.get("categoryTreeNodeAncestors")
+                                       or [])]
+        out.append({
+            "id": category.get("categoryId"),
+            "name": category.get("categoryName"),
+            "path": " > ".join([a for a in ancestors if a]
+                               + [category.get("categoryName") or ""]),
+        })
+    return out
+
+
+def required_aspects(cfg, category_id):
+    """The item specifics eBay will refuse a publish without.
+
+    Asked before publishing rather than discovered from the refusal,
+    because the refusal names them one at a time and each round trip is
+    another failed publish.
+    """
+    tree = category_tree_id(cfg)
+    status, payload = call(
+        cfg, "GET",
+        f"/commerce/taxonomy/v1/category_tree/{tree}"
+        f"/get_item_aspects_for_category?category_id={category_id}")
+    if status != 200:
+        raise EbayError(f"eBay refused the aspects for {category_id} "
+                        f"({status}): " + describe_errors(payload))
+    out = []
+    for aspect in payload.get("aspects") or []:
+        constraint = aspect.get("aspectConstraint") or {}
+        if constraint.get("aspectRequired"):
+            out.append(aspect.get("localizedAspectName"))
+    return [a for a in out if a]
+
+
+# ----------------------------------------------------------- the push
+
+INVENTORY_PATH = "/sell/inventory/v1/inventory_item"
+OFFER_PATH = "/sell/inventory/v1/offer"
+
+# A SKU derived from `listings.inventory_code` rather than equal to it.
+# Two payoffs: it reads as ours in Seller Hub, and the local code stays
+# the source - if eBay ever refuses or forces a change to a SKU, the
+# label already stuck to the box in the loft is still correct.
+SKU_PREFIX = "MP-"
+
+
+def sku_for(inventory_code):
+    if not inventory_code:
+        raise EbayError(
+            "this listing has no inventory_code, so it has no SKU. "
+            "`ensure_inventory_codes` mints them lazily - run a command "
+            "that calls it first.")
+    return f"{SKU_PREFIX}{inventory_code.strip().upper()}"
+
+
+def photo_reachable(cfg, url, timeout=10):
+    """Can anything on the internet fetch this? Asked before publishing.
+
+    eBay fetches `imageUrls` itself, from its own servers, and its
+    refusal for an image it could not get names the *field* rather than
+    the reason. On this deployment the likeliest reason by far is that
+    the tunnel is down - the Pi behind a home router is exactly the
+    machine that disappears - so the question is worth asking locally
+    where the answer can say so.
+
+    A local 200 does not prove eBay can reach it; a local failure does
+    prove eBay cannot. The check is one-directional and says which.
+    """
+    try:
+        status, _headers, _body = _transport("GET", url, {}, timeout=timeout)
+    except EbayError as exc:
+        return False, str(exc)
+    if status == 200:
+        return True, "reachable from here"
+    if status == 404:
+        return False, ("404 - the digest is not attached to a listing with "
+                       "an ebay_offers row yet, so the allowlist refuses it")
+    return False, f"answered {status}"
+
+
+# eBay's hard limit. Her titles routinely run past a hundred characters
+# - "Antique 1900-1915 American Edwardian / Late Victorian..." - so this
+# fires often rather than never, and `push` says when it has.
+TITLE_LIMIT = 80
+
+
+def ebay_title(title):
+    """The title eBay will accept, cut at a word where it can be.
+
+    Truncating mid-word reads as a corrupted listing rather than a long
+    one, and a silent cut is worse than either: the desk shows her full
+    title and eBay would show 80 characters of it with no indication
+    anywhere that they differ. `push` prints the cut version.
+    """
+    title = (title or "").strip()
+    if len(title) <= TITLE_LIMIT:
+        return title
+    cut = title[:TITLE_LIMIT]
+    space = cut.rfind(" ")
+    # Only back off to a word boundary if that does not throw away a
+    # quarter of the room; an unbroken 80-character string is rare and
+    # cutting it hard is better than returning almost nothing.
+    if space > TITLE_LIMIT * 0.75:
+        cut = cut[:space]
+    return cut.rstrip(" ,;-/")
+
+
+def inventory_item_body(listing, image_urls, aspects=None):
+    """One listing as eBay's inventory item.
+
+    `condition` is eBay's enumeration, not hers: her `condition` column
+    is free text a person wrote ("chipped", "good"), and guessing an
+    enum from it would publish a claim about an object a buyer is going
+    to unwrap. USED_GOOD is the floor, and anything more specific has to
+    be said deliberately.
+    """
+    product = {
+        "title": ebay_title(listing.get("title")),
+        "description": (listing.get("description")
+                        or listing.get("title") or ""),
+    }
+    if image_urls:
+        product["imageUrls"] = list(image_urls)
+    if aspects:
+        # eBay wants every value as a list, even the single ones.
+        product["aspects"] = {k: (v if isinstance(v, list) else [v])
+                              for k, v in aspects.items()}
+    return {
+        "product": product,
+        "condition": "USED_GOOD",
+        "availability": {
+            "shipToLocationAvailability": {"quantity": 1},
+        },
+    }
+
+
+def offer_body(cfg, sku, listing, category_id):
+    price = listing.get("price")
+    if price is None:
+        raise EbayError(
+            "this listing has no price, and an offer must carry one. "
+            "Set it before pushing.")
+    return {
+        "sku": sku,
+        "marketplaceId": cfg.get("ebay_marketplace") or "EBAY_US",
+        "format": "FIXED_PRICE",
+        "availableQuantity": 1,
+        "categoryId": str(category_id),
+        "listingDescription": (listing.get("description")
+                               or listing.get("title") or ""),
+        "pricingSummary": {"price": {"value": f"{float(price):.2f}",
+                                     "currency": "USD"}},
+        "listingPolicies": {
+            "fulfillmentPolicyId": cfg.get("ebay_fulfillment_policy"),
+            "paymentPolicyId": cfg.get("ebay_payment_policy"),
+            "returnPolicyId": cfg.get("ebay_return_policy"),
+        },
+        "merchantLocationKey": cfg.get("ebay_merchant_location") or "home",
+    }
+
+
+def put_inventory_item(cfg, sku, body):
+    """Create or replace. eBay answers 204 with no body on success."""
+    status, payload = call(cfg, "PUT", f"{INVENTORY_PATH}/{sku}", body,
+                           headers={"Content-Type": "application/json"})
+    if status not in (200, 201, 204):
+        raise EbayError(f"eBay refused the inventory item ({status}): "
+                        + describe_errors(payload))
+    return sku
+
+
+def find_offer(cfg, sku):
+    """The offer already on this SKU, or None.
+
+    Asked rather than remembered, because `ebay_offers.offer_id` can be
+    stale in exactly one direction that matters: a row written here and
+    an offer deleted in eBay's UI. Creating a second offer for a SKU
+    that has one is a 400 naming neither.
+    """
+    marketplace = cfg.get("ebay_marketplace") or "EBAY_US"
+    status, payload = call(
+        cfg, "GET",
+        f"{OFFER_PATH}?sku={urllib.parse.quote(sku)}"
+        f"&marketplace_id={marketplace}")
+    if status == 404:
+        return None
+    if status != 200:
+        raise EbayError(f"eBay refused the offer lookup ({status}): "
+                        + describe_errors(payload))
+    offers = payload.get("offers") or []
+    return offers[0] if offers else None
+
+
+def create_or_update_offer(cfg, sku, body):
+    """Returns (offer_id, created_or_updated)."""
+    existing = find_offer(cfg, sku)
+    if existing and existing.get("offerId"):
+        offer_id = existing["offerId"]
+        status, payload = call(cfg, "PUT", f"{OFFER_PATH}/{offer_id}", body)
+        if status not in (200, 204):
+            raise EbayError(f"eBay refused the offer update ({status}): "
+                            + describe_errors(payload))
+        return offer_id, "updated"
+    status, payload = call(cfg, "POST", OFFER_PATH, body)
+    if status not in (200, 201):
+        raise EbayError(f"eBay refused the offer ({status}): "
+                        + describe_errors(payload))
+    return payload.get("offerId"), "created"
+
+
+def publish_offer(cfg, offer_id):
+    """Make the offer a live listing. Returns eBay's listingId.
+
+    Refused on production by the caller, not here: this function is the
+    mechanism and `cmd_ebay_push` is the policy, so a future caller
+    cannot get the mechanism without meeting the policy.
+    """
+    status, payload = call(cfg, "POST", f"{OFFER_PATH}/{offer_id}/publish")
+    if status not in (200, 201):
+        raise EbayError(f"eBay refused to publish ({status}): "
+                        + describe_errors(payload))
+    return payload.get("listingId")

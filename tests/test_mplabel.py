@@ -11063,6 +11063,273 @@ def test_the_phone_and_the_desk_agree_on_the_word_for_acquired():
         assert "not listed" in js.lower(), f"{name} has no word for acquired"
 
 
+# --- ebay: the push, and everything it refuses to do
+
+
+def _push_args(**over):
+    base = dict(listing="1", category=None, aspect=None, publish=False,
+                dry_run=False)
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def _pushable(conn, tmp_path, with_photo=True):
+    """A listing with a price, a code, and optionally a photograph."""
+    conn.execute("INSERT INTO listings (listing_id, title, price, state, "
+                 "inventory_code) VALUES ('l1', 'Milk glass vase', 42.0, "
+                 "'active', '7QK3')")
+    lid = conn.execute("SELECT id FROM listings").fetchone()[0]
+    if with_photo:
+        photos = Path(tmp_path) / "photos"
+        photos.mkdir(parents=True, exist_ok=True)
+        (photos / "v.jpg").write_bytes(b"\xff\xd8\xff\xe0x")
+        conn.execute("INSERT INTO photos (path, sha256, listing_id) "
+                     "VALUES (?, ?, ?)",
+                     (str(photos / "v.jpg"), "d" * 64, lid))
+    conn.commit()
+    return lid
+
+
+def test_ebay_push_refuses_to_publish_on_production(db, tmp_path, capsys):
+    """A bug must not be able to list something real.
+
+    Publishing stays a decision made in eBay's own UI, where the whole
+    listing is visible - that was the design decision, and this is the
+    property rather than a prompt. The refusal is in `cmd_ebay_push`
+    rather than `publish_offer` so a future caller cannot reach the
+    mechanism without meeting the policy.
+    """
+    from mplabel import cli
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_environment="production",
+               ebay_app_id="a", ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path)
+    assert cli.cmd_ebay_push(cfg, db, _push_args(publish=True)) == 2
+    assert "production" in capsys.readouterr().err
+    # And nothing was recorded, because nothing was attempted.
+    assert db.execute("SELECT COUNT(*) FROM ebay_offers").fetchone()[0] == 0
+
+
+def test_ebay_push_will_not_publish_on_a_suggested_category(db, tmp_path,
+                                                             monkeypatch,
+                                                             capsys):
+    """The suggestion is eBay's guess from a title.
+
+    A wrong category is a listing nobody searching for the thing will
+    ever see - silent, and the kind of failure this project keeps
+    finding. Good enough for a draft; not good enough to go live on.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_environment="sandbox",
+               ebay_app_id="a", ebay_cert_id="c", ebay_ru_name="r",
+               ebay_photo_base="https://pi.example.com")
+    _pushable(db, tmp_path)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda cfg_, title,
+                        limit=3: [{"id": "20081", "name": "Vases",
+                                   "path": "Antiques > Vases"}])
+    monkeypatch.setattr(ebay, "required_aspects", lambda cfg_, cid: [])
+
+    assert cli.cmd_ebay_push(cfg, db, _push_args(publish=True)) == 2
+    assert "suggested category" in capsys.readouterr().err
+
+
+def test_ebay_push_will_not_publish_without_the_required_aspects(db, tmp_path,
+                                                                  monkeypatch,
+                                                                  capsys):
+    """eBay refuses one aspect per round trip, and each is a failed publish."""
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r",
+               ebay_photo_base="https://pi.example.com")
+    _pushable(db, tmp_path)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [])
+    monkeypatch.setattr(ebay, "required_aspects",
+                        lambda cfg_, cid: ["Type", "Brand"])
+
+    code = cli.cmd_ebay_push(
+        db and cfg, db, _push_args(publish=True, category="20081",
+                                   aspect=["Type=Vase"]))
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "Brand" in err and "Type" not in err.split("without:")[1]
+
+
+def test_ebay_push_will_not_publish_with_no_photographs(db, tmp_path,
+                                                         monkeypatch, capsys):
+    """eBay requires at least one image to publish, and fetches it itself."""
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r",
+               ebay_photo_base="https://pi.example.com")
+    _pushable(db, tmp_path, with_photo=False)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [])
+    monkeypatch.setattr(ebay, "required_aspects", lambda *a, **k: [])
+
+    assert cli.cmd_ebay_push(
+        cfg, db, _push_args(publish=True, category="20081")) == 2
+    assert "no photographs" in capsys.readouterr().err
+
+
+def test_ebay_push_writes_the_offer_row_before_it_publishes(db, tmp_path,
+                                                             monkeypatch):
+    """The row is a precondition, not a record of what happened.
+
+    `/ebay/photo/<sha256>` serves a digest only when it is attached to a
+    listing with an `ebay_offers` row - so if the row were written after
+    publishing, the allowlist would 404 eBay's own image fetch and the
+    publish would fail naming the image field. Order of operations, and
+    the reason is two files away from the code that depends on it.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r",
+               ebay_photo_base="https://pi.example.com")
+    _pushable(db, tmp_path)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [])
+    monkeypatch.setattr(ebay, "required_aspects", lambda *a, **k: [])
+    monkeypatch.setattr(ebay, "put_inventory_item", lambda *a, **k: "MP-7QK3")
+    monkeypatch.setattr(ebay, "create_or_update_offer",
+                        lambda *a, **k: ("offer-1", "created"))
+
+    order = []
+
+    def reachable(cfg_, url, timeout=10):
+        # By the time eBay could fetch, the allowlist row must exist.
+        order.append(("photo checked", db.execute(
+            "SELECT COUNT(*) FROM ebay_offers").fetchone()[0]))
+        return True, "ok"
+
+    monkeypatch.setattr(ebay, "photo_reachable", reachable)
+    monkeypatch.setattr(ebay, "publish_offer",
+                        lambda cfg_, oid: order.append(("published", None))
+                        or "item-9")
+
+    assert cli.cmd_ebay_push(
+        cfg, db, _push_args(publish=True, category="20081")) == 0
+    assert order[0] == ("photo checked", 1), \
+        "the offer row must exist before eBay could fetch an image"
+    row = db.execute("SELECT * FROM ebay_offers").fetchone()
+    assert row["state"] == "published" and row["ebay_item"] == "item-9"
+
+
+def test_republishing_does_not_blank_the_ebay_item(db, tmp_path):
+    """A second push passes no listing id while the old one is still true."""
+    from mplabel import cli
+
+    lid = _pushable(db, tmp_path)
+    cli.record_ebay_offer(db, lid, "MP-7QK3", "o1", "published",
+                          ebay_item="item-9")
+    cli.record_ebay_offer(db, lid, "MP-7QK3", "o1", "draft")
+    row = db.execute("SELECT * FROM ebay_offers").fetchone()
+    assert row["ebay_item"] == "item-9"
+    assert row["state"] == "draft"
+    assert db.execute("SELECT COUNT(*) FROM ebay_offers").fetchone()[0] == 1
+
+
+def test_ebay_setup_refuses_a_token_granted_before_the_write_scope(tmp_path,
+                                                                    capsys):
+    """`refresh_access` replays the granted scopes, deliberately.
+
+    So widening `SCOPES` does not widen a token she already consented
+    to - and `setup` cannot fix itself by refreshing. eBay would answer
+    403, which reads as the account lacking a permission rather than the
+    token lacking a scope.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    ebay.save_tokens(cfg, {
+        "environment": "sandbox", "access_token": "a", "refresh_token": "r",
+        "scopes": ["https://api.ebay.com/oauth/api_scope",
+                   "https://api.ebay.com/oauth/api_scope/sell.inventory"]})
+
+    code = cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="setup",
+                                                dry_run=False))
+    assert code == 78
+    assert "sell.account" in capsys.readouterr().err
+
+
+def test_the_sku_is_derived_from_the_inventory_code_not_equal_to_it():
+    """The local code stays the source; the SKU is a rendering of it.
+
+    If eBay ever refuses or forces a change to a SKU, the label already
+    stuck to the box in the loft is still correct. And it reads as ours
+    in Seller Hub.
+    """
+    from mplabel import ebay
+
+    assert ebay.sku_for("7qk3") == "MP-7QK3"
+    with pytest.raises(ebay.EbayError) as caught:
+        ebay.sku_for(None)
+    assert "inventory_code" in str(caught.value)
+
+
+def test_find_listing_refuses_an_ambiguous_title(db):
+    """Pushing the wrong object puts someone else's thing on sale."""
+    from mplabel import cli
+
+    db.execute("INSERT INTO listings (listing_id, title) "
+               "VALUES ('a', 'Milk glass vase, small')")
+    db.execute("INSERT INTO listings (listing_id, title) "
+               "VALUES ('b', 'Milk glass vase, large')")
+    db.commit()
+    with pytest.raises(SystemExit) as caught:
+        cli.find_listing(db, "Milk glass")
+    assert "2 listings match" in str(caught.value)
+
+
+def test_ebay_setup_does_not_rewrite_a_policy_that_exists(monkeypatch):
+    """A policy is how she actually ships and returns.
+
+    A tool that overwrites one because its own defaults differ is a tool
+    that changed her terms without being asked.
+    """
+    from mplabel import ebay
+
+    calls = []
+    monkeypatch.setattr(ebay, "call",
+                        lambda cfg, method, path, body=None, **k: (
+                            calls.append((method, path)),
+                            (200, {"fulfillmentPolicies": [
+                                {"fulfillmentPolicyId": "6001",
+                                 "name": "hers"}]}))[1])
+    out = ebay.ensure_policies({"ebay_marketplace": "EBAY_US"})
+    assert out["fulfillment"][0] == "6001"
+    assert "already there" in out["fulfillment"][1]
+    assert all(m == "GET" for m, _p in calls), calls
+
+
+def test_a_long_title_is_cut_at_a_word_and_said_out_loud():
+    """eBay's limit is 80 and her titles run past a hundred.
+
+    "Antique 1900-1915 American Edwardian / Late Victorian..." - so this
+    fires often rather than never. Cutting mid-word reads as a corrupted
+    listing rather than a long one, and cutting silently is worse than
+    either: the desk shows her full title and eBay would show 80
+    characters of it with nothing saying they differ.
+    """
+    from mplabel import ebay
+
+    short = "Milk glass vase"
+    assert ebay.ebay_title(short) == short
+
+    long = ("Antique 1900-1915 American Edwardian Late Victorian milk "
+            "glass vase with a small chip on the rim")
+    cut = ebay.ebay_title(long)
+    assert len(cut) <= ebay.TITLE_LIMIT
+    assert not cut.endswith(" ")
+    # A word boundary, not mid-word.
+    assert long.startswith(cut)
+    assert long[len(cut)] in " ,;-/", repr(long[len(cut) - 5:len(cut) + 5])
+
+    # An unbroken run has no boundary to back off to, and returning
+    # almost nothing would be worse than a hard cut.
+    assert len(ebay.ebay_title("x" * 200)) == ebay.TITLE_LIMIT
 # --------------------------------------------------------------------------
 # What a real mailbox survey found.
 #

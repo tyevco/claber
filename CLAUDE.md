@@ -116,6 +116,7 @@ run against a real database.
 | `ebay check` | config, tokens, and how long the refresh token has left. Changes nothing, sends nothing, exits **78** if anything needs attention. No DB |
 | `ebay pull [--since D] [--limit N] --dry-run` | eBay orders as `sales` rows. `--dry-run` is the **only** mode: it prints what it would record and writes nothing, and refuses with exit **2** without the flag |
 | `ebay skus` | every SKU already on the eBay account. Read only, and worth one call before the first push - eBay's SKU uniqueness is permanent. No DB |
+| `ebay setup [--dry-run]` | create the three business policies and the inventory location an offer has to name. Needs the `sell.account` **write** scope, so a token minted before that existed has to re-consent. Will not rewrite a policy that is already there. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -123,6 +124,7 @@ run against a real database.
 
 | Database only | |
 |---|---|
+| `ebay push <listing> [--category N] [--aspect K=V] [--publish] [--dry-run]` | one listing as an eBay inventory item and an **unpublished** offer. `--publish` is refused when `ebay_environment` is production |
 | `list` / `stats` / `ship <ref>` | outstanding orders, analytics, mark shipped |
 | `bin new\|ls\|show\|rename\|put\|rm` | the places things live. `new` mints the code and `--print` puts its tag on the shelf; `put` takes the 4-char inventory code off the item's own label |
 | `cancel <ref>` | the buyer pulled out; not a sale, and the parcel code is freed |
@@ -750,6 +752,43 @@ Note `photos.path` is stored **absolute** (`h_add_photo` builds it from
 `photo_dir(home)`) and `safe_home_path` resolves what it is given, so a
 relative path resolves against the process CWD and is refused. A fixture
 that stored a relative one looked exactly like the route being broken.
+
+**The `ebay_offers` row is written before the publish call, and that
+is a precondition rather than bookkeeping.** eBay fetches `imageUrls`
+from our tunnel itself, and `/ebay/photo/<sha256>` serves a digest
+**only** when it is attached to a listing with a row in `ebay_offers` -
+so a row written *after* publishing would mean the allowlist 404s eBay's
+own image fetch, and the publish fails naming the image field rather
+than the order of operations. A test asserts the row exists at the
+moment the images are checked.
+
+Three more refusals sit in front of publish, each because eBay reports
+the same failure worse: a **suggested** category is refused (it is a
+guess from a title, and a wrong category is a listing nobody searching
+for the thing will ever see), missing required aspects are named
+together rather than one per failed round trip, and an unfetchable photo
+is caught locally - eBay's refusal for one names the *field*, and on
+this deployment the likeliest cause is that the tunnel is down.
+
+And `--publish` is refused outright on production. That is a property
+rather than a prompt, and it is what makes the path testable at all: a
+design where publish cannot be called means that code runs against her
+real account the first time anybody tries it.
+
+**eBay's title limit is 80 and hers run past a hundred.** So the cut
+fires often rather than never. It falls at a word boundary where there
+is one - a mid-word cut reads as a corrupted listing rather than a long
+one - and `push` prints what it actually sent, because the desk shows
+her full title and eBay shows 80 characters of it with nothing else
+anywhere saying they differ.
+
+**Widening `SCOPES` does not widen a token.** `refresh_access` replays
+the scopes that were actually *granted*, deliberately - so adding
+`sell.account` for `ebay setup` leaves every existing token as it was,
+and `setup` cannot fix itself by refreshing. It checks and exits 78
+saying to re-consent, rather than letting eBay answer 403, which reads
+as the account lacking a permission rather than the token lacking a
+scope.
 
 **An exit code nothing propagates is a contract with one end.**
 `cli.main` wrapped `_main()` and threw its return value away, and
