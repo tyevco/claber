@@ -567,7 +567,7 @@ hardware or a real Facebook account.
 | The native iOS client | **Builds, runs against the real server, and its eleven UI journeys now execute.** Xcode compiles it, the simulator launches it, and it reads her actual orders, listings and bins off the Pi through a cloudflared tunnel - so the bearer token, the `/api/v1` prefix, every Codable shape and the whole HTTPS path are confirmed on real data rather than a fixture. `./ios/run-ui-tests.sh` is green: 11/11 against a real `mplabel serve`, plus 24 Swift unit tests. Before that the runner had never executed a single assertion - all eight skipped, because `TEST_RUNNER_*` was being passed as a build setting - so everything the UI tests covered was unproven and two of them were in fact wrong. Three things are still **not** verified, all of them needing a real device: the simulator has no camera, so neither `ScanView` - the entire reason this target exists rather than a web page - nor `CaptureView`'s `AVCapturePhotoOutput` has ever seen one; and nothing has been printed from it, which is the one action that spends physical stock. |
 | The on-device model | **Verified in the simulator, on real generations.** `FoundationModels` reports `available` and both halves run: the text draft (iOS 26) and the image path (iOS 27), which decoded straight into the `@Generable` type and correctly left `era` and `condition` **empty** on a picture it could not place. So the API, the guided decode and the availability handling are real rather than compiled. **Not** run on the phone, and the model there is the same size but not the same silicon. Nothing about the *quality* of a suggestion is verified - see the two findings below, both of which were measured rather than reasoned. |
 | Printer status readback | **Answered on the hardware: it does not.** `mplabel status` got no reply within 0.5s to either query - the G4 is write-only. That is a finding, not a gap, and it is load bearing: **a failed print cannot be detected in software**, so printing is at-least-once and the paper is the only source of truth. `printd` cannot pre-check paper and must not pretend to; a timed-out print stays irreducibly ambiguous. That ambiguity is exactly what the durable journal, `GET /printed` and `mplabel reconcile` exist to convert from "go and look" into a query - which raises their value rather than lowering it. |
-| **No email carries the postage charge** | **Verified from the real label email.** It is a *prepaid* label - Facebook pays the carrier and takes it out of the payout - so the one document this system reliably receives says what the parcel weighs and what service it went by, and not what it cost. A test pins that the fixture has no charge in it, because the temptation is to write a parser for a number that is not there. The payout email is the only plausible carrier and **none has ever been seen**, so whether one exists is still open: `mplabel scan` against the real mailbox is what settles it. Until then every figure is typed by a person, and `listings.estimate_postage` derives one only from parcels whose charge she actually confirmed - returning nothing at all when there is no basis, rather than a number that would be indistinguishable from a measured one a week later. |
+| **No email carries the postage charge** | **Verified from the real label email.** It is a *prepaid* label - Facebook pays the carrier and takes it out of the payout - so the one document this system reliably receives says what the parcel weighs and what service it went by, and not what it cost. A test pins that the fixture has no charge in it, because the temptation is to write a parser for a number that is not there. The payout email is the only plausible carrier, and the whole-mailbox survey **found one**: a single message classified `payout`, the first ever seen, after that pattern had sat in `EVENT_PATTERNS` unmatched since it was written. So the document exists. Whether the charge is *in* it is the next question and **nothing has read its body** - one saved `.eml` answers it, and the prize is bigger than the eBay one it sits beside: it would turn `sales.postage` from a figure she types into one that arrives. Until then every figure is typed by a person, and `listings.estimate_postage` derives one only from parcels whose charge she actually confirmed - returning nothing at all when there is no basis, rather than a number that would be indistinguishable from a measured one a week later. |
 | Printing a label that is not a Marketplace one | **Verified on the hardware, on four real labels, over the tunnel.** Three FedEx Ground return labels and one eBay FedEx/USPS e-VS label went from a Windows workstation through `mplabel send` to the G4 and came out correctly. So the whole chain is real: login, the cached token, the upload, the crop, the orientation, and the print. Two things that had been reasoned about are now measured. **Three of the four carry no extractable text at all** - they are flattened images, exactly the case `rotation_source: aspect` exists for - and the shape-based orientation was **right on all three**. And the crop was right first time on both carriers' layouts, with every barcode complete. What is still **ASSUMED** is any *other* seller's layout, and in particular a page where the label shares the sheet with a packing slip: that path is unit-tested against a synthetic page and has never met a real one. `--dry-run` costs nothing and is still the thing to run first on a PDF from a new source. |
 | The desk portal, on her real data | **Verified: it is running against the real database.** Which immediately found what seeded data could not - the queue titles overlapped their prices, because her titles run past a hundred characters where the design was drawn against forty, and because a `<span>` ignores `text-overflow` however carefully it is set. The seed carries titles that long now. Still not checked on real data: the CSV import wizard, and Month-end against a full year. |
 | The desk portal | **Runs, and every screen has been looked at against seeded data in both themes.** Six screens at `/desk`, driven in headless Edge over CDP: the queue's confirm-and-print dialog, a bulk edit of three rows through `POST /api/inventory/bulk`, the search box keeping its caret, the CSV wizard through mapping and preview. That walk found five things the assertions did not - a figure that was really a `LIMIT`, a focus restore undone by a later render, a theme button that never changed its own label, an `era` column the endpoint had never sent, and a photo placeholder that lied about drafts with photographs. **Not** run against real data, and not on a real laptop over the tunnel - `tools/desk-preview.py` seeds a throwaway database and nothing here has met a real order. |
@@ -589,7 +589,9 @@ hardware or a real Facebook account.
 | eBay push: inventory item and unpublished offer | **Verified on twelve real listings.** Every `PUT` inventory item and every offer was accepted first time, so `MP-<CODE>` is an acceptable SKU, `inventory_item_body` and `offer_body` are the shapes eBay wants, and the 80-character cut fires on real titles (four of the twelve). It also found the cut ending in a dangling **en dash** - the strip set was ASCII and her titles are not. What is **not** exercised is publish: all twelve carry `photos 0`, and eBay requires an image to publish, so **the channel is blocked on photographs** rather than on anything in this repo. |
 | eBay's category suggestion is often wrong | **Verified, and it is why `--publish` refuses one.** On twelve real titles eBay's *first* suggestion was plainly wrong on at least three: **Women's Belts** for "Michael Kors Studded Ankle Boots", **Heels** for "Zara Mesh Heeled Sandals", **Other Outdoor Décor** for a religious plaque on a wood slice. The right category was in the list of three each time, second or third. So "suggest, then require confirming" is measured rather than cautious. Note three of the twelve came back with **no required aspects at all** (High Chairs, Collector Plates, Desks & Tables) - plausible, and unconfirmed: if that is the walker missing a shape rather than eBay meaning it, a publish degrades to eBay's one-aspect-per-round-trip refusal. |
 | **An eBay label PDF** | **Verified on a real one, end to end in software.** Her eBay label was put through the existing pipeline unmodified and came out right: cropped to exactly 4.00x6.00in, upright, every barcode complete, and `extract_label_fields` returned the correct tracking number, weight, service and recipient - the recipient being the buyer rather than her own return address, which is the one that posts a parcel to a stranger when it is wrong. Checked by rasterising the output and looking at it, not by trusting the arithmetic. **Not** printed on the G4 from the mail path; the equivalent page has printed through `mplabel send`. |
-| **An eBay label email** | **ASSUMED, and it is the whole gap in this feature.** No eBay `.eml` has ever been read - only the PDF that was attached to one, and the subject as she reported it ("Your shipping label is ready"). So three things are inference: that her label mail comes from a domain under **`ebay.com`**; that the subject is stable enough for `"shipping label"` to be the rule; and everything about the body, which is why nothing parses one. The failure mode if the domain is wrong is the bad kind - nothing prints and nothing says why - so `mplabel scan` was widened to survey eBay senders, and that survey is what settles it. One saved `.eml` closes all three. |
+| **An eBay label email** | **The envelope is verified; the body is still unread.** The widened `mplabel scan` settled the two inferences that mattered on the first run. The message count went from 306 to 427 - **121 messages matched `from:ebay.com`**, so her eBay mail really does arrive from a domain under it - and **2 came back classified `ebay_shipping_label`**, so the subject rule matches real mail rather than a reported phrasing. Both were the silent-failure kind: wrong, and nothing would have printed and nothing would have said why. What is still **ASSUMED** is every eBay *body*, which is why nothing parses one - so an eBay sale still arrives with no item, no price and no ship-by. One saved `.eml` closes that. |
+| What else eBay sends | **Surveyed, and it is a busier mailbox than ShopGoodwill's.** 121 messages against 2 labels. The families visible in the first attributed run: **`... has been listed`** (31, easily the loudest), **`You have a new offer: $N for ...`**, **`You made the sale for ...`**, and - unlike ShopGoodwill, where the whole mailbox carried none - **dispatch and delivery notices** (`Order update:`, `Your package is now with its carrier!`, `ORDER DELIVERED:`), plus a return, a purchase confirmation, a payouts notice and a monthly statement. None is classified and none is read. Worth knowing before building on it: the sale notification and the offer both carry a price, which is the figure the label email does not give. |
+| **A Facebook payout email exists** | **Verified - one, in the first whole-mailbox survey, classified `payout`.** It had never been seen, and it matters out of proportion to its count: the label email is *prepaid* and carries no postage charge, so the payout mail is the only plausible document that says what Facebook actually deducted. `EVENT_PATTERNS`' `payout` pattern was written blind and has now matched something real. **Nothing reads its body**, so whether the charge is in there is still open - and it is one `.eml` away from being answered, the same ask as the eBay one and with a bigger prize: it would turn `sales.postage` from a figure she types into one that arrives. |
 | The eBay order number | **Verified, from the one real label email - on its attachment's own filename**, `ebay-label-17-15142-59571.pdf`. So the filename is the reliable source for it and the body the speculative one, the opposite way round from Facebook, where 0 of 18 real labels carried a parseable id and the attachment name was the only one there was. `NN-NNNNN-NNNNN` is the shape. |
 | eBay order JSON and SKU rules | **ASSUMED.** Nothing has been pulled or pushed. The label geometry is no longer on this row - see above; what remains assumed is what the Sell APIs return. |
 | The release workflow | **UNRUN.** Every piece of it is a command that works on a Mac, and none of it has been executed once - not the runner label, not cloud signing, not the upload. The first tag is the experiment. What is checked in software: `version.sh` against good and bad tags, both workflows' shell blocks parse, and `check-archive.sh` refuses XcodeGen's placeholder version numbers. What cannot be: whether the API key's role is sufficient, whether `macos-26` has an iOS 26 SDK today, and whether App Store Connect accepts a three-part build number of this shape. |
@@ -1889,6 +1891,34 @@ inventory out of correspondence - rows for things she is trying to send
 *back*, with a cost on them. `ORDER_KINDS` is what `parse` branches on,
 before it looks at a single block.
 
+**A survey of three senders has to say which one sent each line.** The
+first attributed `scan` came back with **thirty-one `... has been
+listed`** notifications and no way to tell whether they were Facebook's
+`listed` event - a pattern that has sat in `EVENT_PATTERNS` since the
+beginning and never matched anything - or eBay's. The two read almost
+identically and want opposite handling: one goes in `EVENT_PATTERNS` and
+reconciles against her listings, the other is a channel nothing reads.
+`_headers_only` fetches FROM and REPLY-TO now, the unrecognised list is
+grouped under the sender, and `classify_for` asks **only** the classifier
+that owns that sender rather than trying all three and taking the first
+answer - which was the classifiers-merged failure this repo keeps
+refusing, one layer out, in the one place it had crept back in.
+
+The cut is per sender for the same reason it exists at all: a flat top 25
+spends its whole budget on the loudest sender, and the quiet one is
+always the one whose shapes nobody has read.
+
+**A truncated title is a variable part too, and eBay truncates
+everything.** It cuts the item name and ends it with an ellipsis, so
+`Vintage...`, `Vintage #...`, `Antique...` and `Andrea by Sadek...` are
+four histogram lines describing one notification - and on the real scan
+that single family took **eight of the twenty-five rows** while
+fifty-four other subjects went unshown. `generic_subject` folds the span
+back to the previous colon, so `Order update: …` and `You have a new
+offer: …` stay apart while the eight become one. Third fold in that
+function; each was added after a real survey was hidden by the thing it
+did not collapse.
+
 **A survey that prints its top 25 has to say what it could not show.**
 The real `scan` came back with twenty `Ticket ID # 9333904 Updated -
 <her own words>` lines, each its own subject, which filled the list and
@@ -2474,15 +2504,23 @@ correctly off it. Two geometric differences are now pinned as fixtures
 rather than luck - the opposite quarter turn, and ink that does not fill
 the label - and both are in *Things that will bite you*.
 
-**What is missing is one saved `.eml`**, and it is the only thing missing.
-Nothing about the envelope has ever been seen: the sending domain is
-inferred as `ebay.com`, the subject rule is her report of it, and the
-body is unread, so no item title, no price and no ship-by date reach the
-database. The consequences are specific and worth knowing before they
-are noticed: an eBay sale never links to its listing, and never earns a
-"parcel is due" notification. `mplabel scan` surveys eBay senders now, so
-the domain question at least has somewhere to be answered without
-guessing.
+**The envelope is settled and the body is not.** The widened `mplabel
+scan` answered both inferences on its first run: 121 messages matched
+`from:ebay.com`, and 2 came back classified `ebay_shipping_label`. So
+the domain is right and the subject rule matches real mail. What remains
+is every eBay *body*, which is why an eBay sale still arrives with no
+item title, no price and no ship-by date - it never links to its listing
+and never earns a "parcel is due" notification. **One saved `.eml`
+closes that**, and it is the only thing left.
+
+That survey also said what else eBay sends, which is a great deal: 121
+messages against 2 labels, led by 31 `... has been listed`
+notifications, and including **dispatch and delivery notices** - which
+ShopGoodwill's whole mailbox carried none of. Two of those families
+carry a **price**: `You have a new offer: $N for ...` and `You made the
+sale for ...`. That is the figure the label email does not give, so if
+the body of a label email turns out not to carry a price either, the
+sale notification is where to look next.
 
 eBay's API side, and the reasoning that shaped it, is in `docs/ebay.md`.
 **Phase 0 - the plumbing - is built**: `ebay.py` with a urllib client, the OAuth
@@ -2540,11 +2578,36 @@ eBay.
   `ebay_offers` to the listing it came from, or `link_sales` mints a
   phantom beside it and sell-through moves **down** on a sale.
 
+### Three emails would answer more than any code here
+
+The surveys have converged on the same shape of answer three times now:
+the subject lines are known and the bodies are not, and one saved `.eml`
+per family closes a question nothing else can. In rough order of what
+they buy:
+
+1. **A Facebook `payout`.** One exists - the survey found it. It is the
+   only plausible carrier of what Facebook actually deducted, and
+   `sales.postage` has been a figure typed by a person for the life of
+   this project because of it.
+2. **An eBay "Your shipping label is ready".** The envelope is settled;
+   the body is not, so an eBay sale has no item, no price and no
+   ship-by, links to no listing and earns no due-parcel notification.
+3. **A ShopGoodwill `Refund Issued`.** Nine in one survey, and returns
+   are roughly half her auction correspondence - a refund makes a
+   recorded `paid` wrong and nothing acts on one, which is the largest
+   known gap in the sourcing half.
+
+Each is File -> Download in Gmail, and each is worth more than a week of
+inference. Note the fixtures stay synthetic either way: work from the
+real one, commit a rebuilt one.
+
 ### Older, still true
 
 #25 USPS tracking is probably not available and one lookup settles it.
-#26 learn the real Facebook subjects, without which `backfill` finds
-almost nothing. #27 the Sheets call itself has never run. #28 the
+#26 learn the real Facebook subjects - the survey now attributes each
+unrecognised subject to its sender, so this is a shorter question than
+it was: the 31 `... has been listed` notifications are eBay's or
+Facebook's and the report says which. #27 the Sheets call itself has never run. #28 the
 saved-page parser has only ever seen a synthetic fixture. #29 multi-page
 label PDFs, #30 non-USPS carriers - both filed as known limitations
 rather than surprises.
