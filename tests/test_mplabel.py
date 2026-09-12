@@ -11992,6 +11992,7 @@ def test_the_survey_says_trash_is_on_a_clock(monkeypatch, capsys):
     # The archive's own line must not carry the warning.
     archive = [ln for ln in out.splitlines() if "All Mail" in ln][0]
     assert "purges" not in archive
+    
 def test_ground_advantage_is_filed_under_the_old_code():
     """The single most useful thing the real service list said.
 

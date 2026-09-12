@@ -562,7 +562,8 @@ hardware or a real Facebook account.
 | A Buy Now confirmation's body | **ASSUMED.** Treated as an acquisition, because BIN is bought-then-paid exactly as an auction is won-then-paid - so the payment receipt is still the only mail that fills a cost - and parsed with the payment mail's label extractor on the guess that ShopGoodwill reuses its own template. If that guess is wrong there are no items and `import_order` records the event and creates nothing, which is the right failure for a shape nobody has read. |
 | A ShopGoodwill order holds one item | **6 of 6 real orders did**, which is evidence and not proof. The multi-item path is unit-tested against a constructed two-item receipt and is the one that refuses to apportion; what has never been seen is a real one, so whether the second item's block is laid out like the first is still **ASSUMED**. `mplabel goodwill <eml>` without `--write` is how to check one when it turns up. |
 | Win titles and payment titles are cased differently | **Verified.** The win mail says `Pair Of World Wildlife Fund Stamp Collection Albums.` and the payment receipt for the same class of item says `VINTAGE CHINESE RICE GRAIN PORCELAIN BLUE AND WHITE MINI TEAPOT JINGDEZHEN`. So the stored title depends on which mail arrived first - `upsert_listing` fills blanks and does not overwrite. Harmless for reconciliation, because `_norm_title` lower-cases both, but it is why an inventory list has some shouting rows in it. |
-| No auction mail carries a shipped/delivered notice | **Nothing unrecognised came back on the re-run, so no dispatch mail reaches the inbox.** That is weaker than it sounds and does not close the question: the same survey proved the inbox is not where the auction mail lives, so a dispatch notice would have been archived along with the wins and the receipts. The run that settles it is the first one against the `\All` mailbox. Note the Gmail connector available to a Claude session is **tyevco@gmail.com**, the developer account, which has no auction mail in it at all; the selling and sourcing mail goes to a different address, so the Pi is the only place that can run it. |
+| No auction mail carries a shipped/delivered notice | **Verified, by the run that could finally see everything.** The first `backfill` across both folders walked 306 messages - 104 in `\All`, 202 in the Bin - and reported **0 unmatched subjects**: every subject in the whole mailbox fell into a known family, and none of them is a dispatch or delivery notice. The earlier inbox-only survey could not say this, because the auction mail had been archived out of the folder it was reading. So tracking a ShopGoodwill parcel is not something this mailbox can ever supply. Note the Gmail connector available to a Claude session is **tyevco@gmail.com**, the developer account, which has no auction mail in it at all; the selling and sourcing mail goes to a different address, so the Pi is the only place that can run it. |
+| The whole-mailbox import | **Run, and it balances.** 306 messages walked, 52 events added, 180 ShopGoodwill orders imported, 74 skipped as already seen, 0 unmatched - which accounts for every message. `listings` went to `{'acquired': 111, 'active': 139, 'sold': 63}`. Two things that were reasoned about are now measured. **Excluding `acquired` from the sell-through denominator is load bearing on real data**: 63/202 reads 31.2%, and counting the 111 acquired rows would have reported 20.1% - a third of her sell-through wiped out by stock arriving, which is the exact inversion `v_price_band`'s `WHERE state <> 'acquired'` exists to prevent. And 180 orders each created a **trip**, so the phone's sourcing-run card and `TripsView` are now mostly online orders rather than shop visits; that is correct - an order *is* a shop, a day and a receipt - but it is a screen designed around ten trips now holding a hundred. What the log does **not** say is how many of the 111 carry a `paid`: a win with no payment receipt behind it is inventory with no cost, and cost basis was the whole point. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
 | eBay OAuth on a headless Pi | **ASSUMED.** The consent URL, the code exchange and the refresh are written and unit-tested against a replaced `_transport`; none has been sent to eBay. The refresh token's ~18-month lifetime is reported *only* on the initial exchange, so `exchange_code` records the absolute expiry there or it cannot be recovered - `ebay check` counts it down. |
 | eBay business-policy prerequisites | **ASSUMED, and they bite earlier than they read.** Opt-in plus fulfillment/payment/return policies and an inventory location look like publish-time requirements; eBay validates them when the **offer is created**. So they gate the first push even though nothing here ever publishes. |
@@ -2207,9 +2208,35 @@ but the recognised list held no win and no payment receipt at all, out
 of 99 messages. Those mails had been archived, and `backfill` walked
 INBOX, so an import against that account would have produced no
 inventory and no cost basis while looking like it worked. It walks the
-archive now. **The next `scan` is the first one that has ever seen the
-whole mailbox**, and it is what settles the dispatch-mail question and
-says how much history is actually there to import.
+archive now.
+
+**And then the whole mailbox was walked, which answered both of the
+questions that paragraph left open.** 306 messages - 104 in `\All`, 202
+in the Bin - produced 52 events, **180 ShopGoodwill orders**, 74 already
+seen and **0 unmatched subjects**, and left `listings` at
+`{'acquired': 111, 'active': 139, 'sold': 63}`. So: there is no dispatch
+mail, because nothing in the entire mailbox was unrecognised; and there
+was a great deal of history to import, two thirds of it in the Bin. The
+sourcing half is no longer a route with nothing on it - it is a hundred
+and eleven things on a shelf that arrived without anybody typing.
+
+What that run does **not** report is the number the whole half exists
+for: how many of the 111 carry a `paid`. A win creates the row and only
+the payment receipt fills the cost, either mail can be missing, and 180
+orders against 111 acquired rows says plenty of them paired up - but
+plenty is not a number. `mplabel stats` shows the bought-not-listed
+table, and the direct question is one query:
+
+```sql
+SELECT COUNT(*) AS acquired,
+       COUNT(paid) AS costed,
+       ROUND(SUM(paid), 2) AS spent
+  FROM listings WHERE state = 'acquired';
+```
+
+An uncosted acquired row is a win whose receipt was deleted before the
+poller ever saw it, which is the rescue window closing in the one place
+it actually costs something.
 
 That parser has since been run over **every** message in the two saved
 threads - 5 real wins and 6 real payment receipts - and all 11 came out
