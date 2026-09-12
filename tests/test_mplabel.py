@@ -11507,6 +11507,113 @@ def test_the_survey_folds_an_id_out_of_a_machine_subject(monkeypatch, capsys):
     assert "3  Order # shipped" in out, out
 
 
+def test_a_refusal_keeps_the_half_that_says_why():
+    """`message or longMessage` threw away the useful one.
+
+    A real sandbox refusal came back as `20403: Invalid .` - eBay's own
+    template with an empty field name - while `longMessage` carried the
+    reason. A diagnostic that discards the diagnosis is worse than none,
+    because it reads as the whole answer and sends you looking at the
+    request instead of the account.
+    """
+    from mplabel import ebay
+
+    line = ebay.describe_errors({"errors": [{
+        "errorId": 20403,
+        "message": "Invalid .",
+        "longMessage": "The seller is not opted in to business policies.",
+    }]})
+    assert "not opted in" in line
+    # The empty template must not stand in for a message.
+    assert "Invalid ." not in line
+
+    # Both are kept when both say something, and not duplicated when
+    # they say the same thing.
+    both = ebay.describe_errors({"errors": [{
+        "errorId": 25002, "message": "A user error has occurred.",
+        "longMessage": "The SKU is already in use."}]})
+    assert "A user error" in both and "already in use" in both
+    same = ebay.describe_errors({"errors": [{
+        "errorId": 1, "message": "Nope.", "longMessage": "Nope."}]})
+    assert same.count("Nope.") == 1
+
+
+def test_ebay_setup_asks_about_the_programme_before_the_policies(tmp_path,
+                                                                  monkeypatch,
+                                                                  capsys):
+    """An account that never joined cannot have policies at all.
+
+    eBay answers the policy list for such an account with `20403:
+    Invalid .`, which reads as a malformed request. Asking the question
+    whose answer is legible - which programmes is this account in - is
+    what turns that into a sentence naming the actual problem.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    ebay.save_tokens(cfg, {"environment": "sandbox", "access_token": "a",
+                           "refresh_token": "r",
+                           "scopes": list(ebay.SCOPES)})
+    monkeypatch.setattr(ebay, "opted_in_programs", lambda cfg_: ["OUT_OF_STOCK_CONTROL"])
+    called = []
+    monkeypatch.setattr(ebay, "ensure_policies",
+                        lambda *a, **k: called.append("policies"))
+    monkeypatch.setattr(ebay, "opt_in_to_program",
+                        lambda *a, **k: called.append("opt_in"))
+
+    code = cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="setup",
+                                                dry_run=False, opt_in=False))
+    assert code == 78
+    err = capsys.readouterr().err
+    assert "SELLING_POLICY_MANAGEMENT" in err and "--opt-in" in err
+    assert called == [], "nothing should be attempted before the programme"
+
+
+def test_ebay_setup_joins_the_programme_only_when_asked(tmp_path, monkeypatch,
+                                                        capsys):
+    """Opting in changes how every listing on the account is managed.
+
+    So it is never a side effect of a command someone ran to find out
+    what was wrong - the same reasoning as `--publish`. And eBay takes
+    up to 24 hours, so a successful call is a request rather than a
+    state change, and `setup` says so instead of going on to create
+    policies that would be refused for the next day.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    ebay.save_tokens(cfg, {"environment": "sandbox", "access_token": "a",
+                           "refresh_token": "r",
+                           "scopes": list(ebay.SCOPES)})
+    monkeypatch.setattr(ebay, "opted_in_programs", lambda cfg_: [])
+    order = []
+    monkeypatch.setattr(ebay, "opt_in_to_program",
+                        lambda cfg_, program=None: order.append("opt_in"))
+    monkeypatch.setattr(ebay, "ensure_policies",
+                        lambda *a, **k: order.append("policies"))
+
+    code = cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="setup",
+                                                dry_run=False, opt_in=True))
+    assert code == 0
+    assert order == ["opt_in"], "policies must wait for eBay to process it"
+    out = capsys.readouterr().out
+    assert "24 hours" in out
+
+
+def test_the_programme_opt_in_is_a_post_to_the_documented_path(monkeypatch):
+    """Pinned because a wrong path here 404s, and a 404 on a POST reads
+    as the account lacking the feature rather than the URL being wrong."""
+    from mplabel import ebay
+
+    seen = []
+    monkeypatch.setattr(ebay, "call",
+                        lambda cfg, method, path, body=None, **k: (
+                            seen.append((method, path, body)), (204, {}))[1])
+    ebay.opt_in_to_program({})
+    assert seen == [("POST", "/sell/account/v1/program/opt_in",
+                     {"programType": "SELLING_POLICY_MANAGEMENT"})]
 # --------------------------------------------------------------------------
 # The survey that found nothing, and why that was the finding.
 #

@@ -2309,6 +2309,34 @@ def cmd_ebay(cfg, args):
                       "`mplabel ebay auth` again to re-consent.",
                       file=sys.stderr)
                 return 78
+
+            # Before anything else: an account that has not joined the
+            # business-policies programme cannot have policies at all,
+            # and eBay's refusal for that is its own template with an
+            # empty field name - `20403: Invalid .` - which reads as a
+            # malformed request rather than an account that never opted
+            # in. Ask the question whose answer is legible.
+            joined = ebay_mod.opted_in_programs(cfg)
+            if ebay_mod.POLICY_PROGRAM not in joined:
+                if not args.opt_in:
+                    print(f"this account has not joined "
+                          f"{ebay_mod.POLICY_PROGRAM}, so it cannot have\n"
+                          f"business policies at all. It is in: "
+                          f"{', '.join(joined) or '(no programmes)'}\n\n"
+                          f"Re-run with --opt-in to join it. That is an "
+                          f"account-level change affecting\nevery listing, "
+                          f"which is why it is not done for you - and eBay "
+                          f"can take\n24 hours to process it, so `setup` "
+                          f"may need running again tomorrow.",
+                          file=sys.stderr)
+                    return 78
+                ebay_mod.opt_in_to_program(cfg)
+                print(f"asked eBay to join {ebay_mod.POLICY_PROGRAM}.\n"
+                      f"This can take up to 24 hours to take effect. Run "
+                      f"`mplabel ebay setup` again\nonce it has, to create "
+                      f"the policies.")
+                return 0
+
             policies = ebay_mod.ensure_policies(cfg, dry_run=args.dry_run)
             key, what = ebay_mod.ensure_location(cfg, dry_run=args.dry_run)
         except ebay_mod.EbayConfigError as exc:
@@ -3276,6 +3304,11 @@ def _main():
                              "Needs the sell.account scope")
     e.add_argument("--dry-run", action="store_true",
                    help="say what it would create and create nothing")
+    e.add_argument("--opt-in", action="store_true",
+                   help="join the business-policies seller programme. An "
+                        "account-level change affecting every listing, so "
+                        "it is never done without this flag - and eBay can "
+                        "take 24 hours to process it")
     e = esub.add_parser("push",
                         help="one listing as an eBay inventory item and an "
                              "unpublished offer")

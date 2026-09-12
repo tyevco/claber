@@ -116,7 +116,7 @@ run against a real database.
 | `ebay check` | config, tokens, and how long the refresh token has left. Changes nothing, sends nothing, exits **78** if anything needs attention. No DB |
 | `ebay pull [--since D] [--limit N] --dry-run` | eBay orders as `sales` rows. `--dry-run` is the **only** mode: it prints what it would record and writes nothing, and refuses with exit **2** without the flag |
 | `ebay skus` | every SKU already on the eBay account. Read only, and worth one call before the first push - eBay's SKU uniqueness is permanent. No DB |
-| `ebay setup [--dry-run]` | create the three business policies and the inventory location an offer has to name. Needs the `sell.account` **write** scope, so a token minted before that existed has to re-consent. Will not rewrite a policy that is already there. No DB |
+| `ebay setup [--dry-run] [--opt-in]` | create the three business policies and the inventory location an offer has to name. Checks the `SELLING_POLICY_MANAGEMENT` programme **first**, because eBay's refusal for an account that never joined is `20403: Invalid .`. Needs the `sell.account` **write** scope, so a token minted before that existed has to re-consent. Will not rewrite a policy that is already there. No DB |
 | `supvan-probe [--device] [--deep]` | status of the 48mm inventory label maker. Reads only - moves no paper. `--deep` also sends the other read-only commands and shows their raw replies |
 | `test-print` | reprint the newest label |
 | `reprint <ref>` | reprint one |
@@ -783,6 +783,26 @@ is one - a mid-word cut reads as a corrupted listing rather than a long
 one - and `push` prints what it actually sent, because the desk shows
 her full title and eBay shows 80 characters of it with nothing else
 anywhere saying they differ.
+
+**A diagnostic that discards the diagnosis is worse than none.**
+`describe_errors` read `message or longMessage`, which looks like a
+sensible preference and threw away the useful half. A real sandbox
+refusal arrived as **`20403: Invalid .`** - eBay's own template with an
+empty field name - while `longMessage` carried the reason. It reads as
+the whole answer, so it sends you to check the query string rather than
+the account. Both texts now, when they differ, and a template with
+nothing filled in does not stand in for a message.
+
+What that one was actually saying: **business policies are a seller
+*programme*, and an account that has not joined
+`SELLING_POLICY_MANAGEMENT` cannot have policies at all.** So `ebay
+setup` asks `get_opted_in_programs` first, because that question has a
+legible answer. Joining is `--opt-in` rather than automatic - it changes
+how every listing on the account is managed, which is not a side effect
+of a command someone ran to find out what was wrong - and eBay takes up
+to 24 hours, so the call is a request rather than a state change and
+`setup` stops there rather than creating policies that would be refused
+until tomorrow.
 
 **Widening `SCOPES` does not widen a token.** `refresh_access` replays
 the scopes that were actually *granted*, deliberately - so adding

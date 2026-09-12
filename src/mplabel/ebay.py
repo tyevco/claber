@@ -467,14 +467,29 @@ def call(cfg, method, path, body=None, marketplace=None, headers=None):
 def describe_errors(payload):
     """eBay's `errors` array as one readable line.
 
-    Worth its own function because the interesting part is usually
-    `parameters`, which names the field that was wrong, and it is nested
-    two levels down where nobody looks.
+    Worth its own function because the interesting part is scattered:
+    `parameters` names the field that was wrong and is nested two levels
+    down, and `longMessage` is often the only one of the two texts that
+    says anything.
+
+    **Both texts, when they differ.** This used to be
+    `message or longMessage`, which reads as a sensible preference and
+    threw away the useful half: a real sandbox refusal came back as
+    `20403: Invalid .` - eBay's template with an empty field name - while
+    `longMessage` carried the actual reason. A diagnostic that discards
+    the diagnosis is worse than none, because it looks like the whole
+    answer.
     """
     errors = (payload or {}).get("errors") or []
     parts = []
     for err in errors:
-        text = err.get("message") or err.get("longMessage") or "?"
+        short = (err.get("message") or "").strip()
+        long = (err.get("longMessage") or "").strip()
+        # A template with nothing filled in - "Invalid ." - is not a
+        # message, so do not let it stand in for one.
+        if short.rstrip(" .") in ("", "Invalid"):
+            short = ""
+        text = " - ".join(dict.fromkeys(t for t in (short, long) if t)) or "?"
         params = ", ".join(
             f"{p.get('name')}={p.get('value')}"
             for p in err.get("parameters") or [] if p.get("name"))
@@ -1270,3 +1285,48 @@ def publish_offer(cfg, offer_id):
         raise EbayError(f"eBay refused to publish ({status}): "
                         + describe_errors(payload))
     return payload.get("listingId")
+
+
+# ------------------------------------------------ the programme opt-in
+
+PROGRAM_PATH = "/sell/account/v1/program"
+
+# Business policies are a seller *programme*, and an account that has not
+# joined it cannot have policies at all. eBay's refusal for that is not
+# the sentence you would expect: a real sandbox account answered the
+# policy list with `20403: Invalid .` - its own template with an empty
+# field name - which reads as a malformed request rather than an account
+# that has not opted in.
+POLICY_PROGRAM = "SELLING_POLICY_MANAGEMENT"
+
+
+def opted_in_programs(cfg):
+    """Which seller programmes this account has joined."""
+    status, payload = call(
+        cfg, "GET", f"{PROGRAM_PATH}/get_opted_in_programs")
+    if status != 200:
+        raise EbayError(f"eBay refused the programme list ({status}): "
+                        + describe_errors(payload))
+    return [row.get("programType") for row in payload.get("programs") or []
+            if row.get("programType")]
+
+
+def opt_in_to_program(cfg, program=POLICY_PROGRAM):
+    """Join a seller programme. Account-level, and not instant.
+
+    eBay says this can take **up to 24 hours** to process, so a
+    successful call is a request rather than a state change - `setup`
+    says so rather than going straight on to create policies that would
+    be refused for the next day.
+
+    Never called without an explicit flag. Opting an account into
+    business policies changes how every listing on it is managed, which
+    is not a thing to do as a side effect of a command someone ran to
+    find out what was wrong.
+    """
+    status, payload = call(cfg, "POST", f"{PROGRAM_PATH}/opt_in",
+                           {"programType": program})
+    if status not in (200, 201, 204):
+        raise EbayError(f"eBay refused the opt-in ({status}): "
+                        + describe_errors(payload))
+    return program
