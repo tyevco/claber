@@ -565,10 +565,12 @@ hardware or a real Facebook account.
 | No auction mail carries a shipped/delivered notice | **Verified, by the run that could finally see everything.** The first `backfill` across both folders walked 306 messages - 104 in `\All`, 202 in the Bin - and reported **0 unmatched subjects**: every subject in the whole mailbox fell into a known family, and none of them is a dispatch or delivery notice. The earlier inbox-only survey could not say this, because the auction mail had been archived out of the folder it was reading. So tracking a ShopGoodwill parcel is not something this mailbox can ever supply. Note the Gmail connector available to a Claude session is **tyevco@gmail.com**, the developer account, which has no auction mail in it at all; the selling and sourcing mail goes to a different address, so the Pi is the only place that can run it. |
 | The whole-mailbox import | **Run, and it balances.** 306 messages walked, 52 events added, 180 ShopGoodwill orders imported, 74 skipped as already seen, 0 unmatched - which accounts for every message. `listings` went to `{'acquired': 111, 'active': 139, 'sold': 63}`. Two things that were reasoned about are now measured. **Excluding `acquired` from the sell-through denominator is load bearing on real data**: 63/202 reads 31.2%, and counting the 111 acquired rows would have reported 20.1% - a third of her sell-through wiped out by stock arriving, which is the exact inversion `v_price_band`'s `WHERE state <> 'acquired'` exists to prevent. And 180 orders each created a **trip**, so the phone's sourcing-run card and `TripsView` are now mostly online orders rather than shop visits; that is correct - an order *is* a shop, a day and a receipt - but it is a screen designed around ten trips now holding a hundred. What the log does **not** say is how many of the 111 carry a `paid`: a win with no payment receipt behind it is inventory with no cost, and cost basis was the whole point. |
 | Google Sheets sync | **UNTESTED against the API.** Only the dry-run payload path is covered. |
-| eBay OAuth on a headless Pi | **ASSUMED.** The consent URL, the code exchange and the refresh are written and unit-tested against a replaced `_transport`; none has been sent to eBay. The refresh token's ~18-month lifetime is reported *only* on the initial exchange, so `exchange_code` records the absolute expiry there or it cannot be recovered - `ebay check` counts it down. |
-| eBay business-policy prerequisites | **ASSUMED, and they bite earlier than they read.** Opt-in plus fulfillment/payment/return policies and an inventory location look like publish-time requirements; eBay validates them when the **offer is created**. So they gate the first push even though nothing here ever publishes. |
+| eBay OAuth on a headless Pi | **Verified against the sandbox.** Consent in a browser elsewhere, the code pasted back, and every call since has been made on a refreshed token - `ebay check` reports 546 days left on the refresh token, which means `exchange_code` recorded the expiry eBay only states once. The headless split works: nothing on the Pi ever opened a browser. **Production is a separate consent** and nothing has touched it. |
+| eBay business-policy prerequisites | **Verified, and they do bite at offer creation.** Twelve real `ebay push` runs created twelve offers against the three policies `ebay setup` made and the `home` location - so the programme opt-in, the policy bodies, the shipping service and the ship-from address are all accepted by a real account, and the reasoning that they gate the *first push* rather than the publish is confirmed rather than inferred. |
 | eBay account-deletion compliance | **ASSUMED and not built.** Subscribing or opting out is required before the first *production* call, and opting out needs storing no eBay data - which we will. Sandbox needs none of it, which is why sandbox is first. |
-| eBay order JSON, label geometry, SKU rules | **ASSUMED.** Nothing has been pulled, attached or pushed. In particular an eBay 4x6 is a different page from Facebook's and `extract_label_fields` is verified against exactly one real label. |
+| eBay push: inventory item and unpublished offer | **Verified on twelve real listings.** Every `PUT` inventory item and every offer was accepted first time, so `MP-<CODE>` is an acceptable SKU, `inventory_item_body` and `offer_body` are the shapes eBay wants, and the 80-character cut fires on real titles (four of the twelve). It also found the cut ending in a dangling **en dash** - the strip set was ASCII and her titles are not. What is **not** exercised is publish: all twelve carry `photos 0`, and eBay requires an image to publish, so **the channel is blocked on photographs** rather than on anything in this repo. |
+| eBay's category suggestion is often wrong | **Verified, and it is why `--publish` refuses one.** On twelve real titles eBay's *first* suggestion was plainly wrong on at least three: **Women's Belts** for "Michael Kors Studded Ankle Boots", **Heels** for "Zara Mesh Heeled Sandals", **Other Outdoor Décor** for a religious plaque on a wood slice. The right category was in the list of three each time, second or third. So "suggest, then require confirming" is measured rather than cautious. Note three of the twelve came back with **no required aspects at all** (High Chairs, Collector Plates, Desks & Tables) - plausible, and unconfirmed: if that is the walker missing a shape rather than eBay meaning it, a publish degrades to eBay's one-aspect-per-round-trip refusal. |
+| eBay order JSON and label geometry | **ASSUMED.** Nothing has been pulled or attached. In particular an eBay 4x6 is a different page from Facebook's and `extract_label_fields` is verified against exactly one real label. |
 | The release workflow | **UNRUN.** Every piece of it is a command that works on a Mac, and none of it has been executed once - not the runner label, not cloud signing, not the upload. The first tag is the experiment. What is checked in software: `version.sh` against good and bad tags, both workflows' shell blocks parse, and `check-archive.sh` refuses XcodeGen's placeholder version numbers. What cannot be: whether the API key's role is sufficient, whether `macos-26` has an iOS 26 SDK today, and whether App Store Connect accepts a three-part build number of this shape. |
 
 When the user reports real-world results, move rows up this table and
@@ -778,6 +780,28 @@ And `--publish` is refused outright on production. That is a property
 rather than a prompt, and it is what makes the path testable at all: a
 design where publish cannot be called means that code runs against her
 real account the first time anybody tries it.
+
+**A cosmetic call must not be able to fail a command.** `ebay push`
+asked for the category suggestions unconditionally, and a sandbox **500
+- `62000: There was a problem with an eBay internal system`** on that
+endpoint killed a `push --category 38204 --publish` that carried every
+value it needed. Once `--category` is given the suggestions are only the
+list the choice is *printed against*; without it, one of them becomes
+the category. So the same failure is fatal in one case and cosmetic in
+the other, and it says which happened - a missing comparison reads as
+agreement. `required_aspects` is deliberately **not** made tolerant the
+same way: those gate `--publish`, and swallowing their failure would
+publish without knowing what eBay requires, which is the one thing
+asking for them early exists to prevent.
+
+The other half of that run: a category **not among the suggestions** is
+now said out loud. Overriding is legitimate - eBay's first guess was
+plainly wrong on three of twelve real titles - but it is also exactly
+what a mis-pasted id looks like, and one reached eBay from a worked
+example in a chat message. It was caught only because that id happened
+not to be a leaf (`62009: The specified category ID must be a leaf
+category`); a valid leaf would have listed the thing somewhere nobody
+searching for it would ever look, silently.
 
 **eBay's title limit is 80 and hers run past a hundred.** So the cut
 fires often rather than never. It falls at a word boundary where there

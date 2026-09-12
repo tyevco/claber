@@ -1213,6 +1213,19 @@ def photo_reachable(cfg, url, timeout=10):
 TITLE_LIMIT = 80
 
 
+# What a cut title must not end in. The ASCII set was the obvious one
+# and it was the wrong one: her titles separate clauses with an **en
+# dash**, not a hyphen - "1988 Ben Richmond ... Collector Plate #445 -
+# Richmond Gallery Ohio" - so a real push came out ending in a dangling
+# U+2013, which reads as a corrupted listing rather than a long one,
+# which is the whole thing the word-boundary cut exists to avoid.
+# Written as an explicit set rather than a category test because the
+# question is "does this read as an unfinished sentence", not "is this
+# punctuation": a trailing full stop is fine and a trailing ampersand
+# is not.
+TRAILING_JUNK = " \t,;:-/|&+\u2010\u2011\u2012\u2013\u2014\u2015\u2212\u00b7\u2022"
+
+
 def ebay_title(title):
     """The title eBay will accept, cut at a word where it can be.
 
@@ -1231,7 +1244,7 @@ def ebay_title(title):
     # cutting it hard is better than returning almost nothing.
     if space > TITLE_LIMIT * 0.75:
         cut = cut[:space]
-    return cut.rstrip(" ,;-/")
+    return cut.rstrip(TRAILING_JUNK)
 
 
 def inventory_item_body(listing, image_urls, aspects=None):

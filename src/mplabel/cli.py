@@ -2607,9 +2607,30 @@ def cmd_ebay_push(cfg, conn, args):
         image_urls = [ebay_mod.photo_url(cfg, d) for d in digests] \
             if digests else []
 
-        suggestions = ebay_mod.suggest_categories(cfg, row.get("title"))
+        # Asked for even when `--category` was given, because the
+        # suggestions are what the printout compares the chosen one
+        # against - but *only* load bearing when it was not, since
+        # that is the case where one of them becomes the category.
+        # So its failure is fatal in one case and cosmetic in the
+        # other, and treating it as fatal in both cost a real run: a
+        # sandbox 500 on this endpoint killed a `push --category
+        # 38204 --publish` that had every value it needed. Same
+        # reasoning as `setup` falling back on the shipping-service
+        # list rather than stopping - and it says which happened,
+        # because a missing comparison read as agreement.
+        suggestions, suggest_failed = [], None
+        try:
+            suggestions = ebay_mod.suggest_categories(cfg, row.get("title"))
+        except ebay_mod.EbayError as exc:
+            if not args.category:
+                raise
+            suggest_failed = str(exc)
         category = args.category or (suggestions[0]["id"]
                                      if suggestions else None)
+        # Deliberately *not* made tolerant the same way: these gate
+        # `--publish`, so swallowing a failure here would publish
+        # without knowing what eBay requires, which is the one thing
+        # asking for them early exists to prevent.
         needed = ebay_mod.required_aspects(cfg, category) if category else []
     except ebay_mod.EbayConfigError as exc:
         print(f"ebay: {exc}", file=sys.stderr)
@@ -2634,9 +2655,21 @@ def cmd_ebay_push(cfg, conn, args):
         print(f"             {url}")
     if suggestions:
         print("  eBay suggests:")
-        for i, guess in enumerate(suggestions):
+        for guess in suggestions:
             mark = "*" if str(guess["id"]) == str(category) else " "
             print(f"           {mark} {guess['id']}  {guess['path']}")
+        if args.category and not any(str(g["id"]) == str(args.category)
+                                     for g in suggestions):
+            # Overriding is legitimate - eBay's first guess has been
+            # plainly wrong on real titles - but a category that is not
+            # in the list is also what a mis-pasted one looks like, and
+            # a wrong category is a listing nobody searching for the
+            # thing will ever see.
+            print(f"             ^ {args.category} is not one of these. "
+                  f"Fine if you meant it.")
+    elif suggest_failed:
+        print(f"  eBay could not suggest a category ({suggest_failed}),\n"
+              f"             so {category} is unchecked against its guesses.")
     missing = [a for a in needed if a not in aspects]
     if needed:
         print(f"  required aspects for {category}: " + ", ".join(needed))
