@@ -11695,7 +11695,7 @@ def test_the_survey_names_the_folder_it_walked(monkeypatch, capsys):
     backfill.scan({"imap_folder": "INBOX"})
     out = capsys.readouterr().out
     assert "in [Gmail]/All Mail" in out
-    assert "not INBOX" in out
+    assert "INBOX" not in out, "walked the inbox, where the auction mail is not"
     # And the family that was crowding the list is recognised now.
     assert "goodwill_refund" in out
 
@@ -11888,3 +11888,103 @@ def test_the_poll_loop_quotes_its_folder_too():
     source = inspect.getsource(cli.poll_once)
     assert "quote_mailbox(cfg[\"imap_folder\"])" in source
     assert backfill.quote_mailbox("My Label") == '"My Label"'
+
+
+# --------------------------------------------------------------------------
+# She deletes the mail.
+#
+# Which changes what `backfill` is. Its first line says it reconstructs
+# her history; a deleted receipt is not in the archive to reconstruct
+# from, and Gmail's `\All` mailbox deliberately excludes Trash. So the
+# archive alone still misses purchases, and Trash is a 30-day rescue
+# window rather than a second archive.
+
+class _GmailFolders:
+    """A server that has both special-use mailboxes and answers per one."""
+
+    def __init__(self, counts=None):
+        self.counts = counts or {"[Gmail]/All Mail": [b"1", b"2"],
+                                 "[Gmail]/Trash": [b"7"]}
+        self.selected = None
+        self.searched = []
+
+    def list(self):
+        return "OK", [br'(\HasNoChildren \All) "/" "[Gmail]/All Mail"',
+                      br'(\HasNoChildren \Trash) "/" "[Gmail]/Trash"']
+
+    def select(self, mailbox, readonly=False):
+        name = mailbox.decode() if isinstance(mailbox, bytes) else str(mailbox)
+        self.selected = name[1:-1] if name.startswith('"') else name
+        return "OK", [b"1"]
+
+    def search(self, charset, query):
+        self.searched.append(self.selected)
+        return "OK", [b" ".join(self.counts.get(self.selected, []))]
+
+    def close(self):
+        pass
+
+    def logout(self):
+        pass
+
+
+def test_trash_is_walked_because_she_deletes_the_mail():
+    """A deleted receipt does not undo the purchase it recorded - the
+    money left her account either way and the cost basis is still true.
+    Gmail's `\\All` mailbox excludes Trash, so the archive alone still
+    misses whatever she cleared out."""
+    from mplabel import backfill
+
+    folders = backfill.survey_folders(_GmailFolders(), {"imap_folder": "INBOX"})
+    assert folders == ["[Gmail]/All Mail", "[Gmail]/Trash"]
+
+
+def test_a_configured_label_is_still_walked_with_trash_after_it():
+    """Setting `imap_folder` answers "her mail is filtered into a
+    label"; it does not answer "and she never deletes any of it"."""
+    from mplabel import backfill
+
+    folders = backfill.survey_folders(_GmailFolders(),
+                                      {"imap_folder": "Marketplace"})
+    assert folders == ["Marketplace", "[Gmail]/Trash"]
+
+
+def test_a_server_with_no_trash_is_not_a_problem():
+    from mplabel import backfill
+
+    plain = _QuietIMAP([br'(\\HasNoChildren) "/" "INBOX"'])
+    assert backfill.survey_folders(plain, {"imap_folder": "INBOX"}) == ["INBOX"]
+
+
+def test_each_folder_is_searched_in_its_own_selection():
+    """A message number means nothing outside the mailbox it was
+    searched in, so these are walked one at a time rather than searched
+    together."""
+    from mplabel import backfill
+
+    imap = _GmailFolders()
+    for folder in backfill.survey_folders(imap, {"imap_folder": "INBOX"}):
+        backfill._search_all(imap, folder)
+    assert imap.searched == ["[Gmail]/All Mail", "[Gmail]/Trash"]
+
+
+def test_the_survey_says_trash_is_on_a_clock(monkeypatch, capsys):
+    """Gmail empties it after 30 days, so what is in there now is
+    recoverable and what was in there last month is gone. A count with
+    no deadline beside it reads like a second archive."""
+    from mplabel import backfill
+
+    imap = _GmailFolders()
+    monkeypatch.setattr(backfill, "_connect", lambda cfg: imap)
+    monkeypatch.setattr(
+        backfill, "_headers_only",
+        lambda i, nums: [email.message_from_string("Subject: Refund Issued\n\n")
+                         for _ in nums])
+
+    backfill.scan({"imap_folder": "INBOX"})
+    out = capsys.readouterr().out
+    assert "1 Facebook/ShopGoodwill message(s) in [Gmail]/Trash" in out
+    assert "purges" in out
+    # The archive's own line must not carry the warning.
+    archive = [ln for ln in out.splitlines() if "All Mail" in ln][0]
+    assert "purges" not in archive

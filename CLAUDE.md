@@ -554,6 +554,7 @@ hardware or a real Facebook account.
 | The desk portal, on her real data | **Verified: it is running against the real database.** Which immediately found what seeded data could not - the queue titles overlapped their prices, because her titles run past a hundred characters where the design was drawn against forty, and because a `<span>` ignores `text-overflow` however carefully it is set. The seed carries titles that long now. Still not checked on real data: the CSV import wizard, and Month-end against a full year. |
 | The desk portal | **Runs, and every screen has been looked at against seeded data in both themes.** Six screens at `/desk`, driven in headless Edge over CDP: the queue's confirm-and-print dialog, a bulk edit of three rows through `POST /api/inventory/bulk`, the search box keeping its caret, the CSV wizard through mapping and preview. That walk found five things the assertions did not - a figure that was really a `LIMIT`, a focus restore undone by a later render, a theme button that never changed its own label, an `era` column the endpoint had never sent, and a photo placeholder that lied about drafts with photographs. **Not** run against real data, and not on a real laptop over the tunnel - `tools/desk-preview.py` seeds a throwaway database and nothing here has met a real order. |
 | ShopGoodwill mail shapes | **Verified against 11 real messages** - every one parsed correctly. The two saved threads are Gmail print views holding 5 real wins and 6 real payment receipts, and `goodwill.parse` was run over all of them: every item number, title, price, order number, subtotal, tax, postage, order total, payment date and selling Goodwill came out right. Real shapes that turned out to matter and are now in the fixtures: **`<font color="#550055">` interleaved at arbitrary points** in 4 of the 5 wins - one opens mid-sentence just before the price and the seller line arrives with a closing tag stuck to its front; a **title ending in a full stop** before the template's `!` (`...Albums.!`); **double quotes inside titles** (`16.5X29.75" FRAME`, `"THE DAILY HERALD"`); and **postage of $0.01** as a free-postage sentinel, where the landed cost is still the order total. The fixtures had none of the font interleaving before this, so they were a tidier document than anything the parser will meet. |
+| **She deletes this mail** | **Reported, and it reframes the auction half.** `backfill` says it reconstructs her history; a deleted receipt is not there to reconstruct from, and Gmail's `\All` mailbox excludes Trash - so preferring the archive still missed whatever she had cleared out. `survey_folders` walks Trash as well now, and `scan` prints the thirty-day purge deadline beside that count, because it is a rescue window rather than a second archive. **The consequence upstream is the one that matters: the poller is the only durable capture there is.** Mail deleted before it is polled leaves no gap to detect - just a purchase with no cost basis and no row. How *fast* she deletes is still unmeasured, and it is what decides whether anything is being lost today. |
 | **The auction mail is not in the inbox** | **Verified, and it is the finding of the second survey.** A re-run of `mplabel scan` classified every subject - and the recognised list carried **no `goodwill_won` and no `goodwill_paid` at all**, out of 99 messages: 47 return tickets, 22 shipping labels, 9 refunds, 8 sales, 5 retracted bids, 4 purchases, 2 Buy Now confirmations, 1 inquiry, 1 payment reminder. The wins and payment receipts exist - eleven of them are the saved threads - so they had been archived out of INBOX. `backfill` walked one folder, so against that account it would have imported **zero acquisitions and zero costs** and reported success. It walks the `\All` special-use mailbox now, found by its flag rather than its name. |
 | The ShopGoodwill subject families | **Surveyed against the real mailbox, and the second run was clean** - every subject classified, nothing unrecognised. `mplabel scan` reported roughly sixty unrecognised ShopGoodwill subjects against the eleven this module was built for, in five families, all now classified: **Buy Now Confirmation** (a second way she acquires things, and invisible until the survey - the win mail's own seller message mentions BIN sales, so it was always there to be found), **Refund Issued** (nine of them), **Bid Has Been Retracted** (five), **Ticket ID # N Updated - <her words>** (thirty-odd: her own return correspondence - "broken item", "missing part", "not jade", "counterfeit"), and **Payment Reminder**. What is **ASSUMED** is every one of their *bodies*: only the subject lines have been seen, so the win and payment mails are still the only two shapes anything reads. |
 | Returns are a large part of how she buys | **Verified, and it reframes the refund gap.** 47 of the 99 messages in one inbox are her own return tickets - "broken item", "missing diamond", "not jade", "two of the bowls are counterfeit", "please cancel the order" - beside 9 refunds. Returning things is not an edge case in this business; it is roughly half the correspondence. So a refund's effect on `paid` is a first-class piece of the cost basis rather than a tidy-up. |
@@ -1667,6 +1668,33 @@ unquoted name with a space now. `open_folder` also falls back to the
 configured folder rather than raising, because a survey must not die on
 the archive.
 
+**The mailbox is not an archive, because she deletes this mail.** That
+changes what `backfill` is: its own first line says it reconstructs her
+history, and a deleted receipt is not there to reconstruct from. Two
+things follow. Gmail's `\All` mailbox **excludes Trash**, so preferring
+the archive still misses whatever she cleared out - `survey_folders`
+walks Trash too, and a deleted receipt does not undo the purchase it
+recorded, because the money left her account either way. And Gmail
+empties Trash after thirty days, so that is a **rescue window on a
+clock**, not a second archive: `scan` prints the deadline beside the
+count, because a number with no deadline next to it reads like an
+archive.
+
+The load-bearing consequence is upstream of both: **the poller is the
+only durable capture there is.** Mail that is deleted before it is
+polled is gone, and nothing downstream can tell that it ever existed -
+there is no gap to detect, just a purchase with no cost basis and no
+row. Every hour the Pi is not polling is history that may not be
+recoverable.
+
+**Backfill may read the bin; the poller may not.** `backfill` never
+prints - it records events and fills in listings - so reading Trash
+costs nothing worse than a duplicate `message_id`, which is already
+UNIQUE. `poll_once` prints, and reprocessing a label email she deleted
+could put a parcel back on the printer, so it stays on the configured
+folder. The asymmetry is the safety property rather than an oversight,
+and it is the reason the two halves can want different folders at all.
+
 **The whole mailbox is not the inbox, and a survey of the wrong folder
 looks exactly like a survey.** `backfill`'s first line says it walks the
 whole mailbox once; it selected `imap_folder`, which defaults to INBOX.
@@ -2118,6 +2146,15 @@ counterfeit, not as described), and it is deliberately unhandled because
 no refund body has ever been read. What is needed to finish it is one
 saved `Refund Issued` .eml, and the same for a `Buy Now Confirmation`
 and a `Bid Has Been Retracted`.
+
+**And she deletes this mail often**, which changes what the backfill
+half *is*: not a reconstruction of her history but a rescue of the part
+that has not been purged. Trash is walked now, on a thirty-day Gmail
+clock - so **running `mplabel backfill` is time-sensitive in a way
+nothing else here is**, and every day it waits is auction history that
+may already be gone. Everything after that depends on the poller
+running, because it is the only durable capture: mail deleted before it
+is polled leaves no gap for anything to notice.
 
 **The re-run then found the thing that mattered most, by finding
 nothing.** Every subject classified and the unrecognised list empty -
