@@ -58,6 +58,16 @@ var S = {
      holding a half-finished upload between two requests. */
   csvStep: 0, csvText: '', csvName: '', csvMapping: null, csvPlan: null,
 
+  /* Design a label. `els` is the design; `geom` is what the server says
+     the drawable box is for the chosen size, and the editor cannot work
+     it out - the head marks 312 of its 384 dots, off-centre, and a label
+     wider than the head prints sideways. `prev` is the server's picture
+     of the actual print payload, which is the only authoritative one:
+     the surface below is an approximation drawn with the browser's
+     fonts, and saying so is cheaper than pretending otherwise. */
+  cvSize: '48x30', cvGeom: null, cvEls: [], cvSel: null, cvSeq: 1,
+  cvPrev: null, cvErr: '', cvBusy: false, cvDrag: null, cvCustom: '',
+
   /* Overlays */
   confirm: null, toast: null
 };
@@ -77,6 +87,8 @@ var SCREENS = [
   { key: 'home',      slug: 'today',     label: 'Today',          view: viewToday },
   { key: 'queue',     slug: 'queue',     label: 'To ship',        view: viewQueue },
   { key: 'send',      slug: 'print',     label: 'Print a label',  view: viewSend },
+  { key: 'canvas',    slug: 'canvas',    label: 'Design a label', view: viewCanvas,
+    after: paintCanvas },
   { key: 'inventory', slug: 'inventory', label: 'Inventory',      view: viewInventory },
   { key: 'writer',    slug: 'writer',    label: 'Listing writer', view: viewWriter },
   { key: 'review',    slug: 'review',    label: 'Month-end',      view: viewReview },
@@ -288,6 +300,9 @@ async function loadScreen(key) {
     if (S.writerId !== null) await openDraft(S.writerId);
   } else if (key === 'review') {
     await Promise.all([loadStats(), loadTrips()]);
+  } else if (key === 'canvas') {
+    restoreCanvas();
+    await loadCanvasGeom();
   }
 }
 
@@ -361,7 +376,15 @@ function renderMain() {
   var at = null;
   try { at = was && was.selectionStart; } catch (e) { at = null; }
 
-  el.innerHTML = screenFor(S.screen).view();
+  var screen = screenFor(S.screen);
+  el.innerHTML = screen.view();
+
+  /* A screen that owns a <canvas> has to paint it again: innerHTML threw
+     the old one away along with everything drawn on it, and an empty
+     rectangle where the design was reads as the design having been lost.
+     Declared on the screen rather than checked for by key, so the
+     registry stays the one place a screen is described. */
+  if (screen.after) screen.after();
 
   if (!id) return;
   var back = document.getElementById(id);
@@ -1495,6 +1518,717 @@ function runSendLabel() {
     pick.busy = false;
     renderMain();
   })();
+}
+
+/* ------------------------------------------------------ design a label
+ *
+ * The other printer, and the only screen here that authors a label
+ * rather than filling one in. The two tags this system prints for itself
+ * are forms - an inventory label is a code, a title and a price in fixed
+ * places - and everything else she has ever wanted on 48mm stock is not:
+ * a FRAGILE strip, a return address, a price ticket, a QR pointing at
+ * something that is not an inventory code.
+ *
+ * Three things about it are worth knowing before changing any of it.
+ *
+ * **The surface below is an approximation and the preview is not.** The
+ * design is drawn here with the browser's fonts and the server draws it
+ * with Pillow's, so they will never agree to the dot - and the picture on
+ * the right is decoded back out of the actual print payload, buffer
+ * checksums and all, which is the only version that has ever been worth
+ * looking at on this printer. The screen says which is which rather than
+ * letting a pretty surface pass for a proof.
+ *
+ * **The QR here is a placeholder.** There is no QR encoder in JavaScript
+ * in this repo and there should not be one: `marker.js` is a port pinned
+ * byte-for-byte against `marker.py` by a node test precisely because a
+ * second implementation of a printed format drifts quietly, and a QR
+ * that encodes differently in the editor than on the paper is that bug
+ * with a worse blast radius. The box shows where it goes and how big it
+ * is; the server draws the real one.
+ *
+ * **Millimetres come from the server.** The drawable box is narrower
+ * than the label and is not centred on it - 40 dots are lost at the left
+ * of a 48mm label and 32 at the right - and a label wider than the head
+ * prints sideways, which swaps which edges the feed margin comes off.
+ * `/api/tag/geometry` answers from the same function the renderer lays
+ * out with, so there is no second opinion here about where the ink
+ * lands.
+ */
+
+/* The stock worth one tap. Anything else is typed in - a die-cut roll is
+   whatever she bought, and a list pretending to be exhaustive is a list
+   that is missing hers. */
+var CV_SIZES = [
+  ['48x30', '48×30'],
+  ['48x50', '48×50'],
+  ['4x1in', '4×1in'],
+  ['4x2in', '4×2in']
+];
+
+/* What travels in a spec, by element type. Everything else on a client
+   element - its id, whether it is selected - stays here: the job id is a
+   digest of the spec, so a local field riding along would change the id
+   on every edit and turn printd's duplicate check off. */
+var CV_FIELDS = {
+  text: ['x', 'y', 'text', 'size', 'w', 'align'],
+  rect: ['x', 'y', 'w', 'h', 'fill', 'stroke'],
+  ellipse: ['x', 'y', 'w', 'h', 'fill', 'stroke'],
+  line: ['x', 'y', 'x2', 'y2', 'stroke'],
+  qr: ['x', 'y', 'size', 'text', 'ecl']
+};
+
+function cvNew(type) {
+  var g = S.cvGeom, cw = g ? g.canvas_mm[0] : 37, ch = g ? g.canvas_mm[1] : 27;
+  var el = { id: S.cvSeq++, type: type, x: 2, y: 2 };
+  if (type === 'text') {
+    el.text = 'Text'; el.size = 3; el.align = 'left';
+    el.w = Math.round((cw - 4) * 10) / 10;
+  } else if (type === 'rect' || type === 'ellipse') {
+    el.w = Math.round(Math.min(20, cw - 4) * 10) / 10;
+    el.h = Math.round(Math.min(10, ch - 4) * 10) / 10;
+    el.fill = false; el.stroke = 0.4;
+  } else if (type === 'line') {
+    el.x2 = Math.round(Math.min(20, cw - 2) * 10) / 10; el.y2 = 2;
+    el.stroke = 0.4;
+  } else if (type === 'qr') {
+    /* Big enough to be worth printing by default. Under 5 dots a module
+       nothing has ever been read off this paper, and a QR that defaults
+       to unreadable is a feature that looks like it works. */
+    el.size = Math.round(Math.min(18, cw - 4, ch - 4) * 10) / 10;
+    el.text = 'https://'; el.ecl = 'M';
+  }
+  S.cvEls.push(el);
+  S.cvSel = el.id;
+  cvChanged();
+}
+
+function cvSelected() {
+  for (var i = 0; i < S.cvEls.length; i++) {
+    if (S.cvEls[i].id === S.cvSel) return S.cvEls[i];
+  }
+  return null;
+}
+
+/* The spec as the server will see it, and as the job id is derived from.
+   Local ids are stripped here rather than at the fetch, so `Save a copy`
+   writes exactly the file `mplabel canvas` will print. */
+function cvSpec() {
+  return {
+    size_mm: S.cvGeom ? S.cvGeom.size_mm : null,
+    elements: S.cvEls.map(function (e) {
+      var out = { type: e.type };
+      CV_FIELDS[e.type].forEach(function (k) {
+        if (e[k] !== undefined && e[k] !== null && e[k] !== '') out[k] = e[k];
+      });
+      return out;
+    })
+  };
+}
+
+/* --- persistence. A design is the only thing on this portal that exists
+   nowhere but the browser: everything else is a row on the Pi. Losing it
+   to a reload is the whole reason a tool like this gets abandoned, and
+   the server has no table for it - so it lives in localStorage, which is
+   this machine only and is honestly all it needs to be. */
+function saveCanvas() {
+  try {
+    localStorage.setItem('mp-canvas', JSON.stringify(
+      { size: S.cvSize, custom: S.cvCustom, els: S.cvEls, seq: S.cvSeq }));
+  } catch (e) { /* private window, or full. Not worth a message. */ }
+}
+
+function restoreCanvas() {
+  if (S.cvEls.length) return;
+  var raw = null;
+  try { raw = localStorage.getItem('mp-canvas'); } catch (e) { raw = null; }
+  if (!raw) return;
+  try {
+    var d = JSON.parse(raw);
+    if (d && d.els && d.els.length) {
+      S.cvEls = d.els;
+      S.cvSize = d.size || S.cvSize;
+      S.cvCustom = d.custom || '';
+      S.cvSeq = d.seq || (d.els.length + 1);
+    }
+  } catch (e) { /* a design from an older shape. Start clean. */ }
+}
+
+async function loadCanvasGeom() {
+  var size = S.cvSize === 'custom' ? S.cvCustom : S.cvSize;
+  S.cvGeom = await api('/api/tag/geometry?size=' + encodeURIComponent(size));
+  await refreshCanvasPreview();
+}
+
+function setCanvasSize(size) {
+  S.cvSize = size;
+  saveCanvas();
+  /* Not through once(): picking a size is a read, and blocking it behind
+     the same flag that serialises prints means a mis-tap during a print
+     silently does nothing. */
+  (async function () {
+    try { await loadCanvasGeom(); } catch (e) {
+      if (e.message !== '401') S.cvErr = e.message;
+    }
+    render();
+  })();
+}
+
+function setCanvasCustom(value) {
+  S.cvCustom = value;
+  S.cvSize = 'custom';
+  saveCanvas();
+  clearTimeout(setCanvasCustom._t);
+  /* Debounced: `4x1in` is typed one character at a time and `4x` is a
+     size the server is right to refuse. Waiting for the typing to stop
+     means the refusal she sees is about what she meant to type. */
+  setCanvasCustom._t = setTimeout(function () {
+    (async function () {
+      try { await loadCanvasGeom(); S.cvErr = ''; } catch (e) {
+        if (e.message !== '401') { S.cvErr = e.message; S.cvPrev = null; }
+      }
+      render();
+    })();
+  }, 500);
+}
+
+/* The authoritative picture, and the warnings that go with it, in one
+   answer. They arrive together on purpose - a preview of one design
+   beside another design's warnings is worse than showing neither. */
+async function refreshCanvasPreview() {
+  if (!S.cvEls.length) { S.cvPrev = null; S.cvErr = ''; return; }
+  try {
+    S.cvPrev = await api('/api/tag/preview',
+                         { method: 'POST', body: cvSpec() });
+    S.cvErr = '';
+  } catch (e) {
+    if (e.message === '401') throw e;
+    /* The server's sentence names the element - "element 3 is a text
+       with no text in it" - and that is the whole answer. */
+    S.cvErr = e.message;
+    S.cvPrev = null;
+  }
+}
+
+/* A change that alters the *shape* of the screen - an element added,
+   removed or selected, a size picked, a toggle that shows a field that
+   was not there before. Rebuilds everything, then asks the server what
+   it now prints. */
+function cvChanged() {
+  saveCanvas();
+  render();
+  queuePreview();
+}
+
+/* A change that only alters a value somebody is in the middle of typing.
+   Repaints the surface and refreshes the preview column, and deliberately
+   does **not** call render(): rebuilding the panel under the cursor takes
+   the caret with it, and `selectionStart` throws on a number input so
+   renderMain cannot put it back. It reads as a field that will not let
+   you type in the middle of a number.
+
+   Same failure the desk's search box had, and the same shape of fix -
+   the region that changed owns its own redraw. */
+function cvTyped() {
+  saveCanvas();
+  paintCanvas();
+  queuePreview();
+}
+
+/* Debounced, because the answer is a whole render, an LZMA stream and a
+   PNG. 400ms is long enough that a typed word is one request and short
+   enough that the picture feels attached to the design. */
+function queuePreview() {
+  clearTimeout(queuePreview._t);
+  queuePreview._t = setTimeout(function () {
+    (async function () {
+      try { await refreshCanvasPreview(); } catch (e) { /* 401 handled */ }
+      renderCanvasRight();
+    })();
+  }, 400);
+}
+
+/* Only the column that changed. The left half holds the element being
+   edited, and nothing the server says about the payload is a reason to
+   rebuild it. */
+function renderCanvasRight() {
+  var el = document.getElementById('cvright');
+  if (el) el.innerHTML = cvPreview();
+}
+
+function cvEdit(field, value) {
+  var el = cvSelected();
+  if (!el) return;
+  if (field === 'text') {
+    el[field] = value;
+  } else {
+    /* Blank stays blank rather than becoming zero: `w` unset on a text
+       means "to the edge of the label", and a 0 there is a box nothing
+       fits in. */
+    el[field] = (value === '') ? '' : Number(value);
+  }
+  cvTyped();
+}
+
+/* The pills - align, filled, error correction. These come from a click
+   rather than a keystroke and some of them change which fields exist, so
+   this is the branch that does rebuild the screen. */
+function cvSet(field, value) {
+  var el = cvSelected();
+  if (!el) return;
+  el[field] = value;
+  cvChanged();
+}
+
+function cvDelete() {
+  S.cvEls = S.cvEls.filter(function (e) { return e.id !== S.cvSel; });
+  S.cvSel = null;
+  cvChanged();
+}
+
+function cvClear() {
+  ask('Clear the design?', 'Every element goes. Nothing is printed and ' +
+      'nothing else changes.', 'Clear it', function () {
+        S.cvEls = []; S.cvSel = null; S.cvPrev = null; S.cvErr = '';
+        cvChanged();
+      });
+}
+
+/* Saved as the file `mplabel canvas` reads, so a design that is worth
+   keeping can live beside the thing it labels instead of in one
+   browser's storage. */
+function cvSave() {
+  var blob = new Blob([JSON.stringify(cvSpec(), null, 2)],
+                      { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'label-' + (S.cvGeom ? S.cvGeom.size_mm.join('x') : 'design') +
+    '.json';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+}
+
+function doCanvasPrint() {
+  var n = S.cvEls.length;
+  ask('Print this label?',
+      'It goes to the label maker on ' +
+      (S.cvGeom ? S.cvGeom.size_mm[0] + ' × ' + S.cvGeom.size_mm[1] + 'mm' :
+       'the loaded') + ' stock. Nothing about it is recorded — there is no ' +
+      'order behind it — so the paper is the only record you get.',
+      'Print it', function () {
+        once(async function () {
+          var d = await api('/api/tag/print',
+                            { method: 'POST', body: cvSpec() });
+          toast(d.printed ? 'Printed ' + n + ' element' +
+                (n === 1 ? '' : 's') + '.'
+                          : 'The label maker did not report a finished print.');
+        });
+      });
+}
+
+/* --- the surface */
+
+/* Pixels per millimetre. Fitted to the box on *both* axes, so a 4in
+   label and a 48mm one fill the same column and the size buttons read as
+   a change of paper rather than a change of zoom.
+
+   Bounded by height as well as width because width alone was wrong in a
+   way only looking at it showed: a 48x30 label at the width that fits
+   came out 640px tall, which pushed the size picker, the toolbar and the
+   element being edited off the top of the screen. A design surface you
+   have to scroll away from the thing you are editing is the same mistake
+   as reference above the action, one screen further along. */
+var CV_STAGE_H = 330;
+var CV_STAGE_W = 560;
+
+function cvScale() {
+  if (!S.cvGeom) return 12;
+  var w = S.cvGeom.canvas_mm[0], h = S.cvGeom.canvas_mm[1];
+  /* Measured rather than assumed. A constant was 620 against a column
+     that is 536 wide at this window size, so a 4in label overflowed and
+     the stage scrolled sideways - which on a design surface reads as the
+     label being cut off rather than as the picture being too big for its
+     frame. The constant stays as the fallback for the first paint, when
+     the node exists but has not been laid out. */
+  var stage = document.querySelector('.cv__stage');
+  var room = stage ? stage.clientWidth - 36 : 0;
+  if (!(room > 60)) room = CV_STAGE_W;
+  return Math.max(3, Math.min(16, room / w, CV_STAGE_H / h));
+}
+
+function paintCanvas() {
+  var cv = document.getElementById('cvsurface');
+  if (!cv || !S.cvGeom) return;
+  var k = cvScale();
+  var cw = S.cvGeom.canvas_mm[0], ch = S.cvGeom.canvas_mm[1];
+  var dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(cw * k * dpr);
+  cv.height = Math.round(ch * k * dpr);
+  cv.style.width = Math.round(cw * k) + 'px';
+  cv.style.height = Math.round(ch * k) + 'px';
+
+  var g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  /* Always white with black ink, in both themes. The label is thermal
+     paper and comes out of the machine one way round; a dark-mode label
+     would be a picture of something that cannot be printed. */
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, cw * k, ch * k);
+
+  S.cvEls.forEach(function (e) {
+    g.fillStyle = '#000';
+    g.strokeStyle = '#000';
+    var x = e.x * k, y = e.y * k;
+    if (e.type === 'text') {
+      var px = (e.size || 3) * k;
+      g.font = px + 'px "Helvetica Neue", Arial, sans-serif';
+      g.textBaseline = 'top';
+      var boxw = (e.w === '' || e.w === undefined || e.w === null)
+        ? cw - e.x : e.w;
+      cvWrap(g, String(e.text || ''), boxw * k).forEach(function (line, i) {
+        var lw = g.measureText(line).width;
+        var lx = x;
+        if (e.align === 'center') lx = x + (boxw * k - lw) / 2;
+        if (e.align === 'right') lx = x + boxw * k - lw;
+        g.fillText(line, lx, y + i * px * 1.18);
+      });
+    } else if (e.type === 'rect' || e.type === 'ellipse') {
+      var w = (e.w || 0) * k, h = (e.h || 0) * k;
+      g.lineWidth = Math.max(1, (e.stroke || 0.4) * k);
+      if (e.type === 'rect') {
+        if (e.fill) g.fillRect(x, y, w, h);
+        else g.strokeRect(x, y, w, h);
+      } else {
+        g.beginPath();
+        g.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+        if (e.fill) g.fill(); else g.stroke();
+      }
+    } else if (e.type === 'line') {
+      g.lineWidth = Math.max(1, (e.stroke || 0.4) * k);
+      g.beginPath();
+      g.moveTo(x, y);
+      g.lineTo((e.x2 || 0) * k, (e.y2 || 0) * k);
+      g.stroke();
+    } else if (e.type === 'qr') {
+      /* A placeholder, deliberately - see the note at the top of this
+         section. Drawn as three finder squares and a hatched middle
+         rather than an empty outline: the footprint and the quiet zone
+         are what she is positioning, and a bare rectangle with a word in
+         it reads as something that failed to load. */
+      var s = (e.size || 10) * k;
+      var q = s / 29;                 /* a v1 symbol plus its quiet zone */
+      g.fillStyle = '#eee';
+      g.fillRect(x, y, s, s);
+      g.fillStyle = '#000';
+      [[0, 0], [1, 0], [0, 1]].forEach(function (c) {
+        var fx = x + (c[0] ? s - 4 * q - 7 * q : 4 * q);
+        var fy = y + (c[1] ? s - 4 * q - 7 * q : 4 * q);
+        g.fillRect(fx, fy, 7 * q, 7 * q);
+        g.fillStyle = '#eee';
+        g.fillRect(fx + q, fy + q, 5 * q, 5 * q);
+        g.fillStyle = '#000';
+        g.fillRect(fx + 2 * q, fy + 2 * q, 3 * q, 3 * q);
+      });
+      g.fillStyle = '#777';
+      g.font = Math.max(7, Math.min(13, s / 9)) +
+        'px "Helvetica Neue", Arial, sans-serif';
+      g.textBaseline = 'middle';
+      g.textAlign = 'center';
+      g.fillText('QR', x + s - 7 * q, y + s - 7 * q);
+      g.textAlign = 'left';
+      g.textBaseline = 'top';
+    }
+
+    if (e.id === S.cvSel) {
+      var b = cvBox(e, cw);
+      g.strokeStyle = '#3fa148';
+      g.lineWidth = 1.5;
+      g.setLineDash([4, 3]);
+      g.strokeRect(b[0] * k - 2, b[1] * k - 2,
+                   (b[2] - b[0]) * k + 4, (b[3] - b[1]) * k + 4);
+      g.setLineDash([]);
+    }
+  });
+}
+
+/* Greedy wrap, the same shape as the server's `_wrap` - close enough for
+   a working surface, and never the thing that decides what prints. */
+function cvWrap(g, text, maxpx) {
+  var words = text.split(/\s+/), lines = [], line = '';
+  for (var i = 0; i < words.length; i++) {
+    var trial = line ? line + ' ' + words[i] : words[i];
+    if (g.measureText(trial).width <= maxpx || !line) line = trial;
+    else { lines.push(line); line = words[i]; }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+/* An element's footprint in mm. Used for the selection outline and for
+   hit-testing, from one function so that clicking a thing and seeing it
+   outlined cannot disagree. */
+function cvBox(e, cw) {
+  if (e.type === 'text') {
+    var boxw = (e.w === '' || e.w === undefined || e.w === null)
+      ? cw - e.x : e.w;
+    var lines = Math.max(1, Math.ceil(String(e.text || '').length *
+      (e.size || 3) * 0.5 / Math.max(1, boxw)));
+    return [e.x, e.y, e.x + boxw, e.y + lines * (e.size || 3) * 1.18];
+  }
+  if (e.type === 'qr') return [e.x, e.y, e.x + (e.size || 10),
+                               e.y + (e.size || 10)];
+  if (e.type === 'line') {
+    return [Math.min(e.x, e.x2 || 0), Math.min(e.y, e.y2 || 0),
+            Math.max(e.x, e.x2 || 0), Math.max(e.y, e.y2 || 0)];
+  }
+  return [e.x, e.y, e.x + (e.w || 0), e.y + (e.h || 0)];
+}
+
+function cvAt(ev) {
+  var cv = document.getElementById('cvsurface');
+  var r = cv.getBoundingClientRect(), k = cvScale();
+  return [(ev.clientX - r.left) / k, (ev.clientY - r.top) / k];
+}
+
+function cvDown(ev) {
+  if (!S.cvGeom) return;
+  var p = cvAt(ev), cw = S.cvGeom.canvas_mm[0];
+  /* Topmost first: later elements are drawn over earlier ones, so they
+     are what a click is aimed at. */
+  for (var i = S.cvEls.length - 1; i >= 0; i--) {
+    var b = cvBox(S.cvEls[i], cw);
+    if (p[0] >= b[0] - 1 && p[0] <= b[2] + 1 &&
+        p[1] >= b[1] - 1 && p[1] <= b[3] + 1) {
+      S.cvSel = S.cvEls[i].id;
+      S.cvDrag = { id: S.cvEls[i].id, dx: p[0] - S.cvEls[i].x,
+                   dy: p[1] - S.cvEls[i].y };
+      render();
+      return;
+    }
+  }
+  S.cvSel = null;
+  S.cvDrag = null;
+  render();
+}
+
+function cvMove(ev) {
+  if (!S.cvDrag) return;
+  var el = cvSelected();
+  if (!el) return;
+  var p = cvAt(ev);
+  /* Half a millimetre, which is four dots. Finer than that is below what
+     the head can place and makes a value nobody typed look deliberate. */
+  var nx = Math.round((p[0] - S.cvDrag.dx) * 2) / 2;
+  var ny = Math.round((p[1] - S.cvDrag.dy) * 2) / 2;
+  if (el.type === 'line') {
+    el.x2 = Math.round((el.x2 + (nx - el.x)) * 2) / 2;
+    el.y2 = Math.round((el.y2 + (ny - el.y)) * 2) / 2;
+  }
+  el.x = nx;
+  el.y = ny;
+  /* Paint only. A full render() per mousemove rebuilds every input on
+     the screen and takes the caret with it. */
+  paintCanvas();
+}
+
+function cvUp() {
+  if (!S.cvDrag) return;
+  S.cvDrag = null;
+  cvChanged();
+}
+
+/* --- the view */
+
+function viewCanvas() {
+  var g = S.cvGeom;
+  var sizeBtns = CV_SIZES.map(function (s) {
+    return '<button class="pill' + (S.cvSize === s[0] ? ' pill--on' : '') +
+      '" onclick="setCanvasSize(\'' + s[0] + '\')">' + esc(s[1]) +
+      '</button>';
+  }).join('');
+
+  var head = '<div class="eyebrow">Not an order, not a shelf</div>' +
+    '<h1 class="display display--lg" style="margin-bottom:18px">' +
+      'Design a label</h1>';
+
+  var sizeRow =
+    '<div class="card cv__opts">' +
+      '<div class="sendrow"><span class="label">Size</span>' +
+        '<span class="sendrow__opts">' + sizeBtns +
+          '<input class="input cv__size" id="cvcustom" value="' +
+            esc(S.cvCustom) + '" placeholder="or 60x40" ' +
+            'oninput="setCanvasCustom(this.value)">' +
+        '</span></div>' +
+      (g ? '<p class="prose muted" style="font-size:12px;margin:10px 0 0">' +
+        'You have <b>' + esc(g.canvas_mm[0]) + ' × ' + esc(g.canvas_mm[1]) +
+        'mm</b> to draw in, out of a ' + esc(g.size_mm[0]) + ' × ' +
+        esc(g.size_mm[1]) + 'mm label — the head does not mark the whole ' +
+        'width of the paper.' +
+        (g.sideways ? ' This one prints sideways, long axis down the feed: ' +
+          'the head does not turn.' : '') +
+        (g.is_roll ? '' : ' <b>This is not the roll this Pi is set up for ' +
+          '(' + esc(g.roll_mm[0]) + ' × ' + esc(g.roll_mm[1]) + 'mm)</b> — ' +
+          'check the stock in the machine before printing.') +
+        '</p>' : '') +
+    '</div>';
+
+  var adders = ['text', 'rect', 'ellipse', 'line', 'qr'].map(function (t) {
+    var names = { text: 'Text', rect: 'Box', ellipse: 'Ellipse',
+                  line: 'Line', qr: 'QR code' };
+    return '<button class="pill" onclick="cvNew(\'' + t + '\')">+ ' +
+      names[t] + '</button>';
+  }).join('');
+
+  var surface = g
+    ? '<canvas id="cvsurface" class="cv__surface" ' +
+        'onmousedown="cvDown(event)" onmousemove="cvMove(event)" ' +
+        'onmouseup="cvUp()" onmouseleave="cvUp()"></canvas>'
+    : '<div class="cv__surface cv__surface--wait"></div>';
+
+  return '<div class="pane"><div class="cv">' +
+    '<div class="cv__left">' + head + sizeRow +
+      '<div class="cv__tools">' + adders +
+        '<span style="flex:1"></span>' +
+        '<button class="pill" onclick="cvSave()"' +
+          (S.cvEls.length ? '' : ' disabled') + '>Save a copy</button>' +
+        '<button class="pill" onclick="cvClear()"' +
+          (S.cvEls.length ? '' : ' disabled') + '>Clear</button>' +
+      '</div>' +
+      '<div class="cv__stage">' + surface + '</div>' +
+      '<p class="prose muted" style="font-size:11.5px;margin:10px 0 0">' +
+        'Drag to move, click to select. This surface is drawn with your ' +
+        'browser’s fonts, so it is a working sketch — the picture on the ' +
+        'right is the label itself, decoded back out of what would go ' +
+        'down the wire.</p>' +
+      cvProps() +
+    '</div>' +
+    '<div class="cv__right" id="cvright">' + cvPreview() + '</div>' +
+  '</div></div>';
+}
+
+function cvProps() {
+  var el = cvSelected();
+  if (!el) {
+    return '<div class="card cv__props"><div class="label">Nothing ' +
+      'selected</div><p class="prose muted" style="font-size:12px;margin:' +
+      '8px 0 0">Add something above, or click an element to change it. ' +
+      'Everything is in millimetres from the top-left of the drawable ' +
+      'box.</p></div>';
+  }
+  var rows = '';
+  function num(field, label, step) {
+    rows += '<label class="cv__field"><span>' + esc(label) + '</span>' +
+      '<input class="input" type="number" step="' + (step || '0.5') + '" ' +
+      'id="cv-' + esc(field) + '" value="' + esc(el[field]) + '" ' +
+      'oninput="cvEdit(\'' + field + '\', this.value)"></label>';
+  }
+  function txt(field, label) {
+    rows += '<label class="cv__field cv__field--wide"><span>' + esc(label) +
+      '</span><input class="input" id="cv-' + esc(field) + '" value="' +
+      esc(el[field]) + '" oninput="cvEdit(\'' + field + '\', this.value)">' +
+      '</label>';
+  }
+  function pills(field, label, choices) {
+    var bits = choices.map(function (c) {
+      return '<button class="pill' +
+        (String(el[field]) === String(c[0]) ? ' pill--on' : '') +
+        '" onclick="cvSet(\'' + field + '\', ' +
+        (typeof c[0] === 'string' ? '\'' + c[0] + '\'' : c[0]) + ')">' +
+        esc(c[1]) + '</button>';
+    }).join('');
+    rows += '<div class="cv__field cv__field--wide"><span>' + esc(label) +
+      '</span><span class="sendrow__opts">' + bits + '</span></div>';
+  }
+
+  num('x', 'X (mm)'); num('y', 'Y (mm)');
+  if (el.type === 'text') {
+    txt('text', 'Words');
+    num('size', 'Size (mm)', '0.1');
+    num('w', 'Wrap width (mm)');
+    pills('align', 'Align', [['left', 'Left'], ['center', 'Centre'],
+                             ['right', 'Right']]);
+  } else if (el.type === 'rect' || el.type === 'ellipse') {
+    num('w', 'Width (mm)'); num('h', 'Height (mm)');
+    pills('fill', 'Filled', [[true, 'Solid'], [false, 'Outline']]);
+    if (!el.fill) num('stroke', 'Line (mm)', '0.1');
+  } else if (el.type === 'line') {
+    num('x2', 'To X (mm)'); num('y2', 'To Y (mm)');
+    num('stroke', 'Thickness (mm)', '0.1');
+  } else if (el.type === 'qr') {
+    txt('text', 'What it carries');
+    num('size', 'Size (mm)', '0.5');
+    pills('ecl', 'Correction', [['L', 'L'], ['M', 'M'], ['Q', 'Q'],
+                                ['H', 'H']]);
+  }
+  var names = { text: 'Text', rect: 'Box', ellipse: 'Ellipse',
+                line: 'Line', qr: 'QR code' };
+  return '<div class="card cv__props">' +
+    '<div class="cv__propshead"><div class="label">' +
+      esc(names[el.type]) + '</div>' +
+      '<button class="pill" onclick="cvDelete()">Remove</button></div>' +
+    '<div class="cv__grid">' + rows + '</div></div>';
+}
+
+function cvPreview() {
+  var r = S.cvPrev;
+  var body;
+  if (S.cvErr) {
+    /* The server's sentence, which names the element. A status code here
+       would send her back to the screen to guess which of eleven boxes
+       it meant. */
+    body = '<div class="cv__bad">' + esc(S.cvErr) + '</div>';
+  } else if (!S.cvEls.length) {
+    body = '<div class="cv__blank">Nothing on the label yet.</div>';
+  } else if (!r) {
+    body = '<div class="cv__blank">Working it out…</div>';
+  } else {
+    body = '<img class="cv__shot" src="' + esc(r.png) + '" alt="">';
+  }
+
+  var warn = '';
+  if (r && r.notes && r.notes.warnings && r.notes.warnings.length) {
+    /* Above the button, not below it. Both kinds of warning describe
+       damage that is invisible on the paper - ink outside the drawable
+       box is dropped rather than printed small, and a QR with modules
+       too small looks perfect until a phone is pointed at it - so the
+       one place they must not be is under the thing that spends the
+       stock. */
+    warn = '<div class="cv__warn">' + r.notes.warnings.map(function (w) {
+      return '<div>' + esc(w) + '</div>';
+    }).join('') + '</div>';
+  }
+
+  var can = S.cvEls.length && r && !S.cvErr;
+  var actions =
+    '<div style="display:flex;gap:11px;margin-top:14px">' +
+      '<button class="btn btn--alarm" style="flex:1" ' +
+        'onclick="doCanvasPrint()"' + (can && !S.busy ? '' : ' disabled') +
+        '>' + (S.busy ? 'Working…' : 'Print it') + '</button>' +
+    '</div>';
+
+  var facts = '';
+  if (r) {
+    var L = r.label, P = r.payload;
+    facts = '<div class="stats" style="margin-top:14px;max-width:none">' +
+      cell('Label', esc(L.mm[0]) + ' × ' + esc(L.mm[1]) + 'mm') +
+      cell('Down the feed', esc(L.feed_mm.toFixed(1)) + 'mm') +
+      cell('Ink', esc(L.ink_pct.toFixed(2)) + '%') +
+      '</div>' +
+      '<p class="prose muted" style="font-size:11.5px;margin:10px 0 0">' +
+        'The die-cut label has to be at least <b>' +
+        esc(L.feed_mm.toFixed(1)) +
+        'mm</b> long or this prints across more than one of them. ' +
+        'Nothing here is recorded — there is no order behind a label you ' +
+        'drew, so the paper is the only record. ' +
+        '<span class="mono">' + esc(P.buffer_count) + '</span> print ' +
+        'buffer' + (P.buffer_count === 1 ? '' : 's') + ' at density ' +
+        '<span class="mono">' + esc(P.density) + '</span>.</p>';
+  }
+
+  return '<div class="label">What will print</div>' + body + warn +
+    actions + facts;
 }
 
 /* -------------------------------------------------------------- writer */

@@ -819,7 +819,15 @@ def assemble_tag(spec, cfg):
     if spec.get("density") is not None:
         density = int(spec["density"])
 
-    raster, stride, rows, label_mm = inventory_mod.render_tag(spec, label_mm)
+    # What only the renderer can know, and only for a freeform canvas:
+    # which elements ran off the label, and what each QR's module size
+    # actually came out at. Both are silent on paper - the part that runs
+    # off is dropped rather than printed small, and a QR with modules too
+    # small to read looks perfect until a phone is pointed at it - so
+    # they ride back in the result and the caller says them out loud.
+    notes = {}
+    raster, stride, rows, label_mm = inventory_mod.render_tag(
+        spec, label_mm, notes=notes)
     job = supvan_mod.build_job(raster, stride, rows, density=density)
 
     # Round-trip it whatever happens next: a job that will not come back
@@ -845,6 +853,7 @@ def assemble_tag(spec, cfg):
             "media_box": list(inventory_mod.media_box(label_mm)),
             "ink_pct": round(100 * ink / (len(raster) * 8), 2),
         },
+        "notes": notes,
         # `buffer_count`, never `buffers`. The word that means two things
         # does not appear on the wire at all.
         "payload": {
