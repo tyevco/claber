@@ -842,34 +842,59 @@ def render_edge_test(width_dots=HEAD_DOTS, rows=DEFAULT_HEIGHT_MM * DOTS_PER_MM,
         img = canvas
     return img.tobytes(), stride, rows
 
-# The two things a tag can be. `kind` travels inside the signed body
+# The three things a tag can be. `kind` travels inside the signed body
 # rather than in a header or a path, because the HMAC covers the job id
 # and a digest of the body and nothing else - routing on anything
 # unsigned would let a signed body be aimed at a printer its signer did
 # not choose.
-TAG_KINDS = ("inventory-label", "shelf-tag")
+#
+# The first two are forms: the layout is fixed and the caller supplies
+# the words. `canvas` is the one that carries its own layout - see
+# canvas.py for why that is a different kind rather than more arguments
+# here.
+TAG_KINDS = ("inventory-label", "shelf-tag", "canvas")
+
+# The kinds whose whole identity is a code, so the code is required and
+# the machine-readable carrier names the same thing the characters do. A
+# canvas is in neither set: it has no single identity to name.
+CODED_KINDS = ("inventory-label", "shelf-tag")
 
 
-def render_tag(spec, label_mm=None):
+def render_tag(spec, label_mm=None, notes=None):
     """Draw a tag from a spec. Returns (raster, stride, rows, label_mm).
 
     The spec says *what to put on the label*; `label_mm` says what the
     label is. They are separate arguments because they belong to
     different machines: the code, the title and the price come from
     whoever has the orders, and the size of the die-cut label comes from
-    whoever has the roll."""
+    whoever has the roll.
+
+    `notes` is a dict the caller owns, for what only the renderer can
+    know - a canvas element that ran off the label, a QR whose modules
+    came out too small to read. The two coded kinds fill nothing into it:
+    their layouts are fixed and cannot overflow."""
     kind = spec.get("kind")
     if kind not in TAG_KINDS:
         raise ValueError(
             f"{kind!r} is not a tag kind; expected one of "
             f"{', '.join(TAG_KINDS)}")
+    label_mm = tuple(label_mm or DEFAULT_LABEL_MM)
+
+    if kind == "canvas":
+        # Imported here rather than at module scope: canvas.py lays out
+        # against `_geometry` and so imports this module, and the two
+        # would be a cycle at import time.
+        from . import canvas as canvas_mod
+        raster, stride, rows = canvas_mod.render_canvas(
+            spec, label_mm=label_mm, notes=notes)
+        return raster, stride, rows, label_mm
+
     if spec.get("qr") and spec.get("marker"):
         raise ValueError("a tag carries one machine-readable code, not two")
 
     code = spec.get("code")
     if not code:
         raise ValueError("a tag needs a code")
-    label_mm = tuple(label_mm or DEFAULT_LABEL_MM)
 
     if kind == "shelf-tag":
         raster, stride, rows = render_shelf_tag(

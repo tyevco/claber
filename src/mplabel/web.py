@@ -29,6 +29,7 @@ her out mid-parcel.
 import base64
 import hashlib
 import hmac
+import io
 import json
 import logging
 import mimetypes
@@ -470,6 +471,14 @@ class Handler(BaseHTTPRequestHandler):
         # it - see h_print_label.
         ("POST", r"^/api/print/label$", "h_print_label", True),
         ("POST", r"^/api/label/preview$", "h_label_preview", True),
+        # The freeform canvas: the other printer, and the only screen
+        # that authors a label rather than filling one in. Geometry is
+        # asked for rather than assumed because the drawable box is
+        # narrower than the label and is not centred on it - see
+        # h_tag_geometry.
+        ("GET", r"^/api/tag/geometry$", "h_tag_geometry", True),
+        ("POST", r"^/api/tag/preview$", "h_tag_preview", True),
+        ("POST", r"^/api/tag/print$", "h_tag_print", True),
         # The sourcing half. Cost basis enters the system here, which is
         # why every margin in the analytics is null until it does.
         ("GET", r"^/api/trips$", "h_trips", True),
@@ -1687,6 +1696,164 @@ class Handler(BaseHTTPRequestHandler):
                 log.error("print failed for sale %s: %s", row["id"], exc)
                 failed.append({"id": row["id"], "error": str(exc)})
         self.json({"printed": printed, "failed": failed})
+
+    # ------------------------------------------------ the freeform canvas
+
+    def _canvas_spec(self):
+        """A canvas spec off the request body, with its size settled.
+
+        The size is pinned into the spec here rather than left to the
+        host's roll, which is the opposite of what `inventory-label` and
+        `shelf-tag` do. Those are forms: the layout adapts to whatever
+        paper is loaded, so `size_mm` unset rightly means "the machine
+        with the roll decides". A canvas is millimetres from a corner,
+        and a coordinate means nothing without the box it was measured
+        in - so whatever the editor laid out against travels with the
+        design, and a size it never chose would move the label out from
+        under every element on it."""
+        spec = self.body() or {}
+        if not isinstance(spec, dict):
+            raise ValueError("that is not a canvas spec")
+        spec = dict(spec, kind="canvas")
+        size = spec.get("size_mm")
+        if size:
+            try:
+                w, h = (float(v) for v in size)
+            except (TypeError, ValueError):
+                raise ValueError("size_mm wants two numbers, width and height")
+            spec["size_mm"] = [w, h]
+        return spec
+
+    def h_tag_geometry(self):
+        """How big a canvas is, for a label of a given size.
+
+        The editor cannot work this out. The head marks 312 of its 384
+        dots and the window is not centred; the firmware never sends the
+        feed margin at either end; and a label wider than the head is
+        drawn sideways, which swaps which pair of edges the margin comes
+        off. All three are measurements of a particular roll under a
+        particular printhead, and a browser that held its own copy would
+        be a second opinion about where the ink lands - which is the bug
+        that cost a QR its left finder column while looking intact in a
+        photograph.
+
+        So this answers from `canvas.canvas_mm`, the same call the
+        renderer lays out with. With no `size` it reports the roll this
+        host is configured for, which is what the editor opens on."""
+        from . import canvas as canvas_mod
+        from . import inventory as inventory_mod
+
+        qs = parse_qs(urlparse(self.path).query)
+        raw = (qs.get("size") or [None])[0]
+        roll_mm, density = printers_mod.tag_geometry(self.cfg)
+        label_mm = printers_mod.parse_label_size(raw) if raw else roll_mm
+        cw, ch = canvas_mod.canvas_mm(label_mm)
+        self.json({
+            "size_mm": [label_mm[0], label_mm[1]],
+            "canvas_mm": [cw, ch],
+            "sideways": inventory_mod.reads_sideways(label_mm),
+            "roll_mm": [roll_mm[0], roll_mm[1]],
+            # True when the size asked about is the one in the machine,
+            # so the editor can say "this is your stock" rather than
+            # leaving her to compare two numbers.
+            "is_roll": [label_mm[0], label_mm[1]] == [roll_mm[0], roll_mm[1]],
+            "density": density,
+            "dots_per_mm": inventory_mod.DOTS_PER_MM,
+            "backend": self.cfg.get("tag_backend") or "supvan",
+            "qr_min_scale": canvas_mod.QR_MIN_SCALE,
+        })
+
+    def h_tag_preview(self):
+        """What the canvas will actually print, and what is wrong with it.
+
+        The picture is decoded back **out of the print payload** - the
+        job is assembled, decompressed, its buffer checksums checked and
+        its geometry read out of the headers - rather than drawn from the
+        raster that went in. That is the rule `inventory-label --preview`
+        already follows, and the reason is this printer's whole history:
+        a preview of the source raster shows a perfect label for a job
+        the device is about to refuse.
+
+        The warnings ride in the same answer as the picture, which is why
+        this returns JSON with the PNG inside it rather than image bytes
+        like `/api/label/preview` does. Two calls would be two renders of
+        two specs the moment one of them lost a race, and a screen
+        showing one design's picture beside another design's warnings is
+        worse than showing neither."""
+        from . import inventory as inventory_mod
+        from . import supvan as supvan_mod
+
+        spec = self._canvas_spec()
+        # Renders and builds; opens no device and journals nothing. Any
+        # refusal in here is a ValueError carrying the sentence that
+        # names the element, which the dispatcher turns into a 400.
+        _job, result = printers_mod.assemble_tag(spec, self.cfg)
+
+        back, stride, cols = supvan_mod.decode_job(_job["compressed"])
+        img = inventory_mod.to_image(back, stride, cols, scale=2)
+        # Cropped to the media the *renderer* reported, never this
+        # process's own PRINTABLE_*: on a pi-http deployment those
+        # describe a roll at the other end of the house.
+        mx0, _my0, mx1, _my1 = result["label"]["media_box"]
+        img = img.crop((mx0 * 2, 0, (mx1 + 1) * 2, img.height))
+        if result["label"].get("sideways"):
+            # Turned the way she holds the label, not the way the head
+            # sees it. The editor's own surface is in reading
+            # orientation, and a preview a quarter turn from it reads as
+            # a layout bug rather than as the head not turning.
+            img = img.rotate(-90, expand=True)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+
+        result["png"] = ("data:image/png;base64,"
+                         + base64.b64encode(buf.getvalue()).decode())
+        result["png_dots"] = [img.width // 2, img.height // 2]
+        self.json(result)
+
+    def h_tag_print(self):
+        """Print a freeform canvas on the label maker.
+
+        Records nothing, for the same reason `POST /api/print/label`
+        records nothing: there is no order, no listing and no shelf
+        behind it, and inventing a row so that something could be
+        recorded would put a thing that is not a thing into the numbers.
+        What records it is printd's journal - and with `tag_backend`
+        pointing straight at the hidraw node there is no journal at all,
+        which the answer says rather than implying a record that does not
+        exist.
+
+        The job id is a digest of the spec, exactly as the ad-hoc 4x6
+        route derives one from the PDF's bytes, and for the same reason:
+        she is behind a tunnel, a request that times out after the label
+        came out is the likely case rather than the unusual one, and a
+        random id would turn her retry into a second label instead of a
+        409. Printing the same design again on purpose is `force`, which
+        is a different intent and gets a different id."""
+        spec = self._canvas_spec()
+        dry = bool(spec.pop("dry_run", False))
+        force = bool(spec.pop("force", False))
+
+        canonical = json.dumps(spec, sort_keys=True).encode()
+        job = "canvas-" + hashlib.sha256(canonical).hexdigest()[:16]
+        if force:
+            job += "-" + secrets.token_hex(4)
+
+        backend = self.cfg.get("tag_backend") or "supvan"
+        kwargs = printers_mod.tag_backend_kwargs(self.cfg, backend, job=job)
+        try:
+            result = printers_mod.print_tag(spec, backend, dry_run=dry, **kwargs)
+        except printers_mod.PrinterUnavailable as exc:
+            return self.fail(503, str(exc))
+
+        result["job"] = job
+        result["recorded"] = backend != "supvan"
+        result["note"] = (
+            "Nothing about this label is recorded - there is no order "
+            "behind it. " + ("printd's journal has the job." if backend
+                             != "supvan" else
+                             "This host prints straight to the device, so "
+                             "there is no journal either."))
+        self.json(result)
 
     def _label_upload(self):
         """The PDF and the crop options off one request. Shared by the

@@ -117,6 +117,7 @@ run against a real database.
 | `supvan-test-print --style ruler [--width W] [--height H]` | the calibration target: scales on both axes in dots, the last dot's number at each far end, an inset comb to measure a clipped edge, and a feed arrow. Moves paper |
 | `supvan-test-print --style edges` | the edge test: eight bars per side, 8 dots apart, each a different length so it names itself without a number beside it. Reads where each edge starts printing and nothing else. Moves paper |
 | `shelf-tag --code XXX [--name N] [--marker\|--qr] [--size WxH[in]] [--preview PNG] [--print]` | a tag for a shelf, bin or area. Code big, name under it, marker beside it. **Three** characters, where an item code is four. No DB |
+| `canvas <spec.json> [--size WxH[in]] [--density N] [--preview PNG] [--print]` | a **freeform** label: text, shapes and QR codes wherever the spec puts them. Drawn at `/desk`; this prints one back, so a design can live in the repo next to the thing it labels. No DB |
 | `config [--all]` | the resolved config, each key marked `default`/`file`/`env`, secrets redacted, and **which** file was read. No DB |
 | `ebay auth [--code C]` | consent for the eBay account. No `--code` prints the URL; the Pi is headless, so consent happens in a browser elsewhere and the code is pasted back. No DB |
 | `ebay check` | config, tokens, and how long the refresh token has left. Changes nothing, sends nothing, exits **78** if anything needs attention. No DB |
@@ -148,8 +149,9 @@ run against a real database.
 | `reconcile [--since JOB] [--dry-run]` | reconcile the local DB against printd's journal. The recovery path for an ambiguous print |
 | `notify [--dry-run]` | say the three things that earn a notification. `--dry-run` prints the whole decision and records nothing, so it says the same thing twice. Exit **78** if push is not configured |
 
-`probe`, `selftest`, `supvan-probe`, `file` and `ebay auth|check` run
-above `connect_db` in `main()` - see the note below on why.
+`probe`, `selftest`, `supvan-probe`, `file`, `canvas` and
+`ebay auth|check` run above `connect_db` in `main()` - see the note
+below on why.
 
 ## Deploying to the Pi
 
@@ -237,6 +239,8 @@ src/mplabel/
   qr.py          a QR encoder, stdlib only, versions 1-10
   marker.py      the shelf marker: a 6x24 band for our own 3-4 char codes
   inventory.py   draws the 48mm inventory label; QR or shelf marker
+  canvas.py      the third tag kind: a freeform label laid out in mm
+                 inside the box that actually burns
   static/marker.js  the marker decoder in the browser, a port of marker.py
   goodwill.py    ShopGoodwill auction mail -> inventory with a cost on it
   savedpage.py   parse a saved Marketplace selling page
@@ -558,6 +562,7 @@ hardware or a real Facebook account.
 | The shelf marker | **Round-trips in software, never printed or photographed - and now largely moot.** 6x24 modules - one by four - carrying 4 data bytes and 7 Reed-Solomon parity, so any 3 of the 11 can be wrong. The interior is 4x22 = 88 modules and the codeword is exactly 88 bits, so nothing is spare. Reads back clean at all four rotations, under a 2.5px blur, scaled to 40%, with 4% salt-and-pepper noise, and out of the decoded print-buffer payload of a real label at both sizes. It exists because a QR at this size might not have read off thermal. **It did read**, so the marker's reason for existing is gone: it buys bigger modules at the cost of being readable by nothing but our own decoder. Do not port it to Swift; see the note below. |
 | The browser decoder | **Agrees with the Python reference; never run against a real camera.** `static/marker.js` matches `marker.py` byte for byte on clean and damaged codewords under node. What is untested is everything a phone does: exposure, focus, rolling shutter, and whether the aiming reticle is a usable way to hold a box. |
 | The inventory label | **Prints, and the printable window is measured.** `--style edges` settled it: the left **40** dots and the right **32** never reach the paper, leaving **312 (39mm), not 384**, and the window is **not centred** - unequal insets mean the media sits off-centre under the head rather than the head being narrow. Top and bottom lose nothing. The layout was a symmetric 12-dot guess before, and it cost a real failure: the QR was drawn from x=22, lost its left finder column, and **did not scan** while looking intact in a photograph. `_geometry` now lays out inside the measured window. Measured on one roll; other stock will differ and the edge test is how to find out. **Not yet reprinted against the new window.** |
+| The freeform canvas | **Software only, and it has never printed.** `canvas.py` renders, `assemble_tag` builds the job, and the preview is decoded back out of the payload with every buffer checksum checked - so it is exactly as real as any other `build_job` label and no more. What is **unverified** is anything physical: no canvas label has come off the device, so nothing confirms that a 2.6mm text is legible on thermal, that a hairline `stroke` survives a burn, or that a QR drawn at the module size this warns about is in fact unreadable rather than merely untested. The drawable box it lays out in is `PRINTABLE_*`, measured on **one roll**. One printed label answers all of it. |
 | TSPL gap value 0.12in | **Verified on the hardware and on the stock.** A week of production parcels, plus three deliberate labels in a row landing in the same place on their die-cut - no creep, no blank label between them, one job one label. The value was a guess taken from typical 4x6 die-cut; it happens to be right for this roll. A different roll is a different number, and the three-in-a-row print is how to check. |
 | Facebook subject patterns | **Partly verified** against a real mailbox survey. Seen and handled: `Shipping label for your Marketplace order`, `New Marketplace order for <item>` (the sale itself, arriving before the label), and messages as `<emoji> <name> sent you a message`. The rest of `EVENT_PATTERNS` (listed / renewed / expired / payout / rating) is still **ASSUMED** - none has been seen. |
 | The mailbox mixes buying and selling | **Verified.** `You placed an order: <item>`, `Offer submitted: <item>` and `Confirm if you received your order: <item>` are *her purchases*. They carry the **seller's** listing id, so they are classified `purchase`, kept out of the listings table by `BUYER_KINDS`, and their listing id is dropped at record time. Counting them would invent listings that were never for sale and drag sell-through down. |
@@ -766,7 +771,7 @@ a separate identity, and until it is shared every write is a 403 no matter
 how good the key is.
 
 **A printer test must not need the database.** `probe`, `selftest`,
-`supvan-probe` and
+`supvan-probe`, `canvas` and
 `file` run above `connect_db` in `main()`, because an unwritable home
 directory once stopped a printer test dead - which is the one thing you
 want working when nothing else is. `cmd_file` takes no `conn` at all.
@@ -1161,6 +1166,114 @@ has a working decoder and costs nothing to leave alone, and
 `inventory-label --marker` stays for the same reason; but nothing new
 should be built on it, and printing `--qr` is the default worth
 preferring on anything a phone is meant to read.
+
+**A canvas is the third tag kind, and it is the one that carries its own
+layout.** `inventory-label` and `shelf-tag` are *forms*: the layout is
+fixed and the caller supplies the words, which is right for the labels
+this system mints for itself and wrong for everything else she puts on
+48mm stock - a FRAGILE strip, a return address, a price ticket, a QR
+pointing at something that is not an inventory code. `canvas.py` is a
+size and a list of elements, and because it is a `kind` rather than a
+second route it inherits the HMAC, the journal, the deadline and the
+device lock without any of them being written twice.
+
+**Its coordinates are millimetres inside the box that burns, not inside
+the label.** The head marks 312 of its 384 dots and the window is **not
+centred**; the firmware never sends the feed margin at either end; and a
+label wider than the head is drawn sideways, which swaps which pair of
+edges that margin comes off. `canvas.canvas_mm` reports that box and
+`render_canvas` lays out in it, from `inventory._geometry` - so a 48x30
+label gives **37x27mm** to draw in. A canvas keyed on the label's own
+corner would put every element a fixed distance from where it was drawn
+and look right on screen the whole time, which is the same failure as
+the QR that lost its left finder column to a symmetric 12-dot guess and
+would not scan while looking intact in a photograph.
+
+**And it pins its own size, which is the opposite of the rule the other
+two follow.** There, `size_mm` unset means "the host with the roll
+decides", and that is correct for a form - the layout adapts to whatever
+paper is loaded. A canvas *is* millimetres from a corner, and a
+coordinate has no meaning without the box it was measured in: the same
+design sent to a 48x30 roll and a 4x1in one is not two sizes of one
+label, it is one label and one pile of ink in the wrong places. So the
+size travels with the design and the roll does not overrule it. The
+mismatch that matters instead - a design longer than the die-cut stock -
+is reported as `feed_mm`, which is the number both other tag commands
+already print for the same reason.
+
+**Off the label is refused; partly off is printed and reported.** Ink
+outside the drawable box is **dropped, not printed small**, and nothing
+on paper says so. An element entirely outside is never what anybody
+meant, so it is a refusal naming the element and the box - there is
+still something to say about it at that point. An element *partly*
+outside is printed, because dragging a millimetre past an edge while
+laying out is normal and refusing there would make the editor unusable -
+but it lands in `notes["clipped"]` and in a warning, because an
+instrument that cannot refuse still has to say when the reading is off
+its scale. Same reasoning as the edge gauge that stopped at 32 dots
+while the loss was 40.
+
+**A canvas QR reports its module size, because that is the whole question
+of whether it reads.** 5 dots a module is the only value ever read off
+this paper - a printed `inventory-label --qr` went first time in the
+stock Camera app - so anything under `QR_MIN_SCALE` is warned about,
+with the size that *would* work, rather than refused: only the person
+holding the label can say whether a 3mm code is an experiment or a
+mistake. A QR with no room for even one dot a module is refused outright,
+since that scales into nothing at all rather than into uneven blocks.
+Note the quiet zone here is the full 4 modules where the inventory label
+uses 2 - that label is boxed by its own layout and a freeform one can put
+ink hard against anything.
+
+**The desk draws the design and the server draws the truth.** An
+interactive surface needs client-side coordinates, so this is the one
+place the "a crop and the drawing that made it come from one function"
+rule cannot hold outright. It is mitigated rather than ignored: the
+surface is labelled a working sketch, the picture beside it is decoded
+back **out of the print payload** - buffer checksums and all - and the
+millimetres come from `/api/tag/geometry`, so the browser holds no copy
+of `PRINTABLE_*`. **The QR on the surface is a placeholder on purpose.**
+There is no QR encoder in JavaScript here and there should not be one:
+`marker.js` is pinned byte-for-byte against `marker.py` by a node test
+precisely because a second implementation of a printed format drifts
+quietly, and a QR that encodes differently in the editor than on the
+paper is that bug with a worse blast radius.
+
+**`/api/tag/preview` returns JSON with the PNG inside it**, where
+`/api/label/preview` returns image bytes. Deliberate: the warnings have
+to arrive in the same answer as the picture. Two calls are two renders of
+two specs the moment one loses a race, and a screen showing one design's
+picture beside another design's warnings is worse than showing neither.
+
+**Typing in the canvas panel must not re-render the canvas panel.**
+`cvEdit` repaints the surface and refreshes the preview *column* and
+deliberately does not call `render()`: rebuilding an input under the
+cursor takes the caret with it, and `selectionStart` **throws** on
+`<input type=number>`, so `renderMain`'s restore cannot put it back. It
+presents as a field that will not let you type in the middle of a number,
+and it garbled a whole design the first time this screen was driven. The
+structural changes - add, remove, select, a pill that reveals a field -
+go through `cvChanged` and do rebuild. Same failure the desk's search box
+had, one screen further along.
+
+**A design lives in localStorage, and that is the honest place for it.**
+It is the only thing on this portal that exists nowhere but the browser -
+everything else is a row on the Pi - and losing it to a reload is how a
+tool like this gets abandoned. There is no table for it because a design
+is not a fact about her business; `Save a copy` writes the exact JSON
+`mplabel canvas` reads, which is the route for one worth keeping.
+
+**A freeform label records nothing, exactly like an ad-hoc 4x6.** No
+`sales` row, no `listings` row, no file kept - there is no order, listing
+or shelf behind it, and inventing a row so something could be recorded
+would put a thing that is not a thing into revenue and sell-through. What
+records it is printd's journal, and with `tag_backend` pointing straight
+at the hidraw node there is no journal at all - the answer says which, in
+those words, because a caveat that is false on this host is worse than no
+caveat. The job id is a digest of the spec for the same reason the ad-hoc
+4x6's is a digest of its bytes: behind a tunnel a timed-out request that
+already printed is the likely case, and a random id turns her retry into
+a second label instead of a 409.
 
 **Both printers are behind `printd`, and the label maker sends a *spec*
 not a raster.** `tag_backend` picks `supvan` (the local hidraw node) or
@@ -2312,6 +2425,15 @@ What is left is physical and needs a camera, not a test:
 - #18 row order and feed origin. Low priority - labels come out right
   today - but it is the difference between knowing and having been lucky.
 
+**A freeform canvas is the third thing it prints**, and the one that
+needed no new protocol at all - `kind: "canvas"` goes down the same
+signed `/print-tag` body as the other two. The design lives at
+`/desk#canvas` and `mplabel canvas <spec.json>` prints one back. What it
+has not done is come out of the machine: see the table above for what
+one printed label would settle, and note the warnings it emits about QR
+module size and about ink leaving the drawable box are both derived from
+measurements of a single roll.
+
 ### What the tags are for
 
 #19, largely landed. `bins` exists, `listings.bin_code` references it,
@@ -2500,6 +2622,12 @@ Three things about it are worth keeping here rather than rediscovering:
   itself beside the measurement, labelled as the file going **in** rather
   than the 4x6 coming out - the crop is still what the numbers describe,
   and a picture of the input must not be read as a preview of the output.
+- **Designing a label is the seventh screen**, and the first one that
+  authors rather than edits. It is on the desk and not the phone for the
+  obvious reason - dragging a text box is a mouse job - and it is the
+  only screen whose work lives in the browser rather than on the Pi. See
+  *Things that will bite you* for why the surface is a sketch, why its
+  QR is a placeholder, and why typing in its panel must not re-render it.
 - **What it does not do**: no scanning (the phone has the camera), no
   offline.
 
