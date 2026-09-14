@@ -254,17 +254,89 @@ def _search_all(imap, folder, since=None, domains=None):
 
 
 def _headers_only(imap, nums):
-    """Fetch just headers for the survey pass - much faster than RFC822."""
+    """Fetch just headers for the survey pass - much faster than RFC822.
+
+    FROM and REPLY-TO are in the list because a subject on its own stopped
+    being enough the moment there were three senders. A real scan came
+    back with thirty-one `has been listed` notifications and no way to
+    say whether they were Facebook's `listed` event - a pattern that has
+    been in `EVENT_PATTERNS` and never matched anything - or eBay's, and
+    the two want opposite handling. An instrument that cannot attribute
+    its reading is the same failure as one that stops at 32 dots."""
     out = []
     for i in range(0, len(nums), 100):
         chunk = b",".join(nums[i:i + 100])
-        typ, data = imap.fetch(chunk, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE MESSAGE-ID)])")
+        typ, data = imap.fetch(
+            chunk, "(BODY.PEEK[HEADER.FIELDS "
+                   "(SUBJECT DATE MESSAGE-ID FROM REPLY-TO)])")
         if typ != "OK":
             continue
         for part in data:
             if isinstance(part, tuple) and part[1]:
                 out.append(email.message_from_bytes(part[1]))
     return out
+
+
+def generic_subject(subject):
+    """Collapse the variable parts so the histogram stays readable."""
+    generic = re.sub(r"[\"'\u201c\u201d].*?[\"'\u201c\u201d]", '"..."',
+                     subject)
+    # Long digit runs are the other variable part, and the one that
+    # actually bit: a real survey came back with twenty
+    # `Ticket ID # 9333904 Updated - ...` lines, each its own subject,
+    # which ate most of the list and pushed whole families below the
+    # cut. Quoting was the only thing being collapsed and nothing here
+    # is quoted.
+    generic = re.sub(r"\d{4,}", "#", generic)
+    # A truncated title is the third variable part, and the one eBay
+    # uses for nearly everything: it cuts the item name and ends it with
+    # an ellipsis, so `Vintage...`, `Vintage #...`, `Antique...` and
+    # `Andrea by Sadek...` are four lines of a histogram describing one
+    # notification. A real scan spent eight of its twenty-five rows on
+    # that single family and hid fifty-four other subjects behind them.
+    #
+    # The span is bounded at a colon so a label keeps its own words -
+    # `Order update: ...` and `You have a new offer: ...` stay apart,
+    # which is the whole point of reading the list.
+    # Starts at a word character or a `$`, so the emoji eBay prefixes
+    # these with survives - it is half of what identifies the family.
+    generic = re.sub(r"[\w$][^:]*?(?:\.\.\.|\u2026)", "\u2026", generic)
+    return re.sub(r"\s+", " ", generic).strip()[:70]
+
+
+def classify_for(who, subject):
+    """Ask the classifier that belongs to the sender, and only that one.
+
+    The three are separate on purpose - one classifier answering "sold"
+    to a ShopGoodwill subject puts one of her own purchases into the
+    sell-through numerator - and until the survey fetched FROM it had to
+    try all three and take the first answer, which is the merge it was
+    trying to avoid, one layer out. An unknown sender still tries all
+    three, because a wrong guess there is a line in a report rather than
+    a row in a table."""
+    if who == "facebook":
+        return listings.classify(subject)
+    if who == "shopgoodwill":
+        return goodwill.classify(subject)
+    if who == "ebay":
+        return mailparse.classify_ebay(subject)
+    return (listings.classify(subject) or goodwill.classify(subject)
+            or mailparse.classify_ebay(subject))
+
+
+def sender_of(msg):
+    """Which of the three this came from, by address domain.
+
+    The same predicates the importers gate on rather than a fourth
+    reading of the From header - a survey that disagrees with the poller
+    about who sent something is worse than one that cannot tell."""
+    if mailparse.is_from_facebook(msg):
+        return "facebook"
+    if goodwill.is_from_goodwill(msg):
+        return "shopgoodwill"
+    if mailparse.is_from_ebay(msg):
+        return "ebay"
+    return "?"
 
 
 def scan(cfg, limit=2000):
@@ -305,52 +377,63 @@ def scan(cfg, limit=2000):
             pass
         imap.logout()
 
+    from_sender = Counter()
     known, unknown = Counter(), Counter()
     for m in msgs:
         subj = mailparse._decode(m.get("Subject"))
-        kind = (listings.classify(subj) or goodwill.classify(subj)
-                or mailparse.classify_ebay(subj))
+        who = sender_of(m)
+        from_sender[who] += 1
+        kind = classify_for(who, subj)
         if kind:
-            known[kind] += 1
+            known[(who, kind)] += 1
         else:
-            # Collapse the variable part so the histogram stays readable.
-            generic = re.sub(r"[\"'\u201c\u201d].*?[\"'\u201c\u201d]", '"..."', subj)
-            # Long digit runs are the other variable part, and the one
-            # that actually bit: a real survey came back with twenty
-            # `Ticket ID # 9333904 Updated - ...` lines, each its own
-            # subject, which ate most of the list and pushed whole
-            # families below the cut. Quoting was the only thing being
-            # collapsed and nothing here is quoted.
-            generic = re.sub(r"\d{4,}", "#", generic)
-            generic = re.sub(r"\s+", " ", generic).strip()[:70]
-            unknown[generic] += 1
+            unknown[(who, generic_subject(subj))] += 1
+
+    print("\n=== who sent them ===")
+    for who, n in from_sender.most_common():
+        print(f"  {n:>5}  {who}")
 
     print("\n=== recognised ===")
-    for kind, n in known.most_common():
-        print(f"  {n:>5}  {kind}")
+    for (who, kind), n in known.most_common():
+        print(f"  {n:>5}  {who:<13}{kind}")
     if not known:
         print("  none")
 
+    # Grouped by sender and capped *per sender*, because the cut is what
+    # keeps going wrong. A flat top 25 let one noisy family eat the list
+    # once already, and with three senders it would happily spend the
+    # whole budget on the loudest one while the sender whose shapes
+    # nobody has read printed nothing at all.
     print("\n=== unrecognised subjects ===")
-    shown = 25
-    for subj, n in unknown.most_common(shown):
-        print(f"  {n:>5}  {subj}")
-    # A gauge has to say when it is off-scale. This printed its top 25
-    # and nothing else, so a survey whose first twenty lines were all
-    # one noisy family looked like a complete answer and was not.
-    if len(unknown) > shown:
-        print(f"  ... and {len(unknown) - shown} more distinct subject(s) "
-              f"not shown. Classify the noisy ones and run this again - "
-              f"they are what is hiding the rest.")
+    if not unknown:
+        print("  none")
+    per_sender = 12
+    for who, _n in from_sender.most_common():
+        rows = [(subj, n) for (w, subj), n in unknown.items() if w == who]
+        if not rows:
+            continue
+        rows.sort(key=lambda r: (-r[1], r[0]))
+        print(f"\n  -- {who} --")
+        for subj, n in rows[:per_sender]:
+            print(f"  {n:>5}  {subj}")
+        if len(rows) > per_sender:
+            hidden = sum(n for _s, n in rows[per_sender:])
+            print(f"  ... and {len(rows) - per_sender} more distinct "
+                  f"subject(s) from {who}, {hidden} message(s) in total.")
+
     if unknown:
-        print("\nIf any of those are listing/sale/inquiry notifications, add "
-              "a pattern for them to EVENT_PATTERNS in listings.py - that is "
-              "how the backfill learns them. An auction subject goes in "
-              "SUBJECT_PATTERNS in goodwill.py instead.")
-        print("An eBay subject is a different question: the only one that "
-              "has a printer behind it is 'Your shipping label is ready', "
-              "and the rest are listed here so it is visible what eBay "
-              "actually sends rather than assumed.")
+        print("\nWhere a pattern goes depends on who sent it, which is why "
+              "the sender is printed beside every line. A Facebook "
+              "listing/sale/inquiry notification goes in EVENT_PATTERNS in "
+              "listings.py; an auction subject goes in SUBJECT_PATTERNS in "
+              "goodwill.py. Guessing from the subject alone is how a "
+              "Facebook `listed` pattern and an eBay one get confused for "
+              "each other - they read almost identically and want "
+              "opposite handling.")
+        print("An eBay subject is a different question again: the only one "
+              "with a printer behind it is 'Your shipping label is ready'. "
+              "The rest are listed so it is visible what eBay actually "
+              "sends rather than assumed, and nothing reads their bodies.")
 
 
 def run(cfg, conn, limit=None, resume=True):
