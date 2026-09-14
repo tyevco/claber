@@ -1324,6 +1324,50 @@ def cmd_shelf_tag(cfg, args):
 
 
 
+def cmd_canvas(cfg, args):
+    """Print a freeform label from a canvas spec in a file.
+
+    The desk portal is where these are drawn - dragging a text box on a
+    laptop is the job, and it is not one for a terminal. This exists for
+    the two things a screen is bad at: checking a design into the repo
+    next to the thing it labels, and printing the same one again next
+    month without having to find it in a browser's local storage.
+
+    Above `connect_db` with the other printer commands. A freeform label
+    is not about an order, a listing or a shelf - nothing it prints is
+    recorded anywhere, exactly like `POST /api/print/label` on the 4x6
+    side - so a database it will never open must not be able to stop it.
+    """
+    path = Path(args.spec)
+    try:
+        spec = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit(f"cannot read {path}: {exc}")
+    except ValueError as exc:
+        raise SystemExit(f"{path} is not JSON: {exc}")
+    if not isinstance(spec, dict):
+        raise SystemExit(f"{path} holds a {type(spec).__name__}, not a "
+                         f"canvas spec")
+
+    # A file that is just the element list is accepted, because that is
+    # what the design *is* and asking somebody to wrap it in a kind they
+    # cannot choose is ceremony.
+    spec = dict(spec)
+    spec["kind"] = "canvas"
+
+    if getattr(args, "size", None):
+        try:
+            spec["size_mm"] = list(printers.parse_label_size(args.size))
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+    if getattr(args, "density", None) is not None:
+        spec["density"] = int(args.density)
+
+    n = len(spec.get("elements") or [])
+    print(f"canvas : {path.name}, {n} element{'' if n == 1 else 's'}")
+    return _emit_tag(cfg, args, spec)
+
+
 def cmd_bin(conn, cfg, args):
     """Make, list and fill the places things live.
 
@@ -1492,6 +1536,21 @@ def _emit_tag(cfg, args, spec):
               f"die-cut label has to be at least this long")
         print(f"decoded: {payload['decoded_columns']} printhead lines, "
               f"{payload['decoded_stride']} bytes each, every checksum valid")
+
+    # What the renderer noticed, and only it could. Both kinds of note
+    # describe damage that is invisible on the paper: ink outside the
+    # drawable box is dropped rather than printed small, and a QR whose
+    # modules came out too small looks perfect until a phone is pointed
+    # at it. Printed after the payload rather than before, so the last
+    # thing on screen before "add --print" is the reason not to.
+    notes = result.get("notes") or {}
+    for qr_note in notes.get("qr_modules") or []:
+        print(f"qr     : element {qr_note['element']}, "
+              f"{qr_note['modules']} modules at "
+              f"{qr_note['dots_per_module']} dots each = "
+              f"{qr_note['mm']:g}mm square")
+    for warning in notes.get("warnings") or []:
+        print(f"  ! {warning}")
 
     if args.preview and result.get("compressed_b64"):
         import base64
@@ -2701,6 +2760,19 @@ def cmd_ebay_push(cfg, conn, args):
     listing = find_listing(conn, args.listing)
     row = dict(listing)
 
+    # A sold thing is gone, and an offer for it is a listing she would
+    # have to take down - or worse, one somebody buys. Nothing looked at
+    # the state before, so `push <a sold listing>` was accepted in
+    # silence. Only `sold` is refused: `acquired` and `draft` are both
+    # things she owns that nobody can buy yet, which is precisely what
+    # a new eBay listing is for.
+    if (row.get("state") or "").strip().lower() == "sold":
+        print(f"refusing: listing {row['id']} is already sold.\n"
+              f"  {row.get('title') or ''}\n"
+              f"An offer for it would be a listing to take down, or one "
+              f"somebody buys.", file=sys.stderr)
+        return 2
+
     try:
         sku = ebay_mod.sku_for(row.get("inventory_code"))
         photos = listings_mod.photos_for(conn, row["id"])
@@ -2732,7 +2804,9 @@ def cmd_ebay_push(cfg, conn, args):
         # `--publish`, so swallowing a failure here would publish
         # without knowing what eBay requires, which is the one thing
         # asking for them early exists to prevent.
-        needed = ebay_mod.required_aspects(cfg, category) if category else []
+        aspects_seen = {}
+        needed = (ebay_mod.required_aspects(cfg, category, seen=aspects_seen)
+                  if category else [])
     except ebay_mod.EbayConfigError as exc:
         print(f"ebay: {exc}", file=sys.stderr)
         return 78
@@ -2756,8 +2830,15 @@ def cmd_ebay_push(cfg, conn, args):
         print(f"             {url}")
     if suggestions:
         print("  eBay suggests:")
+        # The star means "this is the one being sent", so it belongs to
+        # a category that will actually be used: the one she named, or
+        # on a dry run the first suggestion the request is built from.
+        # Marking the first one in a run that is about to refuse said
+        # the opposite of what the refusal then says.
+        will_use = args.category or (category if args.dry_run else None)
         for guess in suggestions:
-            mark = "*" if str(guess["id"]) == str(category) else " "
+            mark = ("*" if will_use and str(guess["id"]) == str(will_use)
+                    else " ")
             print(f"           {mark} {guess['id']}  {guess['path']}")
         if args.category and not any(str(g["id"]) == str(args.category)
                                      for g in suggestions):
@@ -2776,6 +2857,36 @@ def cmd_ebay_push(cfg, conn, args):
         print(f"  required aspects for {category}: " + ", ".join(needed))
         if missing:
             print(f"             missing: " + ", ".join(missing))
+    elif category:
+        # Said out loud, because "none required" and "we could not read
+        # the list" look identical as silence - and the second means a
+        # publish fails at eBay naming one aspect per round trip, which
+        # is the thing asking early exists to prevent.
+        total = aspects_seen.get("total")
+        if total:
+            print(f"  required aspects for {category}: none of the "
+                  f"{total} eBay listed")
+        else:
+            print(f"  required aspects for {category}: eBay's answer "
+                  f"carried no aspects at all,\n             which is "
+                  f"either true or a shape this could not read")
+
+    if not args.category and not args.dry_run:
+        # The step that can refuse goes before the steps that create -
+        # the same rule `ebay setup` was fixed to follow. eBay's own
+        # first suggestion was plainly wrong on three of twelve real
+        # titles, and an offer created on a guess is a listing nobody
+        # searching for the thing will ever see. Publishing happens in
+        # eBay's UI by design, and that route never asks again.
+        print("\nrefusing to create an offer on a suggested category. "
+              "Name one:\n"
+              f"  mplabel ebay push {args.listing} --category "
+              f"{(suggestions[0]['id'] if suggestions else 'N')}"
+              + "".join(f" --aspect {a!r}=..." for a in needed)
+              + "\nNothing was sent. The suggestions above are eBay's "
+                "guess from the title;\n`--dry-run` prints the whole "
+                "request without this refusal.", file=sys.stderr)
+        return 2
 
     if args.dry_run:
         print("\n--- inventory item ---")
@@ -3316,6 +3427,29 @@ def _main():
     p.add_argument("--print", action="store_true", help="actually send it")
     p.add_argument("--device", help="hidraw node, default supvan_device")
 
+    p = sub.add_parser("canvas",
+                       help="print a freeform label from a canvas spec: "
+                            "text, shapes and QR codes wherever you put "
+                            "them. Drawn on the desk portal at /desk")
+    p.add_argument("spec", help="a JSON file holding `elements`, and "
+                                "optionally `size_mm`. Save one out of "
+                                "the desk's canvas screen")
+    p.add_argument("--size", default=None, metavar="WxH",
+                   help="override the size the spec was drawn for, in mm "
+                        "unless suffixed `in`. Rarely what you want: the "
+                        "elements are millimetres from a corner, so a "
+                        "different size moves the label under them rather "
+                        "than rescaling the design")
+    p.add_argument("--density", type=int, default=None,
+                   help="burn energy 0-15. Unset means the host with the "
+                        "roll decides (supvan_density)")
+    p.add_argument("--preview", metavar="PNG",
+                   help="write what the payload decodes back to")
+    p.add_argument("--scale", type=int, default=2,
+                   help="preview magnification (default %(default)s)")
+    p.add_argument("--print", action="store_true", help="actually send it")
+    p.add_argument("--device", help="hidraw node, default supvan_device")
+
     p = sub.add_parser("bin", help="the places things live: make one, see "
                                    "what is in it, put something in it")
     bsub = p.add_subparsers(dest="action", required=True)
@@ -3638,6 +3772,11 @@ def _main():
         return
     if args.cmd == "shelf-tag":
         cmd_shelf_tag(cfg, args)
+        return
+    if args.cmd == "canvas":
+        # Above connect_db with the other two: a freeform label records
+        # nothing and belongs to nothing, so it has no database to need.
+        cmd_canvas(cfg, args)
         return
 
     if args.cmd == "supvan-probe":

@@ -517,6 +517,93 @@ a:hover { text-decoration: underline; }
 }
 .drop--has p { margin-left: 0; margin-right: 0; }
 
+/* --------------------------------------------------------- design a label
+ *
+ * Two columns like the stray-label screen, and for the same reason: the
+ * thing being made on the left, the thing that will actually come out of
+ * the printer on the right, at a size where a mistake is obvious.
+ */
+.cv { display: flex; gap: 26px; align-items: flex-start; }
+.cv__left { flex: 1; min-width: 0; max-width: 760px; }
+.cv__right {
+  flex: 1; min-width: 300px; position: sticky; top: 0;
+  display: flex; flex-direction: column; gap: 9px;
+}
+.cv__opts { margin-top: 18px; padding: 6px 18px 14px; }
+/* Narrow, and beside the presets rather than under them: it is the
+   fifth option in that row, not a second way of answering. */
+.cv__size { width: 96px; flex: none; }
+.cv__opts .sendrow .label { width: 44px; }
+.cv__opts .sendrow__opts .pill { padding: 6px 9px; }
+
+.cv__tools {
+  display: flex; align-items: center; gap: 6px;
+  flex-wrap: wrap; margin: 16px 0 12px;
+}
+
+/* The paper. Always light, in both themes - thermal stock is white and
+   the ink is burnt, so a dark-mode label would be a picture of something
+   this machine cannot print. The surround stays themed. */
+.cv__stage {
+  border: 1px solid var(--bd); border-radius: 12px; background: var(--elev);
+  padding: 18px; display: flex; justify-content: center;
+  overflow-x: auto;
+}
+.cv__surface {
+  background: #fff; display: block; cursor: crosshair;
+  box-shadow: 0 1px 6px rgba(0,0,0,.25);
+  /* The label's own edge. Without it a design that stops short of the
+     margin looks like the label stops there too. */
+  outline: 1px solid #bbb;
+}
+.cv__surface--wait { width: 100%; height: 240px; border-radius: 8px; }
+
+.cv__props { margin-top: 16px; }
+.cv__propshead {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 12px;
+}
+.cv__grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+.cv__field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.cv__field--wide { grid-column: 1 / -1; }
+.cv__field > span {
+  font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--mut);
+}
+.cv__field .sendrow__opts { justify-content: flex-start; }
+
+.cv__shot {
+  width: 100%; border: 1px solid var(--bd); border-radius: 12px;
+  background: #fff; object-fit: contain; padding: 10px; display: block;
+  /* Nearest, not smooth. This is a 1-bit raster at 8 dots per
+     millimetre, and a browser's default smoothing turns a QR's modules
+     into grey mush that looks like a bad print rather than a scaled one. */
+  image-rendering: pixelated;
+}
+.cv__blank, .cv__bad {
+  border: 1px solid var(--bd); border-radius: 12px; padding: 22px;
+  background: var(--rai); font-size: 13px; color: var(--mut);
+  min-height: 90px; display: flex; align-items: center;
+}
+.cv__bad {
+  background: var(--alt); border-color: var(--ale); color: var(--al);
+}
+/* Above the print button, never below it: both kinds of warning describe
+   damage that is invisible on the paper. */
+.cv__warn {
+  border: 1px solid var(--wa); border-radius: 12px; padding: 12px 14px;
+  background: var(--wat); color: var(--wa); font-size: 12.5px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+
+@media (max-width: 1100px) {
+  .cv { flex-direction: column; }
+  .cv__left, .cv__right { max-width: none; width: 100%; position: static; }
+}
+
 /* ----------------------------------------------------- listing writer */
 
 .writer__head {

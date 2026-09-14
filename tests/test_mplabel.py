@@ -5370,6 +5370,370 @@ def test_a_bad_tag_spec_is_refused_before_anything_moves(printd):
         assert why in payload["error"], (bad, payload)
 
 
+# --- the freeform canvas ---------------------------------------------------
+#
+# A third tag kind, so almost everything about it is already covered by
+# the tests above: the signed body, the journal, the deadline, the lock.
+# What is new is a layout nobody else writes - millimetres from a corner
+# rather than a form - and every test here exists because that layout can
+# be wrong in a way the paper does not report.
+
+CANVAS_SPEC = {
+    "kind": "canvas",
+    "size_mm": [48, 30],
+    "elements": [
+        {"type": "text", "x": 2, "y": 2, "text": "FRAGILE", "size": 5},
+        {"type": "line", "x": 2, "y": 10, "x2": 30, "y2": 10},
+        {"type": "rect", "x": 2, "y": 13, "w": 20, "h": 8, "fill": False},
+    ],
+}
+
+
+def test_a_canvas_is_laid_out_in_the_box_that_burns_not_the_label():
+    """The head marks 312 of its 384 dots and the window is not centred,
+    and the firmware never sends the feed margin - so a canvas that used
+    the label's own corner as mm (0, 0) would put every element a fixed
+    distance from where it was drawn. It reads right on screen the whole
+    time, which is how a QR once lost its left finder column and would
+    not scan while looking intact in a photograph."""
+    from mplabel import canvas, inventory
+
+    w, h = canvas.canvas_mm((48, 30))
+    # Strictly inside the label on both axes, and by the measured insets
+    # rather than by a tidy symmetric guess.
+    assert w < 48 and h < 30
+    assert w == pytest.approx(
+        (inventory.PRINTABLE_DOTS - 2 * inventory.SIDE_MARGIN_DOTS)
+        / inventory.DOTS_PER_MM, abs=0.01)
+
+
+def test_the_geometry_route_answers_from_the_renderers_own_function(app):
+    """One function, or the editor lays out against a second opinion of
+    where the ink lands. The route exists precisely so the browser holds
+    no copy of PRINTABLE_* at all."""
+    from mplabel import canvas
+
+    base, _conn = app
+    _, cookie = _login(base)
+    status, _h, body = _http(f"{base}/api/tag/geometry?size=4x1in",
+                             cookie=cookie, headers={"X-Mplabel": "1"})
+    assert status == 200
+    got = json.loads(body)
+    assert got["canvas_mm"] == list(canvas.canvas_mm((101.6, 25.4)))
+    # A label wider than the head can only print with its long axis down
+    # the feed, and the editor has to say so - it is the difference
+    # between a label and one that prints across three of them.
+    assert got["sideways"] is True
+    assert got["is_roll"] is False
+
+
+def test_a_canvas_keeps_the_feed_margin_empty_both_ways_round():
+    """The first and last `margin` printhead lines are never sent, so ink
+    there is dropped rather than printed small and nothing reports it.
+    Which pair of edges that is depends on whether the label prints
+    sideways, and insetting the wrong pair is silent."""
+    from mplabel import canvas, supvan
+
+    for size in ((48, 30), (101.6, 25.4)):
+        cw, ch = canvas.canvas_mm(size)
+        # Deliberately hard against all four edges of the drawable box.
+        spec = {"kind": "canvas", "elements": [
+            {"type": "rect", "x": 0, "y": 0, "w": cw, "h": ch, "fill": True}]}
+        raster, stride, rows = canvas.render_canvas(spec, label_mm=size)
+        top = raster[:stride * supvan.DEFAULT_MARGIN_DOTS]
+        bottom = raster[stride * (rows - supvan.DEFAULT_MARGIN_DOTS):]
+        assert not any(top), f"ink in the leading feed margin at {size}"
+        assert not any(bottom), f"ink in the trailing feed margin at {size}"
+        assert any(raster), f"nothing drawn at all at {size}"
+
+
+def test_an_element_entirely_off_the_label_is_refused_by_name():
+    """Never what anybody meant, and the printer cannot report a label
+    that came out missing a third of its design - so it is refused here,
+    where there is still something to say about it. The message names the
+    element because a canvas comes out of an editor where they are a list
+    and "element 3" is something a person can point at."""
+    from mplabel import canvas
+
+    spec = {"kind": "canvas", "elements": [
+        {"type": "text", "x": 1, "y": 1, "text": "fine"},
+        {"type": "rect", "x": 90, "y": 1, "w": 5, "h": 5}]}
+    with pytest.raises(canvas.CanvasError) as exc:
+        canvas.render_canvas(spec, label_mm=(48, 30))
+    assert "element 1" in str(exc.value)
+    assert "off the label" in str(exc.value)
+    # And it says what the box actually is, so the fix does not need a
+    # second round trip to discover.
+    assert "37" in str(exc.value)
+
+
+def test_an_element_partly_off_the_label_prints_and_says_so():
+    """Refusing on a millimetre of overhang would make the editor
+    unusable - dragging past an edge while laying out is normal. But the
+    part that runs off is dropped silently, so an instrument that cannot
+    refuse still has to report that the reading is off its scale."""
+    from mplabel import canvas
+
+    notes = {}
+    spec = {"kind": "canvas", "elements": [
+        {"type": "rect", "x": 30, "y": 2, "w": 20, "h": 5, "fill": True}]}
+    canvas.render_canvas(spec, label_mm=(48, 30), notes=notes)
+    assert notes["clipped"] == [0]
+    assert any("runs off the label" in w for w in notes["warnings"])
+
+
+def test_a_canvas_qr_reports_the_module_size_that_decides_whether_it_reads():
+    """5 dots a module is the only value ever read off this paper - a
+    printed `inventory-label --qr` went first time in the stock Camera
+    app. Below it nothing has been read, and a QR that is too small looks
+    perfect until a phone is pointed at it, so the number is reported
+    rather than left on the label to be discovered."""
+    from mplabel import canvas
+
+    notes = {}
+    canvas.render_canvas(
+        {"kind": "canvas", "elements": [
+            {"type": "qr", "x": 1, "y": 1, "size": 8, "text": "MP-7K2Q"}]},
+        label_mm=(48, 30), notes=notes)
+    assert notes["qr_modules"][0]["dots_per_module"] < canvas.QR_MIN_SCALE
+    warning = " ".join(notes["warnings"])
+    assert "dot" in warning and "read off this paper" in warning
+    # Actionable: it names the size that would work rather than only
+    # saying the one chosen is wrong.
+    assert "mm" in warning
+
+    big = {}
+    canvas.render_canvas(
+        {"kind": "canvas", "elements": [
+            {"type": "qr", "x": 1, "y": 1, "size": 20, "text": "MP-7K2Q"}]},
+        label_mm=(48, 50), notes=big)
+    assert big["qr_modules"][0]["dots_per_module"] >= canvas.QR_MIN_SCALE
+    assert not big.get("warnings")
+
+
+def test_a_qr_with_no_room_for_one_dot_a_module_is_refused():
+    """A fractional module here does not scale into uneven blocks, it
+    scales into nothing at all."""
+    from mplabel import canvas
+
+    with pytest.raises(canvas.CanvasError) as exc:
+        canvas.render_canvas(
+            {"kind": "canvas", "elements": [
+                {"type": "qr", "x": 1, "y": 1, "size": 1,
+                 "text": "https://example.invalid/a/rather/long/one"}]},
+            label_mm=(48, 30))
+    assert "modules" in str(exc.value) and "at least" in str(exc.value)
+
+
+def test_an_empty_canvas_is_refused_rather_than_printing_a_blank_label():
+    """Stock spent on nothing, and this printer gives nothing back that
+    would say it happened."""
+    from mplabel import canvas
+
+    for bad in ({"elements": []}, {"elements": None}, {}):
+        with pytest.raises(canvas.CanvasError):
+            canvas.render_canvas(dict(bad, kind="canvas"), label_mm=(48, 30))
+
+
+def test_a_canvas_element_is_refused_with_a_sentence_that_names_the_field():
+    from mplabel import canvas
+
+    cases = (
+        ([{"type": "wat", "x": 1, "y": 1}], "expected one of"),
+        ([{"type": "text", "x": 1, "y": 1}], "no text in it"),
+        ([{"type": "text", "x": 1, "y": 1, "text": "a", "align": "up"}],
+         "expected left, center"),
+        ([{"type": "rect", "x": 1, "y": 1, "w": 0, "h": 5}], "no area"),
+        ([{"type": "qr", "x": 1, "y": 1, "size": 5}], "nothing to carry"),
+        ([{"type": "text", "x": "over there", "y": 1, "text": "a"}],
+         "wants a number"),
+    )
+    for elements, why in cases:
+        with pytest.raises(canvas.CanvasError) as exc:
+            canvas.render_canvas({"kind": "canvas", "elements": elements},
+                                 label_mm=(48, 30))
+        assert why in str(exc.value), (elements, str(exc.value))
+
+
+def test_a_canvas_crosses_the_wire_as_a_spec_down_the_same_signed_path(printd):
+    """A third `kind`, so it inherits the HMAC, the journal, the deadline
+    and the device lock rather than growing a second route beside them."""
+    base, _sent, _srv = printd
+
+    status, result = _tag_req(base, dict(CANVAS_SPEC, dry_run=True),
+                              job="canvas-0011223344556677")
+    assert status == 200, result
+    assert result["kind"] == "canvas"
+    assert result["printed"] is False and result["dry_run"] is True
+    # The design named its own size, so that is what got drawn - see
+    # below for why a canvas is the one kind that pins its own.
+    assert result["label"]["mm"] == [48, 30]
+    assert result["payload"]["buffer_count"] >= 1
+
+
+def test_a_canvas_pins_its_own_size_where_the_other_tags_defer(printd):
+    """The opposite rule to `inventory-label` and `shelf-tag`, on
+    purpose. Those are forms - the layout adapts to whatever is loaded,
+    so an unset size rightly means "the host with the roll decides". A
+    canvas is millimetres from a corner and a coordinate means nothing
+    without the box it was measured in, so the size travels with the
+    design and the host's roll does not overrule it."""
+    base, _sent, srv = printd
+    srv.cfg["supvan_label_mm"] = "48x50"
+
+    status, result = _tag_req(base, dict(CANVAS_SPEC, dry_run=True),
+                              job="canvas-1122334455667788")
+    assert status == 200, result
+    assert result["label"]["mm"] == [48, 30], "the roll overruled the design"
+
+    # And with no size on the design, the roll is what answers - which is
+    # the rule the other two kinds follow all the time.
+    spec = {k: v for k, v in CANVAS_SPEC.items() if k != "size_mm"}
+    status, result = _tag_req(base, dict(spec, dry_run=True),
+                              job="canvas-2233445566778899")
+    assert status == 200, result
+    assert result["label"]["mm"] == [48, 50]
+
+
+def test_the_canvas_print_job_id_is_a_digest_of_the_design(app, monkeypatch):
+    """She is on a laptop behind a tunnel and a request that times out
+    after the label came out is the likely case. A random id would turn
+    her retry into a second label instead of a 409 from printd; asking
+    again on purpose is `force`, which is a different intent."""
+    from mplabel import printers
+
+    base, _conn = app
+    _, cookie = _login(base)
+    jobs = []
+
+    def fake(spec, backend=None, **kw):
+        jobs.append(kw.get("job"))
+        return {"printed": True, "label": {"mm": [48, 30]}, "payload": {}}
+
+    monkeypatch.setattr(printers, "print_tag", fake)
+    spec = {k: v for k, v in CANVAS_SPEC.items() if k != "kind"}
+
+    for _ in range(2):
+        status, _h, _b = _http(f"{base}/api/tag/print", "POST", spec,
+                               cookie=cookie, headers={"X-Mplabel": "1"})
+        assert status == 200
+    assert jobs[0] == jobs[1], "a retry would have printed a second label"
+
+    _http(f"{base}/api/tag/print", "POST", dict(spec, force=True),
+          cookie=cookie, headers={"X-Mplabel": "1"})
+    assert jobs[2] != jobs[0], "--force did not ask for a fresh label"
+
+    # The id must not move when something that is not part of the design
+    # changes, or the duplicate check is off for every request.
+    _http(f"{base}/api/tag/print", "POST", dict(spec, dry_run=True),
+          cookie=cookie, headers={"X-Mplabel": "1"})
+    assert jobs[3] == jobs[0]
+
+
+def test_the_canvas_preview_is_decoded_back_out_of_the_payload(app):
+    """A preview of the source raster shows a perfect label for a job the
+    device is about to refuse, which is this printer's entire history.
+    The picture and the warnings arrive in one answer so that a screen
+    cannot show one design's picture beside another design's warnings."""
+    import base64
+
+    from mplabel import supvan
+
+    base, _conn = app
+    _, cookie = _login(base)
+    spec = dict({k: v for k, v in CANVAS_SPEC.items() if k != "kind"},
+                elements=CANVAS_SPEC["elements"] + [
+                    {"type": "qr", "x": 24, "y": 13, "size": 11,
+                     "text": "MP-7K2Q"}])
+    status, _h, body = _http(f"{base}/api/tag/print".replace("print",
+                                                             "preview"),
+                             "POST", spec, cookie=cookie,
+                             headers={"X-Mplabel": "1"})
+    assert status == 200
+    got = json.loads(body)
+    assert got["png"].startswith("data:image/png;base64,")
+    assert len(base64.b64decode(got["png"].split(",", 1)[1])) > 200
+    assert got["notes"]["qr_modules"][0]["element"] == 3
+    # Every buffer checksum was checked on the way back through.
+    # Short by the feed margin at each end, which is the documented
+    # behaviour rather than a loss: `split_into_buffers` starts the
+    # image at `margin_top` and stops `margin_bottom` short, and the
+    # firmware feeds blank for both.
+    assert (got["payload"]["decoded_columns"]
+            == got["label"]["rows"] - 2 * supvan.DEFAULT_MARGIN_DOTS)
+
+
+def test_a_canvas_refusal_reaches_the_browser_as_its_own_sentence(app):
+    """"element 3 is a text with no text in it" is the whole answer, and
+    a status code alone sends her back to the screen to guess which of
+    eleven boxes it meant."""
+    base, _conn = app
+    _, cookie = _login(base)
+    status, _h, body = _http(f"{base}/api/tag/preview", "POST",
+                             {"elements": [{"type": "qr", "x": 90, "y": 1,
+                                            "size": 5, "text": "x"}]},
+                             cookie=cookie, headers={"X-Mplabel": "1"})
+    assert status == 400
+    assert "element 0" in json.loads(body)["error"]
+
+
+def test_the_canvas_command_does_not_open_the_database(tmp_path,
+                                                       monkeypatch, capsys):
+    """With `probe`, `selftest` and the other two tag commands: a label
+    that belongs to no order records nothing, so a database it will never
+    open must not be able to stop it printing."""
+    from mplabel import cli
+
+    spec = tmp_path / "design.json"
+    spec.write_text(json.dumps({"size_mm": [48, 30], "elements": [
+        {"type": "text", "x": 2, "y": 2, "text": "FRAGILE", "size": 5}]}))
+
+    def boom(*a, **k):
+        raise AssertionError("canvas opened the database")
+
+    monkeypatch.setattr(cli, "connect_db", boom)
+    monkeypatch.setattr(sys, "argv", ["mplabel", "canvas", str(spec)])
+    cli.main()
+    out = capsys.readouterr().out
+    assert "1 element" in out
+    assert "48 x 30mm" in out
+    assert "nothing sent, no paper moved" in out
+
+
+def test_the_canvas_cli_and_the_web_route_draw_the_same_label(tmp_path):
+    """One renderer behind both, the same way `read_csv` sits under the
+    CLI importer and the wizard. Two would disagree about what a
+    millimetre means eventually, and invisibly."""
+    from mplabel import canvas, printers
+
+    spec = dict(CANVAS_SPEC)
+    from_spec, _stride, _rows = canvas.render_canvas(spec, label_mm=(48, 30))
+    _job, result = printers.assemble_tag(spec, {})
+    assert result["label"]["mm"] == [48, 30]
+    # Same ink, to the dot.
+    assert result["label"]["ink_pct"] == round(
+        100 * sum(bin(b).count("1") for b in from_spec)
+        / (len(from_spec) * 8), 2)
+
+
+def test_the_canvas_screen_is_wired_into_the_desks_three_registries():
+    """The screen registry is one list precisely so a screen cannot exist
+    in the sidebar and not the router - which is a nav row that
+    highlights and shows the wrong body. A canvas also needs the `after`
+    hook, because innerHTML throws away everything drawn on its surface
+    and an empty rectangle reads as the design having been lost."""
+    static = Path(__file__).parent.parent / "src" / "mplabel" / "static"
+    js = (static / "desk.js").read_text(encoding="utf-8")
+    assert "slug: 'canvas'" in js
+    assert "view: viewCanvas" in js
+    assert "after: paintCanvas" in js
+    assert "if (screen.after) screen.after();" in js
+    # Typing must not rebuild the panel being typed into: `selectionStart`
+    # throws on a number input, so renderMain cannot put the caret back.
+    assert "function cvTyped()" in js
+    assert "function renderCanvasRight()" in js
+
+
 def test_healthz_reports_the_label_maker_without_touching_it(printd):
     """It must keep answering through a wedged tag print too, so the
     status it carries is the last one seen, with its age, and never a
@@ -11294,7 +11658,11 @@ def test_ebay_check_passes_on_an_install_that_cannot_publish_yet(tmp_path,
 
     rows = ebay.check(cfg)
     unset = [r for r in rows if r[2] and not r[3]]
-    assert len(unset) == 4, "the policies should be notes, not faults"
+    # Five now: the location, the three policies and the photo base -
+    # which is the one publish actually stops on, and was missing from
+    # this report while the other four were in it.
+    assert len(unset) == 5, "the publish-time keys are notes, not faults"
+    assert "photo base" in [label for label, _v, _p, _b in unset]
     assert not [r for r in rows if r[2] and r[3]], \
         "nothing about this install is actually broken"
     assert cli.cmd_ebay(cfg, argparse.Namespace(ebaycmd="check")) == 0
@@ -11463,7 +11831,8 @@ def test_ebay_push_will_not_publish_on_a_suggested_category(db, tmp_path,
     monkeypatch.setattr(ebay, "suggest_categories", lambda cfg_, title,
                         limit=3: [{"id": "20081", "name": "Vases",
                                    "path": "Antiques > Vases"}])
-    monkeypatch.setattr(ebay, "required_aspects", lambda cfg_, cid: [])
+    monkeypatch.setattr(ebay, "required_aspects",
+                        lambda cfg_, cid, seen=None: [])
 
     assert cli.cmd_ebay_push(cfg, db, _push_args(publish=True)) == 2
     assert "suggested category" in capsys.readouterr().err
@@ -11481,7 +11850,8 @@ def test_ebay_push_will_not_publish_without_the_required_aspects(db, tmp_path,
     _pushable(db, tmp_path)
     monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [])
     monkeypatch.setattr(ebay, "required_aspects",
-                        lambda cfg_, cid: ["Type", "Brand"])
+                        lambda cfg_, cid, seen=None:
+                        ["Type", "Brand"])
 
     code = cli.cmd_ebay_push(
         db and cfg, db, _push_args(publish=True, category="20081",
@@ -12813,3 +13183,212 @@ def test_push_says_when_the_named_category_is_not_a_suggestion(
         listing="1", category="13905", aspect=[], publish=False,
         dry_run=False)) == 0
     assert "13905 is not one of these" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Four things a real sandbox session left open, closed together.
+# --------------------------------------------------------------------------
+
+
+def test_push_refuses_to_create_an_offer_on_a_suggested_category(
+        db, tmp_path, capsys, monkeypatch):
+    """The step that can refuse goes before the steps that create.
+
+    eBay's own first suggestion was plainly wrong on three of twelve
+    real titles - belts for ankle boots, heels for sandals - and twelve
+    offers were nevertheless created carrying it, because `category`
+    fell back to `suggestions[0]`. Publishing happens in eBay's UI by
+    design and that route never asks again, so the guess would have gone
+    live unchallenged.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [
+        {"id": "20081", "name": "Vases", "path": "Antiques > Vases"}])
+    monkeypatch.setattr(ebay, "required_aspects",
+                        lambda *a, **k: ["Brand"])
+    sent = []
+    monkeypatch.setattr(ebay, "put_inventory_item",
+                        lambda *a, **k: sent.append("item"))
+    monkeypatch.setattr(ebay, "create_or_update_offer",
+                        lambda *a, **k: sent.append("offer"))
+
+    code = cli.cmd_ebay_push(db and cfg, db, argparse.Namespace(
+        listing="1", category=None, aspect=[], publish=False, dry_run=False))
+    assert code == 2
+    assert sent == [], "nothing may be created on a guess"
+    captured = capsys.readouterr()
+    # The refusal hands back the command that would work, aspects and all.
+    assert "--category 20081" in captured.err
+    assert "--aspect 'Brand'" in captured.err
+    assert db.execute("SELECT COUNT(*) FROM ebay_offers").fetchone()[0] == 0
+    # And the suggestion is not starred: the star means "being sent",
+    # and this run sends nothing - saying otherwise contradicts the
+    # refusal printed under it.
+    assert "* 20081" not in captured.out, captured.out
+
+
+def test_a_dry_run_still_works_without_a_category(db, tmp_path, capsys,
+                                                   monkeypatch):
+    """It sends nothing, so it has nothing to refuse.
+
+    Refusing there too would leave no way to see the suggestions and the
+    request together, which is exactly what a person needs in order to
+    choose the category the refusal is asking for.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r",
+               ebay_photo_base="https://pi.example.com")
+    _pushable(db, tmp_path)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [
+        {"id": "20081", "name": "Vases", "path": "Antiques > Vases"}])
+    monkeypatch.setattr(ebay, "required_aspects", lambda *a, **k: [])
+
+    assert cli.cmd_ebay_push(db and cfg, db, argparse.Namespace(
+        listing="1", category=None, aspect=[], publish=False,
+        dry_run=True)) == 0
+    out = capsys.readouterr().out
+    assert "--- offer ---" in out and "nothing sent" in out
+
+
+def test_push_refuses_a_listing_that_is_already_sold(db, tmp_path, capsys,
+                                                      monkeypatch):
+    """Nothing looked at the state, so this was accepted in silence.
+
+    An offer for a sold thing is a listing she has to take down - or one
+    somebody buys. `acquired` and `draft` stay pushable: those are
+    things she owns that nobody can buy yet, which is what a new eBay
+    listing is for.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    db.execute("UPDATE listings SET state='sold'")
+    db.commit()
+    called = []
+    monkeypatch.setattr(ebay, "suggest_categories",
+                        lambda *a, **k: called.append("suggest") or [])
+
+    code = cli.cmd_ebay_push(db and cfg, db, argparse.Namespace(
+        listing="1", category="20081", aspect=[], publish=False,
+        dry_run=False))
+    assert code == 2
+    assert called == [], "refused before it asks eBay anything"
+    assert "already sold" in capsys.readouterr().err
+
+    for state in ("acquired", "draft", "active"):
+        db.execute("UPDATE listings SET state=?", (state,))
+        db.commit()
+        monkeypatch.setattr(ebay, "required_aspects", lambda *a, **k: [])
+        monkeypatch.setattr(ebay, "put_inventory_item", lambda *a, **k: None)
+        monkeypatch.setattr(ebay, "create_or_update_offer",
+                            lambda *a, **k: ("o1", "created"))
+        assert cli.cmd_ebay_push(db and cfg, db, argparse.Namespace(
+            listing="1", category="20081", aspect=[], publish=False,
+            dry_run=False)) == 0, state
+
+
+def test_the_aspect_list_is_walked_not_indexed():
+    """`payload["aspects"]` was the one key name this module trusted.
+
+    Against this repo's own rule, and the failure is silent in the worst
+    direction: a list we cannot find returns *no required aspects*,
+    which reads exactly like a category that has none - and the publish
+    then fails at eBay naming one aspect per round trip, the precise
+    thing asking early exists to prevent. Three of twelve real
+    categories came back empty.
+    """
+    from mplabel import ebay
+
+    documented = {"aspects": [
+        {"localizedAspectName": "Brand",
+         "aspectConstraint": {"aspectRequired": True},
+         "aspectValues": [{"localizedValue": "Nike"}]},
+        {"localizedAspectName": "Colour",
+         "aspectConstraint": {"aspectRequired": False}}]}
+    rows = ebay._aspect_rows(documented)
+    assert [r["name"] for r in rows] == ["Brand", "Colour"]
+    assert [r["required"] for r in rows] == [True, False]
+
+    # One level deeper, under another key, with the flag hoisted out of
+    # the constraint - the two obvious ways for the shape to move.
+    moved = {"category": {"categoryAspects": [
+        {"aspectName": "Type", "aspectRequired": True}]}}
+    assert ebay._aspect_rows(moved) == [{"name": "Type", "required": True}]
+
+    # An aspect *value* is not an aspect, however named.
+    assert ebay._aspect_rows(
+        {"aspectValues": [{"localizedValue": "Brass"}]}) == []
+
+
+def test_an_empty_aspect_list_says_which_kind_of_empty(db, tmp_path, capsys,
+                                                        monkeypatch):
+    """"None required" and "we could not read it" are different answers.
+
+    Both printed nothing, and only one of them means the publish is
+    safe to attempt.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    _pushable(db, tmp_path, with_photo=False)
+    monkeypatch.setattr(ebay, "suggest_categories", lambda *a, **k: [])
+
+    def _aspects(cfg_, cid, seen=None):
+        if seen is not None:
+            seen["total"] = 24
+        return []
+
+    monkeypatch.setattr(ebay, "required_aspects", _aspects)
+    monkeypatch.setattr(ebay, "put_inventory_item", lambda *a, **k: None)
+    monkeypatch.setattr(ebay, "create_or_update_offer",
+                        lambda *a, **k: ("o1", "created"))
+    args = argparse.Namespace(listing="1", category="2986", aspect=[],
+                              publish=False, dry_run=False)
+    assert cli.cmd_ebay_push(db and cfg, db, args) == 0
+    assert "none of the 24 eBay listed" in capsys.readouterr().out
+
+    # Nothing found at all is the other answer, and reads differently.
+    monkeypatch.setattr(ebay, "required_aspects",
+                        lambda cfg_, cid, seen=None: [])
+    assert cli.cmd_ebay_push(db and cfg, db, args) == 0
+    assert "no aspects at all" in capsys.readouterr().out
+
+
+def test_ebay_check_reports_the_photo_base(tmp_path):
+    """The fifth publish-time key, and the only one publish stops on.
+
+    eBay requires an image to publish and fetches it from this host
+    itself, so every `--publish` refuses without it - and `check` listed
+    the location and the three policies while saying nothing about this.
+    """
+    from mplabel import cli, ebay
+
+    cfg = dict(cli.DEFAULTS, home=str(tmp_path), ebay_app_id="a",
+               ebay_cert_id="c", ebay_ru_name="r")
+    ebay.save_tokens(cfg, {"environment": "sandbox", "access_token": "a",
+                           "refresh_token": "r", "scopes": list(ebay.SCOPES)})
+
+    def _row(conf):
+        rows = ebay.check(dict(cfg, **conf))
+        return next(r for r in rows if r[0] == "photo base")
+
+    label, value, problem, blocking = _row({})
+    assert value == "(unset)" and problem and not blocking
+
+    # http is refused here rather than by eBay, whose complaint names
+    # the field instead of the scheme.
+    _l, _v, problem, blocking = _row({"ebay_photo_base": "http://pi.example"})
+    assert "https" in problem and not blocking
+
+    _l, value, problem, _b = _row(
+        {"ebay_photo_base": "https://pi.example.ts.net"})
+    assert value == "https://pi.example.ts.net" and problem is None
