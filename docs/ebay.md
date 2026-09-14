@@ -17,7 +17,8 @@ mplabel ebay auth            # prints the consent URL, then takes the code
 mplabel ebay check           # config and tokens; changes nothing
 mplabel ebay skus            # SKUs already on the account; read-only
 mplabel ebay setup           # the three policies and the location
-mplabel ebay push <listing>  # an inventory item and an unpublished offer
+mplabel ebay push <listing> --category N   # an item and an unpublished offer
+mplabel ebay push <listing> --dry-run      # the same request, sent nowhere
 mplabel ebay pull --dry-run  # the orders it would record; writes nothing
 ```
 
@@ -60,16 +61,33 @@ anybody tries it.
 Even on sandbox, publishing refuses four things. Each is a failure eBay
 would report worse than we can:
 
-- **A suggested category.** `push` prints eBay's guesses from the title
-  and will not publish until `--category` names one. A wrong category is
-  a listing nobody searching for the thing will ever see.
+- **A suggested category** - and this one now refuses earlier, at
+  *offer creation*, because refusing only at publish was not enough.
+  Publishing happens in eBay's UI by design and that route never asks
+  again, so a draft built on a guess goes live unchallenged. Twelve real
+  offers were created that way before this changed, and eBay's first
+  suggestion was plainly wrong on three of them: Women's Belts for
+  "Michael Kors Studded Ankle Boots", Heels for "Zara Mesh Heeled
+  Sandals", Other Outdoor Décor for a religious plaque. `--dry-run`
+  needs no category, because it sends nothing and it is where the
+  suggestions and the request can be read together.
 - **Missing required aspects.** eBay refuses one per round trip, so they
-  are read from the Taxonomy API first and named together.
+  are read from the Taxonomy API first and named together. That answer
+  is **walked, not indexed** - a list we fail to find would return "none
+  required", which is indistinguishable from a category that has none -
+  and where the list comes back empty `push` says whether eBay listed
+  any aspects at all, because only one of those two answers means a
+  publish is safe to attempt.
 - **No photographs.** eBay requires at least one, and fetches it itself.
 - **A photograph it cannot fetch.** Checked locally before the publish
   call, because eBay's refusal for an unreachable image names the *field*
   rather than the reason - and on this deployment the likeliest reason is
   that the tunnel is down.
+
+A **sold** listing is refused outright, before any of that: an offer
+for a thing that is gone is a listing to take down, or one somebody
+buys. `acquired` and `draft` stay pushable - they are things she owns
+that nobody can buy yet, which is what a new listing is for.
 
 **The order of operations matters and is not tidiness.** The
 `ebay_offers` row is written *before* the publish call, because
